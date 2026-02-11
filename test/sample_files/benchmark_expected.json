@@ -25,8 +25,8 @@
       ]
     ],
     "n_kernel": 2,
-    "python_time_find_consistent_s": 0.061534,
-    "python_time_ipm_s": 4.8e-05
+    "python_time_find_consistent_s": 0.069249,
+    "python_time_ipm_s": 5.3e-05
   },
   "bench_large": {
     "nvariants": [
@@ -57,8 +57,8 @@
       ]
     ],
     "n_kernel": 2,
-    "python_time_find_consistent_s": 0.709208,
-    "python_time_ipm_s": 4.4e-05
+    "python_time_find_consistent_s": 0.793541,
+    "python_time_ipm_s": 3.5e-05
   },
   "bench_xlarge": {
     "nvariants": [
@@ -99,7 +99,7 @@
       ]
     ],
     "n_kernel": 3,
-    "python_time_find_consistent_s": 1.507164,
-    "python_time_ipm_s": 0.000133
+    "python_time_find_consistent_s": 1.651773,
+    "python_time_ipm_s": 0.000125
   }
 }
