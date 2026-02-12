@@ -13,7 +13,19 @@ is found even when spawned by a non-interactive host process):
     claude mcp add crossimpactbalances -- /path/to/CrossImpactBalances/mcp/run-server.sh
 """
 
-using CrossImpactBalances
+# Defer package loading — start in background so the MCP handshake
+# (initialize, tools/list) can complete before Julia finishes compiling.
+# The helper _run_analysis is defined inside the @eval so it sees the
+# CrossImpactBalances symbols at the right world age.
+const _pkg_task = @async @eval begin
+    using CrossImpactBalances
+    function _run_analysis(file_path::AbstractString)
+        cib = load_scw(file_path; kernel=Vector{Vector{Int}}())
+        fps, basins, cycle_count = find_basins(cib)
+        total = max_signature(cib) + 1
+        return (cib, fps, basins, cycle_count, total)
+    end
+end
 
 # ── Minimal JSON parser (from test/benchmark.jl) ────────────────────────────
 
@@ -309,10 +321,10 @@ function execute_scw_fixed_points(id, args)
     end
 
     try
-        # Load SCW with empty kernel (find_basins will compute everything)
-        cib = load_scw(file_path; kernel=Vector{Vector{Int}}())
-        fps, basins, cycle_count = find_basins(cib)
-        text = format_results(cib, fps, basins, cycle_count)
+        # Block until CrossImpactBalances has finished loading (no-op if already done)
+        wait(_pkg_task)
+        cib, fps, basins, cycle_count, total = Base.invokelatest(_run_analysis, file_path)
+        text = format_results(cib, fps, basins, cycle_count, total)
 
         return Dict(
             "jsonrpc" => "2.0",
@@ -328,8 +340,7 @@ function execute_scw_fixed_points(id, args)
     end
 end
 
-function format_results(cib, fps, basins, cycle_count)
-    total = max_signature(cib) + 1
+function format_results(cib, fps, basins, cycle_count, total)
     buf = IOBuffer()
 
     println(buf, "Cross-Impact Balance Analysis")
