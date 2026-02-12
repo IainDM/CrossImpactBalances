@@ -13,18 +13,24 @@ is found even when spawned by a non-interactive host process):
     claude mcp add crossimpactbalances -- /path/to/CrossImpactBalances/mcp/run-server.sh
 """
 
-# Defer package loading — start in background so the MCP handshake
-# (initialize, tools/list) can complete before Julia finishes compiling.
-# The helper _run_analysis is defined inside the @eval so it sees the
-# CrossImpactBalances symbols at the right world age.
-const _pkg_task = @async @eval begin
-    using CrossImpactBalances
-    function _run_analysis(file_path::AbstractString)
-        cib = load_scw(file_path; kernel=Vector{Vector{Int}}())
-        fps, basins, cycle_count = find_basins(cib)
-        total = max_signature(cib) + 1
-        return (cib, fps, basins, cycle_count, total)
+# Lazy-load CrossImpactBalances on first tool call, not at startup.
+# The MCP handshake (initialize, tools/list) needs no package symbols and
+# must complete quickly.  Package compilation is deferred to the first
+# tools/call, whose timeout is much longer.
+const _cib_loaded = Ref(false)
+
+function _ensure_cib_loaded()
+    _cib_loaded[] && return
+    @eval begin
+        using CrossImpactBalances
+        function _run_analysis(file_path::AbstractString)
+            cib = load_scw(file_path; kernel=Vector{Vector{Int}}())
+            fps, basins, cycle_count = find_basins(cib)
+            total = max_signature(cib) + 1
+            return (cib, fps, basins, cycle_count, total)
+        end
     end
+    _cib_loaded[] = true
 end
 
 # ── Minimal JSON parser (from test/benchmark.jl) ────────────────────────────
@@ -321,8 +327,7 @@ function execute_scw_fixed_points(id, args)
     end
 
     try
-        # Block until CrossImpactBalances has finished loading (no-op if already done)
-        wait(_pkg_task)
+        _ensure_cib_loaded()
         cib, fps, basins, cycle_count, total = Base.invokelatest(_run_analysis, file_path)
         text = format_results(cib, fps, basins, cycle_count, total)
 
