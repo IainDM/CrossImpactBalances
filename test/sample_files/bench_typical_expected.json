@@ -1,0 +1,60 @@
+{
+  "nvariants": [
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3
+  ],
+  "total_scenarios": 59049,
+  "seed": 0,
+  "value_range": 3,
+  "kernel_sigs": [
+    13785,
+    13839
+  ],
+  "kernel": [
+    [
+      0,
+      2,
+      1,
+      0,
+      2,
+      2,
+      0,
+      0,
+      2,
+      0
+    ],
+    [
+      0,
+      2,
+      1,
+      2,
+      2,
+      2,
+      0,
+      0,
+      2,
+      0
+    ]
+  ],
+  "inner_product_matrix": [
+    [
+      38,
+      38
+    ],
+    [
+      40,
+      40
+    ]
+  ],
+  "n_kernel": 2,
+  "python_time_find_consistent_s": 1.893552,
+  "python_time_ipm_s": 5.1e-05
+}

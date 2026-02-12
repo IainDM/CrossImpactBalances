@@ -158,6 +158,30 @@ const SAMPLE_DIR = joinpath(@__DIR__, "sample_files")
         @test !isnothing(idx)
     end
 
+    @testset "Typical (10 desc × 3 variants, exhaustive + basins)" begin
+        scw = joinpath(SAMPLE_DIR, "bench_typical.scw")
+
+        # Exhaustive: must find the 2 fixed points verified by Python
+        cib = load_scw(scw; exhaustive=true)
+        sigs = sort([signature(cib, u) for u in cib.kernel])
+        @test sigs == [13785, 13839]
+        for u in cib.kernel
+            @test succession_step(cib, u) == u
+        end
+
+        # Basin analysis
+        fps, basins, cyc = find_basins(load_scw(scw; kernel=Vector{Vector{Int}}()))
+        fp_sigs = sort([signature(cib, u) for u in fps])
+        @test fp_sigs == [13785, 13839]
+        @test sum(basins) + cyc == 59049  # 3^10
+        @test all(b -> b >= 1, basins)
+        @test cyc == 5181
+
+        # Largest basin verified against Python chain-following
+        idx = findfirst(u -> signature(cib, u) == 13785, fps)
+        @test basins[idx] == 52329
+    end
+
     @testset "Inner product matrix" begin
         cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"),
                        sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))
