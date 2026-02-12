@@ -5,12 +5,12 @@ Exposes a `scw_fixed_points` tool that accepts a ScenarioWizard .scw file
 and returns the fixed points (consistent scenarios) together with their
 basin-of-attraction sizes.
 
-Run:
+Run directly:
     julia --project=/path/to/CrossImpactBalances /path/to/CrossImpactBalances/mcp/server.jl
 
-Add to Claude Code:
-    claude mcp add crossimpactbalances -- julia --project=/path/to/CrossImpactBalances \\
-        /path/to/CrossImpactBalances/mcp/server.jl
+Add to Claude Code (recommended — uses run-server.sh wrapper so that Julia
+is found even when spawned by a non-interactive host process):
+    claude mcp add crossimpactbalances -- /path/to/CrossImpactBalances/mcp/run-server.sh
 """
 
 using CrossImpactBalances
