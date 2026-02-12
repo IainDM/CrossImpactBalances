@@ -34,7 +34,7 @@ const WORKER_SCRIPT = path.join(__dirname, "julia_worker.jl");
 
 const SERVER_NAME = "crossimpactbalances-mcp";
 const SERVER_VERSION = "0.1.0";
-const PROTOCOL_VERSION = "2024-11-05";
+const PROTOCOL_VERSION = "2025-06-18";
 
 // ── MCP transport (Content-Length framing over stdio) ──────────────────────
 
@@ -59,19 +59,37 @@ process.stdin.on("end", () => {
 });
 
 function tryParseMessage() {
-  const sep = "\r\n\r\n";
-  const headerEnd = inputBuffer.indexOf(sep);
-  if (headerEnd === -1) return null;
+  // Support both \r\n\r\n (spec) and \n\n (some clients) as header delimiters
+  const crlfIdx = inputBuffer.indexOf("\r\n\r\n");
+  const lfIdx = inputBuffer.indexOf("\n\n");
+
+  let headerEnd, sepLen;
+  if (crlfIdx !== -1 && (lfIdx === -1 || crlfIdx <= lfIdx)) {
+    headerEnd = crlfIdx;
+    sepLen = 4; // \r\n\r\n
+  } else if (lfIdx !== -1) {
+    headerEnd = lfIdx;
+    sepLen = 2; // \n\n
+  } else {
+    // No separator found — log buffer head for diagnostics
+    if (inputBuffer.length > 0) {
+      const preview = inputBuffer.slice(0, Math.min(80, inputBuffer.length));
+      log(`buffer (no separator yet): ${JSON.stringify(preview.toString("utf-8"))}`);
+    }
+    return null;
+  }
 
   const headerStr = inputBuffer.slice(0, headerEnd).toString("utf-8");
   const match = headerStr.match(/Content-Length:\s*(\d+)/i);
   if (!match) {
-    inputBuffer = inputBuffer.slice(headerEnd + sep.length);
+    // No Content-Length header — try parsing the whole buffer as bare JSON
+    log(`no Content-Length header found in: ${JSON.stringify(headerStr)}`);
+    inputBuffer = inputBuffer.slice(headerEnd + sepLen);
     return null;
   }
 
   const contentLength = parseInt(match[1], 10);
-  const bodyStart = headerEnd + sep.length;
+  const bodyStart = headerEnd + sepLen;
   const bodyEnd = bodyStart + contentLength;
 
   if (inputBuffer.length < bodyEnd) return null;
