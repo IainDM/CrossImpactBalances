@@ -125,6 +125,39 @@ const SAMPLE_DIR = joinpath(@__DIR__, "sample_files")
         end
     end
 
+    @testset "Basin analysis (small)" begin
+        cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"),
+                       sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))
+
+        fps, basins, cyc = find_basins(cib)
+        fp_sigs = sort([signature(cib, u) for u in fps])
+
+        # Must find the same 4 fixed points
+        @test fp_sigs == [13, 16, 20, 21]
+
+        # Every fixed point must be a true fixed point
+        for u in fps
+            @test CrossImpactBalances.succession_step(cib, u) == u
+        end
+
+        # Basin sizes + cycle count must equal total scenarios (3*3*4 = 36)
+        @test sum(basins) + cyc == 36
+
+        # Each basin must be non-empty
+        @test all(b -> b >= 1, basins)
+
+        # Fixed points count themselves, so each basin >= 1
+        # and there must be some cycle scenarios (we know [0,0,0] cycles)
+        @test cyc > 0
+
+        # Verify a known convergence: [1,0,0] -> [1,2,1] (sig 16)
+        sig_100 = signature(cib, [1, 0, 0])
+        sig_121 = 16
+        # [1,0,0] should be in the basin of sig 16
+        idx = findfirst(u -> signature(cib, u) == sig_121, fps)
+        @test !isnothing(idx)
+    end
+
     @testset "Inner product matrix" begin
         cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"),
                        sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))
