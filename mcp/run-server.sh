@@ -7,4 +7,4 @@
 #   claude mcp add crossimpactbalances -- /absolute/path/to/CrossImpactBalances/mcp/run-server.sh
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec julia --project="$DIR" "$DIR/mcp/server.jl"
+exec julia --startup-file=no --project="$DIR" "$DIR/mcp/server.jl"
