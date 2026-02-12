@@ -365,25 +365,96 @@ end
 function _find_consistent_exhaustive(cib::CIB; ignore_cycles::Bool=true)
     n = max_signature(cib) + 1
     nt = Threads.nthreads()
-
-    # Chunk the space explicitly — avoids threadid() indexing issues
     chunk_size = cld(n, nt)
+    ndesc = cib.ndesc
+    ndim = cib.ndim
+
     local_kerns = [Vector{Vector{Int}}() for _ in 1:nt]
     local_seens = [Set{Int}() for _ in 1:nt]
 
     Threads.@threads for chunk in 1:nt
+        # Pre-allocated working buffers — zero allocations in the hot loop
+        v  = Vector{Int}(undef, ndesc)
+        w  = Vector{Int}(undef, ndesc)
+        ib = Vector{Int}(undef, ndim)
+        tndx = Vector{Int}(undef, ndesc)
+        history = Int[]
+
         first_sig = (chunk - 1) * chunk_size
         last_sig  = min(chunk * chunk_size - 1, n - 1)
+
         for sig in first_sig:last_sig
-            v = inv_signature(cib, sig)
-            nper, veqm = succession(cib, v)
-            if ignore_cycles && nper > 1
-                continue
+            # inv_signature in-place
+            s = sig
+            @inbounds for i in 1:ndesc
+                nv = cib.nvariants[i]
+                v[i] = s % nv
+                s = s ÷ nv
             end
-            veqm_sig = signature(cib, veqm)
-            if !(veqm_sig in local_seens[chunk])
-                push!(local_seens[chunk], veqm_sig)
-                push!(local_kerns[chunk], veqm)
+
+            # succession in-place
+            empty!(history)
+            push!(history, sig)
+            copyto!(w, v)
+
+            while true
+                # succession_step in-place: impact_balance into ib
+                offset = 0
+                @inbounds for i in 1:ndesc
+                    tndx[i] = offset + w[i] + 1
+                    offset += cib.nvariants[i]
+                end
+                fill!(ib, 0)
+                @inbounds for r in tndx
+                    for j in 1:ndim
+                        ib[j] += cib.cim[r, j]
+                    end
+                end
+
+                # Pick best variant per descriptor
+                start = 1
+                @inbounds for i in 1:ndesc
+                    nv = cib.nvariants[i]
+                    max_val = ib[start + w[i]]
+                    for j in 0:nv-1
+                        score = ib[start + j]
+                        if score > max_val
+                            max_val = score
+                            w[i] = j
+                        end
+                    end
+                    start += nv
+                end
+
+                # Signature of w
+                w_sig = 0
+                order = 1
+                @inbounds for i in 1:ndesc
+                    w_sig += order * w[i]
+                    order *= cib.nvariants[i]
+                end
+
+                # Cycle detection (scan history in reverse)
+                cycle_len = 1
+                found = false
+                for k in length(history):-1:1
+                    if history[k] == w_sig
+                        found = true
+                        break
+                    end
+                    cycle_len += 1
+                end
+
+                if found
+                    if cycle_len == 1 || !ignore_cycles
+                        if !(w_sig in local_seens[chunk])
+                            push!(local_seens[chunk], w_sig)
+                            push!(local_kerns[chunk], copy(w))
+                        end
+                    end
+                    break
+                end
+                push!(history, w_sig)
             end
         end
     end
