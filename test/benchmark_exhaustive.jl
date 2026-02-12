@@ -53,6 +53,25 @@ println("  Sigs:    $ex_sigs")
 println("  Valid:   $all_valid")
 println("  Rate:    $(round(60_466_176 / t_ex, digits=0)) scenarios/sec")
 
+# ── Basin analysis ──────────────────────────────────────────────────────────
+println("\nBasin analysis (cached chain-following)...")
+t0 = time_ns()
+fps, basins, cyc = find_basins(load_scw(scw_path; kernel=Vector{Vector{Int}}()))
+t_ba = (time_ns() - t0) / 1e9
+
+ba_sigs = [signature(cib_ex, u) for u in fps]
+perm = sortperm(basins, rev=true)
+
+println("  Time:    $(round(t_ba, digits=2))s")
+println("  Fixed points:   $(length(fps))")
+println("  Cycle scenarios: $cyc")
+println("  Basins:")
+for i in perm
+    pct = round(100 * basins[i] / 60_466_176, digits=2)
+    println("    sig $(ba_sigs[i]):  $(basins[i]) scenarios ($pct%)")
+end
+println("  Check: basins + cycles = $(sum(basins) + cyc) (expect 60,466,176)")
+
 # ── Summary ─────────────────────────────────────────────────────────────────
 missed = setdiff(Set(ex_sigs), Set(mc_sigs))
 println("\n", "-"^70)
@@ -60,6 +79,7 @@ println("SUMMARY")
 println("-"^70)
 println("  MC sampling (10K):  $(length(mc_sigs)) fixed points in $(round(t_mc, digits=3))s")
 println("  Exhaustive search:  $(length(ex_sigs)) fixed points in $(round(t_ex, digits=2))s")
+println("  Basin analysis:     $(length(fps)) fixed points + basins in $(round(t_ba, digits=2))s")
 if !isempty(missed)
     println("  MC missed:          $(length(missed)) fixed points (sigs: $(sort(collect(missed))))")
 end

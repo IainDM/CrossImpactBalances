@@ -4,7 +4,7 @@ using SparseArrays
 
 export CIB, load_scw, load_solutions,
        impact_balance, own_impact_balance, cross_impact_balance, inner_product,
-       succession_step, succession, find_consistent,
+       succession_step, succession, find_consistent, find_basins,
        signature, inv_signature, max_signature,
        sim_anneal, inner_product_matrix, build_graph, merge_scenarios
 
@@ -431,6 +431,144 @@ function _find_consistent_exhaustive(cib::CIB; ignore_cycles::Bool=true)
         append!(kern, local_kerns[chunk])
     end
     return kern
+end
+
+"""
+    find_basins(cib) -> (fixed_points, basin_sizes, cycle_count)
+
+Exhaustive basin-of-attraction analysis. Follows the succession chain from
+every scenario in the space, counting how many starting points converge to
+each fixed point.
+
+Uses a flat cache so each scenario is resolved exactly once (O(n) total
+succession steps). Returns:
+- `fixed_points`: Vector of fixed-point scenarios (0-based variant indices)
+- `basin_sizes`:  corresponding basin sizes (same order as `fixed_points`)
+- `cycle_count`:  number of scenarios that fall into non-fixed-point cycles
+"""
+function find_basins(cib::CIB)
+    n = max_signature(cib) + 1
+    ndesc = cib.ndesc
+    ndim = cib.ndim
+
+    # Cache: 0 = unvisited, -1 = cycle, k>0 = converges to fp with sig k-1
+    cache = zeros(Int, n)
+
+    # Working buffers
+    w    = Vector{Int}(undef, ndesc)
+    ib   = Vector{Int}(undef, ndim)
+    tndx = Vector{Int}(undef, ndesc)
+    history = Int[]
+
+    for start_sig in 0:n-1
+        @inbounds cache[start_sig + 1] != 0 && continue
+
+        # Decode start_sig into w
+        s = start_sig
+        @inbounds for i in 1:ndesc
+            w[i] = s % cib.nvariants[i]
+            s = s ÷ cib.nvariants[i]
+        end
+
+        empty!(history)
+        push!(history, start_sig)
+
+        while true
+            # ── inline succession_step on w ──
+            offset = 0
+            @inbounds for i in 1:ndesc
+                tndx[i] = offset + w[i] + 1
+                offset += cib.nvariants[i]
+            end
+            fill!(ib, 0)
+            @inbounds for r in tndx
+                for j in 1:ndim
+                    ib[j] += cib.cim[r, j]
+                end
+            end
+            start_pos = 1
+            @inbounds for i in 1:ndesc
+                nv = cib.nvariants[i]
+                max_val = ib[start_pos + w[i]]
+                for j in 0:nv-1
+                    if ib[start_pos + j] > max_val
+                        max_val = ib[start_pos + j]
+                        w[i] = j
+                    end
+                end
+                start_pos += nv
+            end
+
+            # Signature of w (the successor)
+            w_sig = 0
+            order = 1
+            @inbounds for i in 1:ndesc
+                w_sig += order * w[i]
+                order *= cib.nvariants[i]
+            end
+
+            # ── Already resolved? Backfill entire history ──
+            @inbounds cached = cache[w_sig + 1]
+            if cached != 0
+                @inbounds for h in history
+                    cache[h + 1] = cached
+                end
+                break
+            end
+
+            # ── Cycle detection: is w_sig already in our chain? ──
+            cycle_start = 0
+            for k in length(history):-1:1
+                if @inbounds history[k] == w_sig
+                    cycle_start = k
+                    break
+                end
+            end
+
+            if cycle_start > 0
+                if cycle_start == length(history)
+                    # Fixed point (cycle of length 1)
+                    val = w_sig + 1
+                    @inbounds for h in history
+                        cache[h + 1] = val
+                    end
+                else
+                    # Real cycle — everything in this chain is non-convergent
+                    @inbounds for h in history
+                        cache[h + 1] = -1
+                    end
+                end
+                break
+            end
+
+            push!(history, w_sig)
+        end
+    end
+
+    # ── Tally basins ──
+    kern = Vector{Vector{Int}}()
+    basins = Vector{Int}()
+    cycle_count = 0
+    fp_order = Dict{Int, Int}()
+
+    for sig in 0:n-1
+        @inbounds c = cache[sig + 1]
+        if c == -1
+            cycle_count += 1
+        elseif c > 0
+            fp_sig = c - 1
+            idx = get(fp_order, fp_sig, 0)
+            if idx == 0
+                push!(kern, inv_signature(cib, fp_sig))
+                push!(basins, 1)
+                fp_order[fp_sig] = length(kern)
+            else
+                @inbounds basins[idx] += 1
+            end
+        end
+    end
+
+    return kern, basins, cycle_count
 end
 
 # ─── Simulated annealing ────────────────────────────────────────────────────
