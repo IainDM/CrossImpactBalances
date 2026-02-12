@@ -256,10 +256,16 @@ function ensureWorker() {
   });
 }
 
-function sendToWorker(filePath) {
+function sendToWorker(op, filePath, scenario) {
   return new Promise((resolve, reject) => {
     onResult = { resolve, reject };
-    workerProc.stdin.write(filePath + "\n");
+    let cmd = `${op}\t${filePath}`;
+    if (scenario) {
+      for (const [desc, variant] of Object.entries(scenario)) {
+        cmd += `\t${desc}=${variant}`;
+      }
+    }
+    workerProc.stdin.write(cmd + "\n");
   });
 }
 
@@ -293,10 +299,10 @@ function handleToolsList(id) {
         {
           name: "scw_fixed_points",
           description:
-            "Analyze a ScenarioWizard (.scw) cross-impact balance file. " +
-            "Finds all consistent scenarios (fixed points of the succession " +
-            "operator) and their basins of attraction: the number of starting " +
-            "combinations that converge to each fixed point.",
+            "Find all consistent scenarios (fixed points) in a " +
+            "ScenarioWizard (.scw) cross-impact balance file. Lists the " +
+            "scenarios that are self-consistent under the succession operator. " +
+            "Fast — use scw_basins instead if you also need basin sizes.",
           inputSchema: {
             type: "object",
             properties: {
@@ -306,6 +312,76 @@ function handleToolsList(id) {
               },
             },
             required: ["file_path"],
+          },
+        },
+        {
+          name: "scw_basins",
+          description:
+            "Exhaustive basin-of-attraction analysis of a ScenarioWizard " +
+            "(.scw) file. Finds all consistent scenarios AND counts how " +
+            "many starting combinations converge to each one. Slower than " +
+            "scw_fixed_points but gives the full convergence picture.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              file_path: {
+                type: "string",
+                description: "Absolute path to a ScenarioWizard .scw file",
+              },
+            },
+            required: ["file_path"],
+          },
+        },
+        {
+          name: "scw_succession",
+          description:
+            "Trace the succession trajectory from a given starting scenario. " +
+            "Shows step-by-step how the scenario evolves under the CIB " +
+            "succession operator until it converges to a fixed point or " +
+            "enters a cycle. Use this to explore 'what if we start from X?'.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              file_path: {
+                type: "string",
+                description: "Absolute path to a ScenarioWizard .scw file",
+              },
+              scenario: {
+                type: "object",
+                description:
+                  "The starting scenario as a mapping of descriptor names " +
+                  "to variant names. Every descriptor must be included. " +
+                  'Example: {"Economy": "Growth", "Climate": "Warming"}',
+                additionalProperties: { type: "string" },
+              },
+            },
+            required: ["file_path", "scenario"],
+          },
+        },
+        {
+          name: "scw_impact_balance",
+          description:
+            "Compute the impact balance for a given scenario, showing the " +
+            "support score for every variant of every descriptor. Reveals " +
+            "why a scenario is or isn't self-consistent: which variants " +
+            "are favoured and which would change under succession.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              file_path: {
+                type: "string",
+                description: "Absolute path to a ScenarioWizard .scw file",
+              },
+              scenario: {
+                type: "object",
+                description:
+                  "The scenario to analyze as a mapping of descriptor names " +
+                  "to variant names. Every descriptor must be included. " +
+                  'Example: {"Economy": "Growth", "Climate": "Warming"}',
+                additionalProperties: { type: "string" },
+              },
+            },
+            required: ["file_path", "scenario"],
           },
         },
       ],
@@ -318,27 +394,41 @@ async function handleToolsCall(id, params) {
   const args = (params && params.arguments) || {};
 
   if (name === "scw_fixed_points") {
-    return executeScwFixedPoints(id, args);
+    return executeWorkerTool(id, "fixed_points", args);
+  }
+  if (name === "scw_basins") {
+    return executeWorkerTool(id, "basins", args);
+  }
+  if (name === "scw_succession") {
+    return executeWorkerTool(id, "succession", args);
+  }
+  if (name === "scw_impact_balance") {
+    return executeWorkerTool(id, "impact_balance", args);
   }
   return makeError(id, -32601, `Unknown tool: ${name}`);
 }
 
 // ── Tool execution (uses persistent Julia worker) ─────────────────────────
 
-async function executeScwFixedPoints(id, args) {
+async function executeWorkerTool(id, op, args) {
   const filePath = args.file_path || "";
   if (!filePath) {
     return makeError(id, -32602, "Missing required parameter: file_path");
   }
 
+  const scenario = args.scenario || null;
+  if ((op === "succession" || op === "impact_balance") && !scenario) {
+    return makeError(id, -32602, "Missing required parameter: scenario");
+  }
+
   try {
     await ensureWorker();
 
-    log(`analyzing ${path.basename(filePath)}`);
-    const result = await sendToWorker(filePath);
+    log(`${op} on ${path.basename(filePath)}`);
+    const result = await sendToWorker(op, filePath, scenario);
 
     if (result.ok) {
-      log("analysis complete");
+      log(`${op} complete`);
       return {
         jsonrpc: "2.0",
         id,
@@ -347,7 +437,7 @@ async function executeScwFixedPoints(id, args) {
         },
       };
     } else {
-      return makeError(id, -32603, `Analysis failed: ${result.error}`);
+      return makeError(id, -32603, `${result.error}`);
     }
   } catch (err) {
     return makeError(id, -32603, `Julia worker error: ${err.message}`);
