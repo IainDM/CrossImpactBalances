@@ -11,7 +11,8 @@ Protocol (newline-delimited, tab-separated fields):
   Response:      {"ok":true,"text":"..."} or {"ok":false,"error":"..."}
 
 Operations:
-  fixed_points   — find all consistent scenarios + basins of attraction
+  fixed_points   — find all consistent scenarios (fixed points)
+  basins         — exhaustive basin-of-attraction analysis
   succession     — trace succession from a starting scenario
   impact_balance — compute impact scores for a scenario
 
@@ -118,17 +119,12 @@ function format_scenario(cib, u)
     return join(lines, "\n")
 end
 
-function format_fixed_points(cib, fps, basins, cycle_count, total)
-    buf = IOBuffer()
-
-    println(buf, "Cross-Impact Balance Analysis")
-    println(buf, "=" ^ 50)
-    println(buf)
-
+function format_model_header(buf, cib)
     println(buf, "Descriptors: $(cib.ndesc)")
     print(buf, "Variants per descriptor: [")
     print(buf, join(cib.nvariants, ", "))
     println(buf, "]")
+    total = max_signature(cib) + 1
     println(buf, "Total scenario space: $total")
     println(buf)
 
@@ -138,6 +134,37 @@ function format_fixed_points(cib, fps, basins, cycle_count, total)
         println(buf, "  $desc: $(join(vars, ", "))")
     end
     println(buf)
+end
+
+function format_fixed_points(cib, fps)
+    buf = IOBuffer()
+
+    println(buf, "Consistent Scenarios (Fixed Points)")
+    println(buf, "=" ^ 50)
+    println(buf)
+
+    format_model_header(buf, cib)
+
+    println(buf, "Fixed Points Found: $(length(fps))")
+    println(buf, "-" ^ 50)
+
+    for (rank, fp) in enumerate(fps)
+        println(buf)
+        println(buf, "Scenario #$rank")
+        println(buf, format_scenario(cib, fp))
+    end
+
+    return String(take!(buf))
+end
+
+function format_basins(cib, fps, basins, cycle_count, total)
+    buf = IOBuffer()
+
+    println(buf, "Basin-of-Attraction Analysis")
+    println(buf, "=" ^ 50)
+    println(buf)
+
+    format_model_header(buf, cib)
 
     perm = sortperm(basins, rev=true)
     println(buf, "Consistent Scenarios (Fixed Points): $(length(fps))")
@@ -150,11 +177,7 @@ function format_fixed_points(cib, fps, basins, cycle_count, total)
 
         println(buf)
         println(buf, "Scenario #$rank (basin: $basin scenarios, $pct%)")
-
-        for (j, desc) in enumerate(cib.descriptors)
-            variant_name = cib.variants[desc][fp[j] + 1]
-            println(buf, "  $desc = $variant_name")
-        end
+        println(buf, format_scenario(cib, fp))
     end
 
     if cycle_count > 0
@@ -250,10 +273,18 @@ end
 
 function do_fixed_points(file_path::String)
     cib = get_cib(file_path)
+    fps = find_consistent(cib)
+    text = format_fixed_points(cib, fps)
+    println(stderr, "julia_worker: done ($(length(fps)) fixed points)")
+    send_ok(text)
+end
+
+function do_basins(file_path::String)
+    cib = get_cib(file_path)
     fps, basins, cycle_count = find_basins(cib)
     total = max_signature(cib) + 1
-    text = format_fixed_points(cib, fps, basins, cycle_count, total)
-    println(stderr, "julia_worker: done ($(length(fps)) fixed points)")
+    text = format_basins(cib, fps, basins, cycle_count, total)
+    println(stderr, "julia_worker: done ($(length(fps)) fixed points, basins computed)")
     send_ok(text)
 end
 
@@ -339,6 +370,8 @@ function main()
 
             if op == "fixed_points"
                 do_fixed_points(file_path)
+            elseif op == "basins"
+                do_basins(file_path)
             elseif op == "succession"
                 if length(parts) < 3
                     send_err("Missing scenario argument (Descriptor=Variant pairs)")

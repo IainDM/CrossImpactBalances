@@ -299,10 +299,28 @@ function handleToolsList(id) {
         {
           name: "scw_fixed_points",
           description:
-            "Analyze a ScenarioWizard (.scw) cross-impact balance file. " +
-            "Finds all consistent scenarios (fixed points of the succession " +
-            "operator) and their basins of attraction: the number of starting " +
-            "combinations that converge to each fixed point.",
+            "Find all consistent scenarios (fixed points) in a " +
+            "ScenarioWizard (.scw) cross-impact balance file. Lists the " +
+            "scenarios that are self-consistent under the succession operator. " +
+            "Fast — use scw_basins instead if you also need basin sizes.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              file_path: {
+                type: "string",
+                description: "Absolute path to a ScenarioWizard .scw file",
+              },
+            },
+            required: ["file_path"],
+          },
+        },
+        {
+          name: "scw_basins",
+          description:
+            "Exhaustive basin-of-attraction analysis of a ScenarioWizard " +
+            "(.scw) file. Finds all consistent scenarios AND counts how " +
+            "many starting combinations converge to each one. Slower than " +
+            "scw_fixed_points but gives the full convergence picture.",
           inputSchema: {
             type: "object",
             properties: {
@@ -377,6 +395,9 @@ async function handleToolsCall(id, params) {
 
   if (name === "scw_fixed_points") {
     return executeWorkerTool(id, "fixed_points", args);
+  }
+  if (name === "scw_basins") {
+    return executeWorkerTool(id, "basins", args);
   }
   if (name === "scw_succession") {
     return executeWorkerTool(id, "succession", args);
