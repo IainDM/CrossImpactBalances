@@ -42,8 +42,13 @@ let inputBuffer = Buffer.alloc(0);
 const pendingReads = [];
 
 process.stdin.on("data", (chunk) => {
+  log(`stdin: received ${chunk.length} bytes`);
   inputBuffer = Buffer.concat([inputBuffer, chunk]);
   drainReads();
+});
+
+process.stdin.on("error", (err) => {
+  log(`stdin error: ${err.message}`);
 });
 
 process.stdin.on("end", () => {
@@ -307,6 +312,8 @@ function makeError(id, code, message) {
 
 async function main() {
   log(`starting (Node.js ${process.version})`);
+  log(`stdin: isTTY=${process.stdin.isTTY}, readable=${process.stdin.readable}`);
+  process.stdin.resume(); // ensure flowing mode on Windows
   log("ready, waiting for messages");
 
   while (true) {
@@ -338,8 +345,10 @@ async function main() {
     }
 
     if (response) {
+      const body = JSON.stringify(response);
+      log(`stdout: sending ${Buffer.byteLength(body)} bytes for ${method || "?"} (id=${id})`);
       sendMessage(response);
-      log(`\u2192 response for ${method || "?"} (id=${id})`);
+      log(`\u2192 response sent for ${method || "?"} (id=${id})`);
     }
   }
 
