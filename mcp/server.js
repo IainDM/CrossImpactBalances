@@ -36,10 +36,11 @@ const SERVER_NAME = "crossimpactbalances-mcp";
 const SERVER_VERSION = "0.1.0";
 const PROTOCOL_VERSION = "2025-06-18";
 
-// ── MCP transport (Content-Length framing over stdio) ──────────────────────
+// ── MCP transport (auto-detects Content-Length framing vs bare NDJSON) ─────
 
 let inputBuffer = Buffer.alloc(0);
 const pendingReads = [];
+let useContentLength = null; // auto-detected from first incoming message
 
 process.stdin.on("data", (chunk) => {
   log(`stdin: received ${chunk.length} bytes`);
@@ -59,31 +60,54 @@ process.stdin.on("end", () => {
 });
 
 function tryParseMessage() {
-  // Support both \r\n\r\n (spec) and \n\n (some clients) as header delimiters
+  if (inputBuffer.length === 0) return null;
+
+  // Skip leading whitespace / empty lines
+  let start = 0;
+  while (start < inputBuffer.length) {
+    const b = inputBuffer[start];
+    if (b !== 0x20 && b !== 0x09 && b !== 0x0a && b !== 0x0d) break;
+    start++;
+  }
+  if (start > 0) inputBuffer = inputBuffer.slice(start);
+  if (inputBuffer.length === 0) return null;
+
+  // Auto-detect transport: '{' means bare JSON, otherwise Content-Length
+  if (inputBuffer[0] === 0x7b) {
+    // ── Bare JSON (newline-delimited) ──
+    const nlIdx = inputBuffer.indexOf(0x0a);
+    if (nlIdx === -1) return null; // wait for complete line
+
+    const line = inputBuffer.slice(0, nlIdx).toString("utf-8").trim();
+    inputBuffer = inputBuffer.slice(nlIdx + 1);
+
+    if (!line) return null;
+
+    if (useContentLength === null) {
+      useContentLength = false;
+      log("transport: bare JSON (NDJSON) detected");
+    }
+    return JSON.parse(line);
+  }
+
+  // ── Content-Length framed ──
   const crlfIdx = inputBuffer.indexOf("\r\n\r\n");
   const lfIdx = inputBuffer.indexOf("\n\n");
 
   let headerEnd, sepLen;
   if (crlfIdx !== -1 && (lfIdx === -1 || crlfIdx <= lfIdx)) {
     headerEnd = crlfIdx;
-    sepLen = 4; // \r\n\r\n
+    sepLen = 4;
   } else if (lfIdx !== -1) {
     headerEnd = lfIdx;
-    sepLen = 2; // \n\n
+    sepLen = 2;
   } else {
-    // No separator found — log buffer head for diagnostics
-    if (inputBuffer.length > 0) {
-      const preview = inputBuffer.slice(0, Math.min(80, inputBuffer.length));
-      log(`buffer (no separator yet): ${JSON.stringify(preview.toString("utf-8"))}`);
-    }
-    return null;
+    return null; // wait for complete header
   }
 
   const headerStr = inputBuffer.slice(0, headerEnd).toString("utf-8");
   const match = headerStr.match(/Content-Length:\s*(\d+)/i);
   if (!match) {
-    // No Content-Length header — try parsing the whole buffer as bare JSON
-    log(`no Content-Length header found in: ${JSON.stringify(headerStr)}`);
     inputBuffer = inputBuffer.slice(headerEnd + sepLen);
     return null;
   }
@@ -97,6 +121,10 @@ function tryParseMessage() {
   const body = inputBuffer.slice(bodyStart, bodyEnd).toString("utf-8");
   inputBuffer = inputBuffer.slice(bodyEnd);
 
+  if (useContentLength === null) {
+    useContentLength = true;
+    log("transport: Content-Length framing detected");
+  }
   return JSON.parse(body);
 }
 
@@ -118,8 +146,12 @@ function readMessage() {
 
 function sendMessage(msg) {
   const body = JSON.stringify(msg);
-  const header = `Content-Length: ${Buffer.byteLength(body, "utf-8")}\r\n\r\n`;
-  process.stdout.write(header + body);
+  if (useContentLength) {
+    const header = `Content-Length: ${Buffer.byteLength(body, "utf-8")}\r\n\r\n`;
+    process.stdout.write(header + body);
+  } else {
+    process.stdout.write(body + "\n");
+  }
 }
 
 function log(text) {
