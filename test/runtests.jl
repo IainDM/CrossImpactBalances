@@ -113,6 +113,18 @@ const SAMPLE_DIR = joinpath(@__DIR__, "sample_files")
         @test loaded_sigs == [13, 16, 20, 21]
     end
 
+    @testset "Exhaustive search (small)" begin
+        cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"); exhaustive=true)
+
+        sigs = sort([signature(cib, u) for u in cib.kernel])
+        @test sigs == [13, 16, 20, 21]
+
+        # Every result must be a true fixed point
+        for u in cib.kernel
+            @test CrossImpactBalances.succession_step(cib, u) == u
+        end
+    end
+
     @testset "Inner product matrix" begin
         cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"),
                        sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))

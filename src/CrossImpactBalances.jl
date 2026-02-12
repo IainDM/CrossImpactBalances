@@ -39,14 +39,18 @@ end
 # ─── .scw file parser ───────────────────────────────────────────────────────
 
 """
-    load_scw(scw_file; sl_file=nothing, kernel=nothing, mc_threshold=10000) -> CIB
+    load_scw(scw_file; sl_file=nothing, kernel=nothing, mc_threshold=10000, exhaustive=false) -> CIB
 
 Parse a ScenarioWizard .scw file and optionally a .sl solutions file.
 Returns a fully populated CIB object.
+
+When `exhaustive=true`, every scenario in the space is checked (using threads
+when Julia is started with multiple threads, e.g. `julia -t8`).
 """
 function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
                   kernel::Union{Vector{Vector{Int}},Nothing}=nothing,
-                  mc_threshold::Int=10000)
+                  mc_threshold::Int=10000,
+                  exhaustive::Bool=false)
     descriptors = String[]
     variants = Dict{String, Vector{String}}()
     nvars = Int[]
@@ -118,7 +122,7 @@ function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
     elseif !isnothing(sl_file)
         cib.kernel = load_solutions(cib, sl_file)
     else
-        cib.kernel = find_consistent(cib)
+        cib.kernel = find_consistent(cib; exhaustive=exhaustive)
     end
 
     return cib
@@ -329,11 +333,18 @@ end
 # ─── Find consistent scenarios ──────────────────────────────────────────────
 
 """
-    find_consistent(cib; ignore_cycles=true) -> Vector{Vector{Int}}
+    find_consistent(cib; ignore_cycles=true, exhaustive=false) -> Vector{Vector{Int}}
 
 Find all consistent scenarios by running succession from every (or sampled) starting point.
+
+When `exhaustive=true`, every scenario in the space is enumerated, using all
+available threads (start Julia with `julia -t auto` or `julia -t8`).
+This guarantees finding all fixed points but requires iterating the full space.
 """
-function find_consistent(cib::CIB; ignore_cycles::Bool=true)
+function find_consistent(cib::CIB; ignore_cycles::Bool=true, exhaustive::Bool=false)
+    if exhaustive
+        return _find_consistent_exhaustive(cib; ignore_cycles=ignore_cycles)
+    end
     kern = Vector{Vector{Int}}()
     seen = Set{Int}()
     for v_sig in get_scenario_signatures(cib)
@@ -346,6 +357,47 @@ function find_consistent(cib::CIB; ignore_cycles::Bool=true)
         if !(veqm_sig in seen)
             push!(seen, veqm_sig)
             push!(kern, veqm)
+        end
+    end
+    return kern
+end
+
+function _find_consistent_exhaustive(cib::CIB; ignore_cycles::Bool=true)
+    n = max_signature(cib) + 1
+    nt = Threads.nthreads()
+
+    # Chunk the space explicitly — avoids threadid() indexing issues
+    chunk_size = cld(n, nt)
+    local_kerns = [Vector{Vector{Int}}() for _ in 1:nt]
+    local_seens = [Set{Int}() for _ in 1:nt]
+
+    Threads.@threads for chunk in 1:nt
+        first_sig = (chunk - 1) * chunk_size
+        last_sig  = min(chunk * chunk_size - 1, n - 1)
+        for sig in first_sig:last_sig
+            v = inv_signature(cib, sig)
+            nper, veqm = succession(cib, v)
+            if ignore_cycles && nper > 1
+                continue
+            end
+            veqm_sig = signature(cib, veqm)
+            if !(veqm_sig in local_seens[chunk])
+                push!(local_seens[chunk], veqm_sig)
+                push!(local_kerns[chunk], veqm)
+            end
+        end
+    end
+
+    # Merge chunk-local results
+    kern = Vector{Vector{Int}}()
+    seen = Set{Int}()
+    for chunk in 1:nt
+        for u in local_kerns[chunk]
+            u_sig = signature(cib, u)
+            if !(u_sig in seen)
+                push!(seen, u_sig)
+                push!(kern, u)
+            end
         end
     end
     return kern
