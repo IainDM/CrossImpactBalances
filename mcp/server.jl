@@ -405,10 +405,16 @@ function main()
     # Disable C-level stdout buffering — critical for MCP over pipes.
     # Julia buffers stdout when connected to a pipe (not a TTY),
     # so the MCP host may never see responses without this.
-    let cstdout = cglobal(:stdout, Ptr{Cvoid})
-        ccall(:setvbuf, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cint, Csize_t),
-              unsafe_load(cstdout), C_NULL, 2, 0)  # 2 = _IONBF (unbuffered)
+    if Sys.iswindows()
+        # On Windows, stdout is a macro (__acrt_iob_func(1)), not an exported symbol.
+        cstdout_ptr = ccall((:__acrt_iob_func, "ucrtbase"), Ptr{Cvoid}, (UInt32,), 1)
+        ionbf = 0x0004  # _IONBF value on Windows UCRT
+    else
+        cstdout_ptr = unsafe_load(cglobal(:stdout, Ptr{Cvoid}))
+        ionbf = 2  # _IONBF value on POSIX
     end
+    ccall(:setvbuf, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cint, Csize_t),
+          cstdout_ptr, C_NULL, ionbf, 0)
 
     input = stdin
     output = stdout
