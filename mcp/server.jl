@@ -230,6 +230,7 @@ function send_message(output::IO, msg::Dict)
     write(output, header)
     write(output, body)
     flush(output)
+    Base.Libc.flush_cstdio()  # also flush C-level stdout buffer (pipe buffering)
 end
 
 # ── MCP protocol handlers ───────────────────────────────────────────────────
@@ -401,6 +402,14 @@ end
 # ── Main event loop ─────────────────────────────────────────────────────────
 
 function main()
+    # Disable C-level stdout buffering — critical for MCP over pipes.
+    # Julia buffers stdout when connected to a pipe (not a TTY),
+    # so the MCP host may never see responses without this.
+    let cstdout = cglobal(:stdout, Ptr{Cvoid})
+        ccall(:setvbuf, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cint, Csize_t),
+              unsafe_load(cstdout), C_NULL, 2, 0)  # 2 = _IONBF (unbuffered)
+    end
+
     input = stdin
     output = stdout
 
