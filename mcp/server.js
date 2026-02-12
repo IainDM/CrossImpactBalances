@@ -2,9 +2,9 @@
 /**
  * Node.js MCP server wrapper for CrossImpactBalances.
  *
- * Handles the MCP protocol (initialize, tools/list) instantly in Node.js,
- * and spawns Julia only when a tool is actually called.  This avoids
- * Julia's startup latency blocking the MCP handshake.
+ * Handles the MCP protocol (initialize, tools/list) instantly in Node.js.
+ * On the first tool call, spawns a persistent Julia worker process that
+ * loads CrossImpactBalances once and stays alive for subsequent calls.
  *
  * Zero dependencies — uses only Node.js built-ins.
  *
@@ -30,7 +30,7 @@ const { spawn } = require("child_process");
 const path = require("path");
 
 const PROJECT_DIR = path.resolve(__dirname, "..");
-const ANALYSIS_SCRIPT = path.join(__dirname, "run_analysis.jl");
+const WORKER_SCRIPT = path.join(__dirname, "julia_worker.jl");
 
 const SERVER_NAME = "crossimpactbalances-mcp";
 const SERVER_VERSION = "0.1.0";
@@ -61,7 +61,6 @@ function tryParseMessage() {
   const headerStr = inputBuffer.slice(0, headerEnd).toString("utf-8");
   const match = headerStr.match(/Content-Length:\s*(\d+)/i);
   if (!match) {
-    // Malformed header — skip it
     inputBuffer = inputBuffer.slice(headerEnd + sep.length);
     return null;
   }
@@ -70,7 +69,7 @@ function tryParseMessage() {
   const bodyStart = headerEnd + sep.length;
   const bodyEnd = bodyStart + contentLength;
 
-  if (inputBuffer.length < bodyEnd) return null; // incomplete body
+  if (inputBuffer.length < bodyEnd) return null;
 
   const body = inputBuffer.slice(bodyStart, bodyEnd).toString("utf-8");
   inputBuffer = inputBuffer.slice(bodyEnd);
@@ -103,6 +102,118 @@ function sendMessage(msg) {
 function log(text) {
   process.stderr.write(`${SERVER_NAME}: ${text}\n`);
 }
+
+// ── Persistent Julia worker ───────────────────────────────────────────────
+
+let workerProc = null;
+let workerState = "idle"; // "idle" | "starting" | "ready"
+let workerLineBuffer = "";
+
+// Callbacks for the current in-flight operation
+let onReady = null;   // { resolve, reject } — set while waiting for ready signal
+let onResult = null;  // { resolve, reject } — set while waiting for analysis result
+
+function processWorkerLines() {
+  let idx;
+  while ((idx = workerLineBuffer.indexOf("\n")) !== -1) {
+    const line = workerLineBuffer.slice(0, idx).trim();
+    workerLineBuffer = workerLineBuffer.slice(idx + 1);
+    if (!line) continue;
+
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch (_) {
+      continue; // ignore non-JSON lines
+    }
+
+    if (workerState === "starting" && parsed.status === "ready") {
+      workerState = "ready";
+      log("Julia worker ready");
+      if (onReady) {
+        onReady.resolve();
+        onReady = null;
+      }
+    } else if (workerState === "ready" && onResult) {
+      const cb = onResult;
+      onResult = null;
+      cb.resolve(parsed);
+    }
+  }
+}
+
+function cleanupWorker() {
+  workerProc = null;
+  workerState = "idle";
+  workerLineBuffer = "";
+
+  const err = new Error("Julia worker exited unexpectedly");
+  if (onReady) {
+    onReady.reject(err);
+    onReady = null;
+  }
+  if (onResult) {
+    onResult.reject(err);
+    onResult = null;
+  }
+}
+
+function ensureWorker() {
+  if (workerState === "ready") return Promise.resolve();
+
+  if (workerState === "starting") {
+    return new Promise((resolve, reject) => {
+      onReady = { resolve, reject };
+    });
+  }
+
+  // Spawn a new worker
+  return new Promise((resolve, reject) => {
+    workerState = "starting";
+    onReady = { resolve, reject };
+
+    log("spawning persistent Julia worker");
+
+    workerProc = spawn(
+      "julia",
+      ["--startup-file=no", `--project=${PROJECT_DIR}`, WORKER_SCRIPT],
+      { stdio: ["pipe", "pipe", "pipe"] }
+    );
+
+    workerProc.stderr.on("data", (d) => {
+      process.stderr.write(d); // forward Julia's stderr to MCP log
+    });
+
+    workerProc.stdout.on("data", (chunk) => {
+      workerLineBuffer += chunk.toString();
+      processWorkerLines();
+    });
+
+    workerProc.on("error", (err) => {
+      log(`Julia worker spawn error: ${err.message}`);
+      cleanupWorker();
+    });
+
+    workerProc.on("close", (code) => {
+      log(`Julia worker exited (code ${code})`);
+      cleanupWorker();
+    });
+  });
+}
+
+function sendToWorker(filePath) {
+  return new Promise((resolve, reject) => {
+    onResult = { resolve, reject };
+    workerProc.stdin.write(filePath + "\n");
+  });
+}
+
+// Kill worker on exit
+process.on("exit", () => {
+  if (workerProc) {
+    workerProc.kill();
+  }
+});
 
 // ── Protocol handlers ─────────────────────────────────────────────────────
 
@@ -147,69 +258,45 @@ function handleToolsList(id) {
   };
 }
 
-function handleToolsCall(id, params) {
+async function handleToolsCall(id, params) {
   const name = (params && params.name) || "";
   const args = (params && params.arguments) || {};
 
   if (name === "scw_fixed_points") {
     return executeScwFixedPoints(id, args);
   }
-  return Promise.resolve(makeError(id, -32601, `Unknown tool: ${name}`));
+  return makeError(id, -32601, `Unknown tool: ${name}`);
 }
 
-// ── Tool execution (spawns Julia) ─────────────────────────────────────────
+// ── Tool execution (uses persistent Julia worker) ─────────────────────────
 
-function executeScwFixedPoints(id, args) {
-  return new Promise((resolve) => {
-    const filePath = args.file_path || "";
-    if (!filePath) {
-      resolve(makeError(id, -32602, "Missing required parameter: file_path"));
-      return;
+async function executeScwFixedPoints(id, args) {
+  const filePath = args.file_path || "";
+  if (!filePath) {
+    return makeError(id, -32602, "Missing required parameter: file_path");
+  }
+
+  try {
+    await ensureWorker();
+
+    log(`analyzing ${path.basename(filePath)}`);
+    const result = await sendToWorker(filePath);
+
+    if (result.ok) {
+      log("analysis complete");
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          content: [{ type: "text", text: result.text }],
+        },
+      };
+    } else {
+      return makeError(id, -32603, `Analysis failed: ${result.error}`);
     }
-
-    log(`spawning Julia for ${path.basename(filePath)}`);
-
-    const proc = spawn(
-      "julia",
-      ["--startup-file=no", `--project=${PROJECT_DIR}`, ANALYSIS_SCRIPT, filePath],
-      { stdio: ["ignore", "pipe", "pipe"] }
-    );
-
-    let stdout = "";
-    let stderrBuf = "";
-
-    proc.stdout.on("data", (d) => {
-      stdout += d;
-    });
-    proc.stderr.on("data", (d) => {
-      stderrBuf += d;
-      process.stderr.write(d); // forward Julia's stderr to the MCP log
-    });
-
-    proc.on("error", (err) => {
-      resolve(
-        makeError(id, -32603, `Failed to start Julia: ${err.message}`)
-      );
-    });
-
-    proc.on("close", (code) => {
-      if (code === 0 && stdout) {
-        log(`Julia finished successfully`);
-        resolve({
-          jsonrpc: "2.0",
-          id,
-          result: {
-            content: [{ type: "text", text: stdout }],
-          },
-        });
-      } else {
-        const errMsg =
-          stderrBuf.trim() || stdout.trim() || `Julia exited with code ${code}`;
-        log(`Julia failed: ${errMsg}`);
-        resolve(makeError(id, -32603, `Analysis failed: ${errMsg}`));
-      }
-    });
-  });
+  } catch (err) {
+    return makeError(id, -32603, `Julia worker error: ${err.message}`);
+  }
 }
 
 function makeError(id, code, message) {
@@ -227,7 +314,7 @@ async function main() {
     try {
       msg = await readMessage();
     } catch (_) {
-      break; // EOF or stdin closed
+      break;
     }
 
     const method = msg.method || null;
