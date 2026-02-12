@@ -418,22 +418,31 @@ end
 # ── Main event loop ─────────────────────────────────────────────────────────
 
 function main()
-    # Disable C-level stdout buffering — critical for MCP over pipes.
-    # Julia buffers stdout when connected to a pipe (not a TTY),
-    # so the MCP host may never see responses without this.
-    if Sys.iswindows()
-        # On Windows, stdout is a macro (__acrt_iob_func(1)), not an exported symbol.
-        cstdout_ptr = ccall((:__acrt_iob_func, "ucrtbase"), Ptr{Cvoid}, (UInt32,), 1)
-        ionbf = 0x0004  # _IONBF value on Windows UCRT
-    else
-        cstdout_ptr = unsafe_load(cglobal(:stdout, Ptr{Cvoid}))
-        ionbf = 2  # _IONBF value on POSIX
+    println(stderr, "crossimpactbalances-mcp: starting (Julia ", VERSION, ")")
+
+    # Try to disable C-level stdout buffering (helps on some platforms).
+    # Wrapped in try-catch because the C symbol lookup can fail on some
+    # Windows configurations; the flush() calls in send_message are the
+    # primary mechanism and always work.
+    try
+        if Sys.iswindows()
+            cstdout_ptr = ccall((:__acrt_iob_func, "ucrtbase"), Ptr{Cvoid}, (UInt32,), 1)
+            ionbf = 0x0004  # _IONBF on Windows UCRT
+        else
+            cstdout_ptr = unsafe_load(cglobal(:stdout, Ptr{Cvoid}))
+            ionbf = 2  # _IONBF on POSIX
+        end
+        ccall(:setvbuf, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cint, Csize_t),
+              cstdout_ptr, C_NULL, ionbf, 0)
+    catch e
+        println(stderr, "crossimpactbalances-mcp: setvbuf failed (non-fatal): ",
+                sprint(showerror, e))
     end
-    ccall(:setvbuf, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cint, Csize_t),
-          cstdout_ptr, C_NULL, ionbf, 0)
 
     input = stdin
     output = stdout
+
+    println(stderr, "crossimpactbalances-mcp: ready, waiting for messages")
 
     while !eof(input)
         local msg
@@ -443,13 +452,17 @@ function main()
             if isa(e, EOFError)
                 break
             end
-            println(stderr, "Error reading message: ", sprint(showerror, e))
+            println(stderr, "crossimpactbalances-mcp: read error: ",
+                    sprint(showerror, e))
             continue
         end
 
         method = get(msg, "method", nothing)
         id = get(msg, "id", nothing)
         params = get(msg, "params", Dict())
+
+        println(stderr, "crossimpactbalances-mcp: ← ", something(method, "?"),
+                !isnothing(id) ? " (id=$id)" : "")
 
         response = nothing
 
@@ -467,8 +480,12 @@ function main()
 
         if !isnothing(response)
             send_message(output, response)
+            println(stderr, "crossimpactbalances-mcp: → response for ",
+                    something(method, "?"), " (id=$id)")
         end
     end
+
+    println(stderr, "crossimpactbalances-mcp: shutting down (EOF)")
 end
 
 main()
