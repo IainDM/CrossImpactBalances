@@ -34,6 +34,7 @@ mutable struct CIB
     kernel::Vector{Vector{Int}}
     thresholds::Vector{Int}
     mc_threshold::Int
+    desc_offsets::Vector{Int}   # cumulative variant offsets per descriptor
 end
 
 # ─── .scw file parser ───────────────────────────────────────────────────────
@@ -113,8 +114,15 @@ function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
     ndesc = d + 1
     thresholds = zeros(Int, ndesc)
 
+    desc_offsets = Vector{Int}(undef, ndesc)
+    off = 0
+    for i in 1:ndesc
+        desc_offsets[i] = off
+        off += nvars[i]
+    end
+
     cib = CIB(descriptors, variants, nvars, cim, n, ndesc,
-              Vector{Vector{Int}}(), thresholds, mc_threshold)
+              Vector{Vector{Int}}(), thresholds, mc_threshold, desc_offsets)
 
     # Load kernel
     if !isnothing(kernel)
@@ -367,60 +375,73 @@ function _find_consistent_exhaustive(cib::CIB; ignore_cycles::Bool=true)
     nt = Threads.nthreads()
     chunk_size = cld(n, nt)
     ndesc = cib.ndesc
-    ndim = cib.ndim
+    cim = cib.cim
+    nvariants = cib.nvariants
+    offsets = cib.desc_offsets
 
     local_kerns = [Vector{Vector{Int}}() for _ in 1:nt]
 
     Threads.@threads for chunk in 1:nt
-        # Pre-allocated working buffers — zero allocations in the hot loop
-        v  = Vector{Int}(undef, ndesc)
-        ib = Vector{Int}(undef, ndim)
+        v    = Vector{Int}(undef, ndesc)
         tndx = Vector{Int}(undef, ndesc)
 
         first_sig = (chunk - 1) * chunk_size
         last_sig  = min(chunk * chunk_size - 1, n - 1)
 
+        # Decode first_sig once (the only divmod in this chunk)
+        s = first_sig
+        @inbounds for i in 1:ndesc
+            nv = nvariants[i]
+            v[i] = s % nv
+            tndx[i] = offsets[i] + v[i] + 1
+            s = s ÷ nv
+        end
+
         for sig in first_sig:last_sig
-            # inv_signature in-place
-            s = sig
-            @inbounds for i in 1:ndesc
-                nv = cib.nvariants[i]
-                v[i] = s % nv
-                s = s ÷ nv
-            end
-
-            # One succession_step: compute impact balance, pick best variant
-            offset = 0
-            @inbounds for i in 1:ndesc
-                tndx[i] = offset + v[i] + 1
-                offset += cib.nvariants[i]
-            end
-            fill!(ib, 0)
-            @inbounds for r in tndx
-                for j in 1:ndim
-                    ib[j] += cib.cim[r, j]
-                end
-            end
-
-            # Check if v is a fixed point: does each descriptor already hold
-            # the variant with the highest impact score?
+            # ── Per-descriptor fixed-point check with early exit ──
+            # Compute impact score only for columns we need. If any
+            # competitor variant beats the current one, bail immediately.
             fixed = true
-            start = 1
             @inbounds for i in 1:ndesc
-                nv = cib.nvariants[i]
-                max_val = ib[start + v[i]]
+                nv = nvariants[i]
+                off = offsets[i]
+                cur_col = off + v[i] + 1
+                # Score of current variant
+                cur_score = 0
+                for k in 1:ndesc
+                    cur_score += cim[tndx[k], cur_col]
+                end
+                # Does any other variant beat it?
                 for j in 0:nv-1
-                    if ib[start + j] > max_val
+                    j == v[i] && continue
+                    col = off + j + 1
+                    score = 0
+                    for k in 1:ndesc
+                        score += cim[tndx[k], col]
+                    end
+                    if score > cur_score
                         fixed = false
                         break
                     end
                 end
                 fixed || break
-                start += nv
             end
 
             if fixed
                 push!(local_kerns[chunk], copy(v))
+            end
+
+            # ── Mixed-radix increment (replaces inv_signature divmod) ──
+            if sig < last_sig
+                @inbounds for i in 1:ndesc
+                    v[i] += 1
+                    tndx[i] += 1
+                    if v[i] < nvariants[i]
+                        break
+                    end
+                    v[i] = 0
+                    tndx[i] = offsets[i] + 1
+                end
             end
         end
     end
@@ -450,6 +471,9 @@ function find_basins(cib::CIB)
     n = max_signature(cib) + 1
     ndesc = cib.ndesc
     ndim = cib.ndim
+    cim = cib.cim
+    nvariants = cib.nvariants
+    offsets = cib.desc_offsets
 
     # Cache: 0 = unvisited, -1 = cycle, k>0 = converges to fp with sig k-1
     cache = zeros(Int, n)
@@ -466,37 +490,40 @@ function find_basins(cib::CIB)
         # Decode start_sig into w
         s = start_sig
         @inbounds for i in 1:ndesc
-            w[i] = s % cib.nvariants[i]
-            s = s ÷ cib.nvariants[i]
+            w[i] = s % nvariants[i]
+            s = s ÷ nvariants[i]
         end
 
         empty!(history)
         push!(history, start_sig)
 
         while true
-            # ── inline succession_step on w ──
-            offset = 0
+            # ── inline succession_step: row-at-a-time with @simd ──
             @inbounds for i in 1:ndesc
-                tndx[i] = offset + w[i] + 1
-                offset += cib.nvariants[i]
+                tndx[i] = offsets[i] + w[i] + 1
             end
-            fill!(ib, 0)
-            @inbounds for r in tndx
-                for j in 1:ndim
-                    ib[j] += cib.cim[r, j]
+            r1 = tndx[1]
+            @inbounds @simd for j in 1:ndim
+                ib[j] = cim[r1, j]
+            end
+            for ki in 2:ndesc
+                r = @inbounds tndx[ki]
+                @inbounds @simd for j in 1:ndim
+                    ib[j] += cim[r, j]
                 end
             end
-            start_pos = 1
+            # Pick best variant per descriptor
             @inbounds for i in 1:ndesc
-                nv = cib.nvariants[i]
-                max_val = ib[start_pos + w[i]]
+                nv = nvariants[i]
+                off = offsets[i]
+                max_val = ib[off + w[i] + 1]
                 for j in 0:nv-1
-                    if ib[start_pos + j] > max_val
-                        max_val = ib[start_pos + j]
+                    score = ib[off + j + 1]
+                    if score > max_val
+                        max_val = score
                         w[i] = j
                     end
                 end
-                start_pos += nv
             end
 
             # Signature of w (the successor)
@@ -504,7 +531,7 @@ function find_basins(cib::CIB)
             order = 1
             @inbounds for i in 1:ndesc
                 w_sig += order * w[i]
-                order *= cib.nvariants[i]
+                order *= nvariants[i]
             end
 
             # ── Already resolved? Backfill entire history ──
