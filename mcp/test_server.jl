@@ -172,7 +172,8 @@ end
             @test tools[1]["name"] == "scw_fixed_points"
             @test haskey(tools[1], "inputSchema")
             schema = tools[1]["inputSchema"]
-            @test "file_path" in schema["required"]
+            @test haskey(schema["properties"], "file_path")
+            @test haskey(schema["properties"], "scw_content")
         end
 
         # ── 4. tools/call with CIB_global.scw ──
@@ -214,7 +215,58 @@ end
             @test occursin("= 36 total", text)
         end
 
-        # ── 5. tools/call with non-existent file ──
+        # ── 5. tools/call with scw_content ──
+        @testset "tools/call — scw_content" begin
+            scw_path = joinpath(SAMPLE_DIR, "CIB_global.scw")
+            scw_content = read(scw_path, String)
+            # Escape for JSON embedding
+            escaped_content = replace(scw_content, "\\" => "\\\\")
+            escaped_content = replace(escaped_content, "\"" => "\\\"")
+            escaped_content = replace(escaped_content, "\n" => "\\n")
+            escaped_content = replace(escaped_content, "\r" => "\\r")
+            escaped_content = replace(escaped_content, "\t" => "\\t")
+            call_msg = """{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"scw_fixed_points","arguments":{"scw_content":"$escaped_content"}}}"""
+            write(proc, mcp_frame(call_msg))
+            flush(proc)
+
+            resp = read_mcp_response(proc)
+            @test resp["id"] == 10
+            @test haskey(resp, "result")
+            content = resp["result"]["content"]
+            @test length(content) >= 1
+            text = content[1]["text"]
+
+            # Same results as file_path test
+            @test occursin("Consistent Scenarios (Fixed Points): 4", text)
+            @test occursin("Total scenario space: 36", text)
+            @test occursin("= 36 total", text)
+        end
+
+        # ── 6. tools/call — both file_path and scw_content (error) ──
+        @testset "tools/call — both params error" begin
+            scw_path = joinpath(SAMPLE_DIR, "CIB_global.scw")
+            escaped_path = replace(scw_path, "\\" => "\\\\")
+            call_msg = """{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"scw_fixed_points","arguments":{"file_path":"$escaped_path","scw_content":"dummy"}}}"""
+            write(proc, mcp_frame(call_msg))
+            flush(proc)
+
+            resp = read_mcp_response(proc)
+            @test resp["id"] == 11
+            @test haskey(resp, "error")
+        end
+
+        # ── 7. tools/call — neither param (error) ──
+        @testset "tools/call — no input error" begin
+            call_msg = """{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"scw_fixed_points","arguments":{}}}"""
+            write(proc, mcp_frame(call_msg))
+            flush(proc)
+
+            resp = read_mcp_response(proc)
+            @test resp["id"] == 12
+            @test haskey(resp, "error")
+        end
+
+        # ── 8. tools/call with non-existent file ──
         @testset "tools/call — missing file" begin
             call_msg = """{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"scw_fixed_points","arguments":{"file_path":"/tmp/nonexistent.scw"}}}"""
             write(proc, mcp_frame(call_msg))

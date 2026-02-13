@@ -292,9 +292,15 @@ function handle_tools_list(id)
                             "file_path" => Dict(
                                 "type" => "string",
                                 "description" => "Absolute path to a ScenarioWizard .scw file"
+                            ),
+                            "scw_content" => Dict(
+                                "type" => "string",
+                                "description" => "Raw contents of a ScenarioWizard .scw file. " *
+                                    "Use this when the file content is available directly " *
+                                    "(e.g. uploaded or pasted) instead of as a filesystem path. " *
+                                    "Provide either file_path or scw_content, not both."
                             )
-                        ),
-                        "required" => ["file_path"]
+                        )
                     )
                 )
             ]
@@ -317,12 +323,25 @@ end
 
 function execute_scw_fixed_points(id, args)
     file_path = get(args, "file_path", "")
+    scw_content = get(args, "scw_content", "")
 
-    if isempty(file_path)
-        return make_error(id, -32602, "Missing required parameter: file_path")
+    if isempty(file_path) && isempty(scw_content)
+        return make_error(id, -32602, "Either file_path or scw_content must be provided")
+    end
+
+    if !isempty(file_path) && !isempty(scw_content)
+        return make_error(id, -32602, "Provide either file_path or scw_content, not both")
+    end
+
+    temp_file = ""
+    if !isempty(scw_content)
+        temp_file = tempname() * ".scw"
+        write(temp_file, scw_content)
+        file_path = temp_file
     end
 
     if !isfile(file_path)
+        !isempty(temp_file) && isfile(temp_file) && rm(temp_file)
         return make_error(id, -32602, "File not found: $file_path")
     end
 
@@ -342,6 +361,8 @@ function execute_scw_fixed_points(id, args)
         )
     catch e
         return make_error(id, -32603, "Analysis failed: $(sprint(showerror, e))")
+    finally
+        !isempty(temp_file) && isfile(temp_file) && rm(temp_file)
     end
 end
 
