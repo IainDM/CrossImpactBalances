@@ -28,6 +28,9 @@
 
 const { spawn } = require("child_process");
 const path = require("path");
+const os = require("os");
+const fs = require("fs");
+const crypto = require("crypto");
 
 const PROJECT_DIR = path.resolve(__dirname, "..");
 const WORKER_SCRIPT = path.join(__dirname, "julia_worker.jl");
@@ -35,6 +38,33 @@ const WORKER_SCRIPT = path.join(__dirname, "julia_worker.jl");
 const SERVER_NAME = "crossimpactbalances-mcp";
 const SERVER_VERSION = "0.1.0";
 const PROTOCOL_VERSION = "2025-06-18";
+
+// ── Temp file management (for scw_content parameter) ──────────────────────
+
+const tempFiles = new Set();
+
+function contentToTempFile(content) {
+  const hash = crypto
+    .createHash("sha256")
+    .update(content)
+    .digest("hex")
+    .slice(0, 16);
+  const tmpPath = path.join(os.tmpdir(), `cib-mcp-${hash}.scw`);
+  if (!fs.existsSync(tmpPath)) {
+    fs.writeFileSync(tmpPath, content, "utf-8");
+  }
+  tempFiles.add(tmpPath);
+  return tmpPath;
+}
+
+function cleanupTempFiles() {
+  for (const f of tempFiles) {
+    try {
+      fs.unlinkSync(f);
+    } catch (_) {}
+  }
+  tempFiles.clear();
+}
 
 // ── MCP transport (auto-detects Content-Length framing vs bare NDJSON) ─────
 
@@ -269,11 +299,12 @@ function sendToWorker(op, filePath, scenario) {
   });
 }
 
-// Kill worker on exit
+// Kill worker and clean up temp files on exit
 process.on("exit", () => {
   if (workerProc) {
     workerProc.kill();
   }
+  cleanupTempFiles();
 });
 
 // ── Protocol handlers ─────────────────────────────────────────────────────
@@ -310,8 +341,15 @@ function handleToolsList(id) {
                 type: "string",
                 description: "Absolute path to a ScenarioWizard .scw file",
               },
+              scw_content: {
+                type: "string",
+                description:
+                  "Raw contents of a ScenarioWizard .scw file. " +
+                  "Use this when the file content is available directly " +
+                  "(e.g. uploaded or pasted) instead of as a filesystem path. " +
+                  "Provide either file_path or scw_content, not both.",
+              },
             },
-            required: ["file_path"],
           },
         },
         {
@@ -328,8 +366,15 @@ function handleToolsList(id) {
                 type: "string",
                 description: "Absolute path to a ScenarioWizard .scw file",
               },
+              scw_content: {
+                type: "string",
+                description:
+                  "Raw contents of a ScenarioWizard .scw file. " +
+                  "Use this when the file content is available directly " +
+                  "(e.g. uploaded or pasted) instead of as a filesystem path. " +
+                  "Provide either file_path or scw_content, not both.",
+              },
             },
-            required: ["file_path"],
           },
         },
         {
@@ -346,6 +391,14 @@ function handleToolsList(id) {
                 type: "string",
                 description: "Absolute path to a ScenarioWizard .scw file",
               },
+              scw_content: {
+                type: "string",
+                description:
+                  "Raw contents of a ScenarioWizard .scw file. " +
+                  "Use this when the file content is available directly " +
+                  "(e.g. uploaded or pasted) instead of as a filesystem path. " +
+                  "Provide either file_path or scw_content, not both.",
+              },
               scenario: {
                 type: "object",
                 description:
@@ -355,7 +408,7 @@ function handleToolsList(id) {
                 additionalProperties: { type: "string" },
               },
             },
-            required: ["file_path", "scenario"],
+            required: ["scenario"],
           },
         },
         {
@@ -372,6 +425,14 @@ function handleToolsList(id) {
                 type: "string",
                 description: "Absolute path to a ScenarioWizard .scw file",
               },
+              scw_content: {
+                type: "string",
+                description:
+                  "Raw contents of a ScenarioWizard .scw file. " +
+                  "Use this when the file content is available directly " +
+                  "(e.g. uploaded or pasted) instead of as a filesystem path. " +
+                  "Provide either file_path or scw_content, not both.",
+              },
               scenario: {
                 type: "object",
                 description:
@@ -381,7 +442,7 @@ function handleToolsList(id) {
                 additionalProperties: { type: "string" },
               },
             },
-            required: ["file_path", "scenario"],
+            required: ["scenario"],
           },
         },
       ],
@@ -411,9 +472,26 @@ async function handleToolsCall(id, params) {
 // ── Tool execution (uses persistent Julia worker) ─────────────────────────
 
 async function executeWorkerTool(id, op, args) {
-  const filePath = args.file_path || "";
-  if (!filePath) {
-    return makeError(id, -32602, "Missing required parameter: file_path");
+  let filePath = args.file_path || "";
+  const scwContent = args.scw_content || "";
+
+  if (!filePath && !scwContent) {
+    return makeError(
+      id,
+      -32602,
+      "Either file_path or scw_content must be provided"
+    );
+  }
+  if (filePath && scwContent) {
+    return makeError(
+      id,
+      -32602,
+      "Provide either file_path or scw_content, not both"
+    );
+  }
+
+  if (scwContent) {
+    filePath = contentToTempFile(scwContent);
   }
 
   const scenario = args.scenario || null;
