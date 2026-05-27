@@ -1,12 +1,27 @@
+"""
+    CrossImpactBalances
+
+Cross-Impact Balance (CIB) scenario analysis. A Julia implementation of the
+methodology in Weimer-Jehle (2006), ported from the Python
+[sei-international/cibsa](https://github.com/sei-international/cibsa) library
+with a memoized basin-of-attraction analysis and a threaded exhaustive search.
+
+# Reference
+Weimer-Jehle, W. (2006). Cross-impact balances: A system-theoretical approach
+to cross-impact analysis. *Technological Forecasting and Social Change*,
+73(4), 334–361.
+"""
 module CrossImpactBalances
 
+using Random
 using SparseArrays
 
 export CIB, load_scw, load_solutions,
        impact_balance, own_impact_balance, cross_impact_balance, inner_product,
        succession_step, succession, find_consistent, find_basins,
        signature, inv_signature, max_signature,
-       sim_anneal, inner_product_matrix, build_graph, merge_scenarios
+       sim_anneal, inner_product_matrix, build_graph, merge_scenarios,
+       set_thresholds!, rand_scenario
 
 """
     CIB
@@ -23,8 +38,12 @@ Fields:
 - `kernel`: list of consistent scenarios (each a Vector{Int}, 0-based variant indices)
 - `thresholds`: per-descriptor thresholds for simulated annealing
 - `mc_threshold`: cutoff for switching to Monte Carlo sampling
+- `desc_offsets`: cumulative 0-based variant offsets per descriptor
+
+`CIB` is immutable in its field bindings. `kernel` and `thresholds` are
+`Vector`s whose contents may be mutated in place (see `set_thresholds!`).
 """
-mutable struct CIB
+struct CIB
     descriptors::Vector{String}
     variants::Dict{String, Vector{String}}
     nvariants::Vector{Int}
@@ -34,24 +53,30 @@ mutable struct CIB
     kernel::Vector{Vector{Int}}
     thresholds::Vector{Int}
     mc_threshold::Int
-    desc_offsets::Vector{Int}   # cumulative variant offsets per descriptor
+    desc_offsets::Vector{Int}
 end
 
 # ─── .scw file parser ───────────────────────────────────────────────────────
 
 """
-    load_scw(scw_file; sl_file=nothing, kernel=nothing, mc_threshold=10000, exhaustive=false) -> CIB
+    load_scw(scw_file; sl_file=nothing, kernel=nothing,
+             mc_threshold=10000, exhaustive=false,
+             rng=Random.default_rng()) -> CIB
 
 Parse a ScenarioWizard .scw file and optionally a .sl solutions file.
 Returns a fully populated CIB object.
 
 When `exhaustive=true`, every scenario in the space is checked (using threads
 when Julia is started with multiple threads, e.g. `julia -t8`).
+
+When the scenario space exceeds `mc_threshold` and `exhaustive=false`, a
+Monte-Carlo sample of that size is drawn without replacement using `rng`.
 """
 function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
                   kernel::Union{Vector{Vector{Int}},Nothing}=nothing,
                   mc_threshold::Int=10000,
-                  exhaustive::Bool=false)
+                  exhaustive::Bool=false,
+                  rng::AbstractRNG=Random.default_rng())
     descriptors = String[]
     variants = Dict{String, Vector{String}}()
     nvars = Int[]
@@ -103,9 +128,14 @@ function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
         end
     end
 
+    n == 0 && error("load_scw: no variants found in $(scw_file) — file is empty or malformed")
+    length(cim_rows) == n || error("load_scw: cross-impact matrix has $(length(cim_rows)) " *
+                                   "rows but $n variants in $(scw_file)")
+
     # Build CIM matrix
     cim = zeros(Int, n, n)
     for (i, row) in enumerate(cim_rows)
+        length(row) == n || error("load_scw: row $i of CIM has $(length(row)) entries but $n expected")
         for (j, val) in enumerate(row)
             cim[i, j] = val
         end
@@ -121,16 +151,16 @@ function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
         off += nvars[i]
     end
 
+    # Build CIB without a kernel first; if needed, populate kernel in place.
     cib = CIB(descriptors, variants, nvars, cim, n, ndesc,
               Vector{Vector{Int}}(), thresholds, mc_threshold, desc_offsets)
 
-    # Load kernel
     if !isnothing(kernel)
-        cib.kernel = kernel
+        append!(cib.kernel, kernel)
     elseif !isnothing(sl_file)
-        cib.kernel = load_solutions(cib, sl_file)
+        append!(cib.kernel, load_solutions(cib, sl_file))
     else
-        cib.kernel = find_consistent(cib; exhaustive=exhaustive)
+        append!(cib.kernel, find_consistent(cib; exhaustive=exhaustive, rng=rng))
     end
 
     return cib
@@ -164,7 +194,15 @@ end
 # ─── Index conversion helpers ───────────────────────────────────────────────
 
 """
-Convert 0-based variant indices (length ndesc) to 1-based CIM row/column indices.
+    varndx_to_tablendx(cib, u) -> Vector{Int}
+
+Convert a scenario `u` (length-`ndesc` vector of 0-based variant indices) to
+the corresponding 1-based row/column indices into `cib.cim`, i.e. the indices
+of `u`'s selected variants in the flat variant space.
+
+This is an internal helper used by [`impact_balance`](@ref) and friends. Hot
+loops in `find_basins` and `_find_consistent_exhaustive` inline the equivalent
+arithmetic to avoid the per-call allocation here.
 """
 function varndx_to_tablendx(cib::CIB, u::Vector{Int})
     tablendx = similar(u)
@@ -219,15 +257,56 @@ end
 # ─── Scenario sampling ──────────────────────────────────────────────────────
 
 """
-Return scenario signatures: all of them, or a random sample if the space exceeds mc_threshold.
+    get_scenario_signatures(cib; max=cib.mc_threshold, allow_dups=false, rng=...)
+
+Return scenario signatures: every signature in `0:n-1` if the space size `n`
+does not exceed `max`, otherwise a random sample of `max` signatures.
+
+By default the sample is drawn without replacement, matching Python CIBSA's
+`np.random.choice(..., replace=False)` behavior. Pass `allow_dups=true` to
+sample with replacement (cheaper but biased toward duplicates).
+
+`rng` controls reproducibility; pass a seeded `AbstractRNG` for deterministic
+sampling.
 """
-function get_scenario_signatures(cib::CIB)
+function get_scenario_signatures(cib::CIB;
+                                 max::Int=cib.mc_threshold,
+                                 allow_dups::Bool=false,
+                                 rng::AbstractRNG=Random.default_rng())
     n = max_signature(cib) + 1
-    if n > cib.mc_threshold
-        return rand(0:n-1, cib.mc_threshold)
-    else
+    if n <= max
         return 0:n-1
     end
+    if allow_dups
+        return rand(rng, 0:n-1, max)
+    end
+    return _sample_without_replacement(rng, n, max)
+end
+
+# Reservoir-style partial Fisher-Yates: O(max) extra memory + O(max) swaps.
+# Returns `max` distinct integers from 0:n-1 in random order.
+function _sample_without_replacement(rng::AbstractRNG, n::Int, max::Int)
+    @assert max <= n
+    # When `max` is close to `n` a dense permutation is cheaper; otherwise a
+    # hash-table-based partial shuffle keeps memory at O(max).
+    if max * 4 >= n
+        perm = randperm(rng, n) .- 1  # 0-based signatures
+        return perm[1:max]
+    end
+    seen = Dict{Int,Int}()  # virtual swap map: i -> what value lives at position i
+    result = Vector{Int}(undef, max)
+    @inbounds for i in 1:max
+        # Pick j uniformly from {i, i+1, ..., n} (1-based positions in conceptual array)
+        j = rand(rng, i:n)
+        # Read the value at position j (default = j-1, the original integer)
+        vj = get(seen, j, j - 1)
+        # Read the value at position i (default = i-1)
+        vi = get(seen, i, i - 1)
+        # Swap positions i and j conceptually
+        seen[j] = vi
+        result[i] = vj
+    end
+    return result
 end
 
 # ─── Impact balance ─────────────────────────────────────────────────────────
@@ -314,48 +393,51 @@ end
 Follow global succession from scenario `u` until convergence to a fixed point
 or detection of a cycle. Returns (cycle_length, final_scenario).
 cycle_length=1 means a consistent scenario (fixed point).
+
+Cycle detection uses an O(1)-per-step hashtable, so total work is linear in
+the trajectory length.
 """
 function succession(cib::CIB, u::Vector{Int})
-    iterations_sig = Int[signature(cib, u)]
+    start_sig = signature(cib, u)
+    history_sig = Int[start_sig]
+    seen = Dict{Int,Int}()  # signature -> 1-based position in history_sig
+    seen[start_sig] = 1
     v = copy(u)
     while true
         v = succession_step(cib, v)
         v_sig = signature(cib, v)
-        # Check history in reverse for cycle detection
-        n = 1
-        foundit = false
-        for k in length(iterations_sig):-1:1
-            if iterations_sig[k] == v_sig
-                foundit = true
-                break
-            end
-            n += 1
+        if haskey(seen, v_sig)
+            cycle_len = length(history_sig) - seen[v_sig] + 1
+            return (cycle_len, v)
         end
-        if foundit
-            return (n, v)
-        end
-        push!(iterations_sig, v_sig)
+        push!(history_sig, v_sig)
+        seen[v_sig] = length(history_sig)
     end
 end
 
 # ─── Find consistent scenarios ──────────────────────────────────────────────
 
 """
-    find_consistent(cib; ignore_cycles=true, exhaustive=false) -> Vector{Vector{Int}}
+    find_consistent(cib; ignore_cycles=true, exhaustive=false,
+                    rng=Random.default_rng()) -> Vector{Vector{Int}}
 
 Find all consistent scenarios by running succession from every (or sampled) starting point.
 
 When `exhaustive=true`, every scenario in the space is enumerated, using all
 available threads (start Julia with `julia -t auto` or `julia -t8`).
 This guarantees finding all fixed points but requires iterating the full space.
+
+When `exhaustive=false` and the space exceeds `cib.mc_threshold`, scenarios
+are sampled without replacement using `rng`.
 """
-function find_consistent(cib::CIB; ignore_cycles::Bool=true, exhaustive::Bool=false)
+function find_consistent(cib::CIB; ignore_cycles::Bool=true, exhaustive::Bool=false,
+                         rng::AbstractRNG=Random.default_rng())
     if exhaustive
         return _find_consistent_exhaustive(cib; ignore_cycles=ignore_cycles)
     end
     kern = Vector{Vector{Int}}()
     seen = Set{Int}()
-    for v_sig in get_scenario_signatures(cib)
+    for v_sig in get_scenario_signatures(cib; rng=rng)
         v = inv_signature(cib, v_sig)
         nper, veqm = succession(cib, v)
         if ignore_cycles && nper > 1
@@ -370,6 +452,18 @@ function find_consistent(cib::CIB; ignore_cycles::Bool=true, exhaustive::Bool=fa
     return kern
 end
 
+"""
+    _find_consistent_exhaustive(cib; ignore_cycles=true) -> Vector{Vector{Int}}
+
+Internal threaded exhaustive search. Partitions the signature space across
+`Threads.nthreads()` chunks; within each chunk uses a mixed-radix counter to
+avoid a `divmod` per signature, and a per-descriptor early-exit fixed-point
+check that bails as soon as any competitor variant beats the current one.
+
+`ignore_cycles` is accepted for API symmetry with [`find_consistent`](@ref)
+but is unused here: this routine only emits true fixed points (cycle length
+1), so non-fixed-point cycles never appear.
+"""
 function _find_consistent_exhaustive(cib::CIB; ignore_cycles::Bool=true)
     n = max_signature(cib) + 1
     nt = Threads.nthreads()
@@ -601,19 +695,32 @@ end
 # ─── Simulated annealing ────────────────────────────────────────────────────
 
 """
-    sim_anneal(cib, u; ignore_cycles=true, return_weights=false)
+    sim_anneal(cib, u; ignore_cycles=true, return_weights=false,
+               rng=Random.default_rng())
 
-Simulated annealing: find scenarios accessible from `u` under threshold perturbation.
-If return_weights=true, returns a Dict mapping signature => count.
-Otherwise returns a list of accessible attractor scenarios.
+Threshold-gated accessibility analysis (a misnomer carried over from the
+Python CIBSA reference — it is *not* a classical simulated-annealing
+optimizer). For each candidate scenario `v` drawn from the scenario space (or
+a Monte-Carlo sample when it exceeds `cib.mc_threshold`), accept `v` only if
+its cross-impact at `v` exceeds `u`'s own impact by at least
+`cib.thresholds[i]` in every descriptor `i`. Each accepted `v` is then
+deterministically run to a fixed point via [`succession`](@ref).
+
+When `return_weights=true`, returns a `Dict` mapping the signature of each
+reachable fixed point to the number of accepted candidates that converge to
+it (with a special `"reject"` key for candidates that fail the threshold
+gate). Otherwise returns the list of distinct reachable fixed points.
+
+`rng` controls the Monte-Carlo sample when one is drawn.
 """
 function sim_anneal(cib::CIB, u::Vector{Int};
-                    ignore_cycles::Bool=true, return_weights::Bool=false)
+                    ignore_cycles::Bool=true, return_weights::Bool=false,
+                    rng::AbstractRNG=Random.default_rng())
     accessible = Vector{Vector{Int}}()
     weights = Dict{Any,Int}()
     weights["reject"] = 0
     uib = own_impact_balance(cib, u)
-    sig_set = get_scenario_signatures(cib)
+    sig_set = get_scenario_signatures(cib; rng=rng)
 
     for v_sig in sig_set
         v = inv_signature(cib, v_sig)
@@ -720,6 +827,39 @@ function merge_scenarios(cib::CIB)
     end
 
     return components
+end
+
+# ─── Mutators and helpers ────────────────────────────────────────────────────
+
+"""
+    set_thresholds!(cib::CIB, thr::AbstractVector{<:Integer}) -> CIB
+
+Replace `cib.thresholds` element-wise with `thr`. The length of `thr` must
+equal `cib.ndesc`. Returns `cib` so calls can be chained.
+
+The threshold vector is consumed by [`sim_anneal`](@ref), [`build_graph`](@ref),
+and [`merge_scenarios`](@ref); it has no effect on `find_consistent` or
+`find_basins`.
+"""
+function set_thresholds!(cib::CIB, thr::AbstractVector{<:Integer})
+    length(thr) == cib.ndesc ||
+        throw(DimensionMismatch("set_thresholds!: expected length $(cib.ndesc), got $(length(thr))"))
+    copyto!(cib.thresholds, thr)
+    return cib
+end
+
+"""
+    rand_scenario(cib::CIB; rng=Random.default_rng()) -> Vector{Int}
+
+Return a uniformly random scenario, i.e. a length-`ndesc` vector of 0-based
+variant indices with `0 ≤ u[i] < cib.nvariants[i]`.
+"""
+function rand_scenario(cib::CIB; rng::AbstractRNG=Random.default_rng())
+    u = Vector{Int}(undef, cib.ndesc)
+    @inbounds for i in 1:cib.ndesc
+        u[i] = rand(rng, 0:cib.nvariants[i] - 1)
+    end
+    return u
 end
 
 end # module
