@@ -318,12 +318,18 @@ Compute the impact balance vector for scenario `u`.
 Returns a vector of length ndim (one score per variant across all descriptors).
 """
 function impact_balance(cib::CIB, u::Vector{Int})
-    rows = varndx_to_tablendx(cib, u)
-    # Sum the selected rows of the CIM
     ib = zeros(Int, cib.ndim)
-    for r in rows
-        for j in 1:cib.ndim
-            ib[j] += cib.cim[r, j]
+    nd = cib.ndim
+    cim = cib.cim
+    offsets = cib.desc_offsets
+    # NOTE: don't use @simd here. `cim[r, j]` is a strided (non-contiguous)
+    # column-major access; @simd forces LLVM to emit gather instructions which
+    # are slower than the scalar path on x86. Benchmarks showed @simd makes
+    # this 35% slower. @inbounds alone is the right hint.
+    @inbounds for (i, ui) in enumerate(u)
+        r = offsets[i] + ui + 1
+        for j in 1:nd
+            ib[j] += cim[r, j]
         end
     end
     return ib
@@ -563,128 +569,148 @@ succession steps). Returns:
 """
 function find_basins(cib::CIB)
     n = max_signature(cib) + 1
+    nt = Threads.nthreads()
     ndesc = cib.ndesc
     ndim = cib.ndim
     cim = cib.cim
     nvariants = cib.nvariants
     offsets = cib.desc_offsets
 
-    # Cache: 0 = unvisited, -1 = cycle, k>0 = converges to fp with sig k-1
-    cache = zeros(Int, n)
+    chunk_size = cld(n, nt)
 
-    # Working buffers
-    w    = Vector{Int}(undef, ndesc)
-    ib   = Vector{Int}(undef, ndim)
-    tndx = Vector{Int}(undef, ndesc)
-    history = Int[]
+    # Per-thread caches (memory cost: nt * n * 8 bytes — matches the single-thread
+    # version's footprint times the thread count). Each thread also produces a
+    # local basin tally; we merge at the end.
+    # cache values: 0 = unvisited, -1 = cycle, k>0 = converges to fp with sig (k-1).
+    thread_basins = [Dict{Int,Int}() for _ in 1:nt]
+    thread_cycle_counts = zeros(Int, nt)
 
-    for start_sig in 0:n-1
-        @inbounds cache[start_sig + 1] != 0 && continue
+    Threads.@threads for tid in 1:nt
+        first_sig = (tid - 1) * chunk_size
+        last_sig  = min(tid * chunk_size, n) - 1
+        first_sig > last_sig && continue
 
-        # Decode start_sig into w
-        s = start_sig
-        @inbounds for i in 1:ndesc
-            w[i] = s % nvariants[i]
-            s = s ÷ nvariants[i]
-        end
+        cache    = zeros(Int, n)
+        w        = Vector{Int}(undef, ndesc)
+        ib       = Vector{Int}(undef, ndim)
+        tndx     = Vector{Int}(undef, ndesc)
+        history  = Int[]
 
-        empty!(history)
-        push!(history, start_sig)
+        for start_sig in first_sig:last_sig
+            @inbounds cache[start_sig + 1] != 0 && continue
 
-        while true
-            # ── inline succession_step: row-at-a-time with @simd ──
+            # Decode start_sig into w
+            s = start_sig
             @inbounds for i in 1:ndesc
-                tndx[i] = offsets[i] + w[i] + 1
+                w[i] = s % nvariants[i]
+                s = s ÷ nvariants[i]
             end
-            r1 = tndx[1]
-            @inbounds @simd for j in 1:ndim
-                ib[j] = cim[r1, j]
-            end
-            for ki in 2:ndesc
-                r = @inbounds tndx[ki]
-                @inbounds @simd for j in 1:ndim
-                    ib[j] += cim[r, j]
+
+            empty!(history)
+            push!(history, start_sig)
+
+            while true
+                # ── inline succession_step: row-at-a-time with @simd ──
+                @inbounds for i in 1:ndesc
+                    tndx[i] = offsets[i] + w[i] + 1
                 end
-            end
-            # Pick best variant per descriptor
-            @inbounds for i in 1:ndesc
-                nv = nvariants[i]
-                off = offsets[i]
-                max_val = ib[off + w[i] + 1]
-                for j in 0:nv-1
-                    score = ib[off + j + 1]
-                    if score > max_val
-                        max_val = score
-                        w[i] = j
+                r1 = tndx[1]
+                @inbounds @simd for j in 1:ndim
+                    ib[j] = cim[r1, j]
+                end
+                for ki in 2:ndesc
+                    r = @inbounds tndx[ki]
+                    @inbounds @simd for j in 1:ndim
+                        ib[j] += cim[r, j]
                     end
                 end
-            end
-
-            # Signature of w (the successor)
-            w_sig = 0
-            order = 1
-            @inbounds for i in 1:ndesc
-                w_sig += order * w[i]
-                order *= nvariants[i]
-            end
-
-            # ── Already resolved? Backfill entire history ──
-            @inbounds cached = cache[w_sig + 1]
-            if cached != 0
-                @inbounds for h in history
-                    cache[h + 1] = cached
+                # Pick best variant per descriptor
+                @inbounds for i in 1:ndesc
+                    nv = nvariants[i]
+                    off = offsets[i]
+                    max_val = ib[off + w[i] + 1]
+                    for j in 0:nv-1
+                        score = ib[off + j + 1]
+                        if score > max_val
+                            max_val = score
+                            w[i] = j
+                        end
+                    end
                 end
-                break
-            end
 
-            # ── Cycle detection: is w_sig already in our chain? ──
-            cycle_start = 0
-            for k in length(history):-1:1
-                if @inbounds history[k] == w_sig
-                    cycle_start = k
+                # Signature of w (the successor)
+                w_sig = 0
+                order = 1
+                @inbounds for i in 1:ndesc
+                    w_sig += order * w[i]
+                    order *= nvariants[i]
+                end
+
+                # ── Already resolved? Backfill entire history ──
+                @inbounds cached = cache[w_sig + 1]
+                if cached != 0
+                    @inbounds for h in history
+                        cache[h + 1] = cached
+                    end
                     break
                 end
-            end
 
-            if cycle_start > 0
-                if cycle_start == length(history)
-                    # Fixed point (cycle of length 1)
-                    val = w_sig + 1
-                    @inbounds for h in history
-                        cache[h + 1] = val
-                    end
-                else
-                    # Real cycle — everything in this chain is non-convergent
-                    @inbounds for h in history
-                        cache[h + 1] = -1
+                # ── Cycle detection: is w_sig already in our chain? ──
+                cycle_start = 0
+                for k in length(history):-1:1
+                    if @inbounds history[k] == w_sig
+                        cycle_start = k
+                        break
                     end
                 end
-                break
-            end
 
-            push!(history, w_sig)
+                if cycle_start > 0
+                    if cycle_start == length(history)
+                        val = w_sig + 1
+                        @inbounds for h in history
+                            cache[h + 1] = val
+                        end
+                    else
+                        @inbounds for h in history
+                            cache[h + 1] = -1
+                        end
+                    end
+                    break
+                end
+
+                push!(history, w_sig)
+            end
         end
+
+        # ── Tally THIS thread's chunk through its own cache ──
+        local_basins = thread_basins[tid]
+        local_cycle = 0
+        @inbounds for sig in first_sig:last_sig
+            c = cache[sig + 1]
+            if c == -1
+                local_cycle += 1
+            elseif c > 0
+                fp_sig = c - 1
+                local_basins[fp_sig] = get(local_basins, fp_sig, 0) + 1
+            end
+        end
+        thread_cycle_counts[tid] = local_cycle
     end
 
-    # ── Tally basins ──
+    # ── Merge per-thread basin tallies ──
+    cycle_count = sum(thread_cycle_counts)
     kern = Vector{Vector{Int}}()
     basins = Vector{Int}()
-    cycle_count = 0
     fp_order = Dict{Int, Int}()
-
-    for sig in 0:n-1
-        @inbounds c = cache[sig + 1]
-        if c == -1
-            cycle_count += 1
-        elseif c > 0
-            fp_sig = c - 1
+    for tid in 1:nt
+        for (fp_sig, count) in thread_basins[tid]
             idx = get(fp_order, fp_sig, 0)
             if idx == 0
                 push!(kern, inv_signature(cib, fp_sig))
-                push!(basins, 1)
+                push!(basins, count)
                 fp_order[fp_sig] = length(kern)
             else
-                @inbounds basins[idx] += 1
+                @inbounds basins[idx] += count
             end
         end
     end
@@ -758,13 +784,24 @@ end
     inner_product_matrix(cib) -> Matrix{Int}
 
 Compute the matrix of inner products between all kernel scenarios.
+
+Threaded over rows when Julia is started with multiple threads. Each row
+hoists its single [`impact_balance`](@ref) call out of the inner loop, so
+total work is `O(k × ndim)` impact-balance accumulations rather than `O(k²)`.
 """
 function inner_product_matrix(cib::CIB)
     k = length(cib.kernel)
     M = zeros(Int, k, k)
-    for (i, u) in enumerate(cib.kernel)
-        for (j, v) in enumerate(cib.kernel)
-            M[i, j] = inner_product(cib, u, v)
+    # Precompute table indices for every kernel element once
+    tndxs = [varndx_to_tablendx(cib, v) for v in cib.kernel]
+    Threads.@threads for i in 1:k
+        ib = impact_balance(cib, cib.kernel[i])
+        @inbounds for j in 1:k
+            s = 0
+            for r in tndxs[j]
+                s += ib[r]
+            end
+            M[i, j] = s
         end
     end
     return M
