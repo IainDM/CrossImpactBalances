@@ -32,7 +32,13 @@ Fields:
 - `descriptors`: ordered list of descriptor names
 - `variants`: dict mapping descriptor name to list of variant names
 - `nvariants`: number of variants per descriptor
-- `cim`: the cross-impact matrix (n × n), n = sum of all variants
+- `cim`: the cross-impact matrix (n × n), n = sum of all variants. Row `r`
+  holds the impacts contributed by variant `r` onto every other variant.
+- `cim_t`: the transpose of `cim` — `cim_t[j, r] == cim[r, j]`. Stored
+  alongside `cim` so that "sum a fixed-row vector across many `j`" hot
+  loops (impact_balance, find_basins) can iterate contiguously through
+  column-major storage, which unlocks SIMD. Construction cost is one
+  `permutedims` at load time.
 - `ndim`: total number of variants (size of CIM)
 - `ndesc`: number of descriptors
 - `kernel`: list of consistent scenarios (each a Vector{Int}, 0-based variant indices)
@@ -48,6 +54,7 @@ struct CIB
     variants::Dict{String, Vector{String}}
     nvariants::Vector{Int}
     cim::Matrix{Int}
+    cim_t::Matrix{Int}
     ndim::Int
     ndesc::Int
     kernel::Vector{Vector{Int}}
@@ -151,8 +158,12 @@ function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
         off += nvars[i]
     end
 
+    # Precompute the transpose so impact_balance / find_basins can do
+    # contiguous SIMD column reads in cim_t (= the row vectors of cim).
+    cim_t = permutedims(cim)
+
     # Build CIB without a kernel first; if needed, populate kernel in place.
-    cib = CIB(descriptors, variants, nvars, cim, n, ndesc,
+    cib = CIB(descriptors, variants, nvars, cim, cim_t, n, ndesc,
               Vector{Vector{Int}}(), thresholds, mc_threshold, desc_offsets)
 
     if !isnothing(kernel)
@@ -320,16 +331,12 @@ Returns a vector of length ndim (one score per variant across all descriptors).
 function impact_balance(cib::CIB, u::Vector{Int})
     ib = zeros(Int, cib.ndim)
     nd = cib.ndim
-    cim = cib.cim
+    cim_t = cib.cim_t                      # row r of cim lives at column r of cim_t
     offsets = cib.desc_offsets
-    # NOTE: don't use @simd here. `cim[r, j]` is a strided (non-contiguous)
-    # column-major access; @simd forces LLVM to emit gather instructions which
-    # are slower than the scalar path on x86. Benchmarks showed @simd makes
-    # this 35% slower. @inbounds alone is the right hint.
     @inbounds for (i, ui) in enumerate(u)
         r = offsets[i] + ui + 1
-        for j in 1:nd
-            ib[j] += cim[r, j]
+        @simd for j in 1:nd
+            ib[j] += cim_t[j, r]           # contiguous column read → AVX-512
         end
     end
     return ib
@@ -572,7 +579,7 @@ function find_basins(cib::CIB)
     nt = Threads.nthreads()
     ndesc = cib.ndesc
     ndim = cib.ndim
-    cim = cib.cim
+    cim_t = cib.cim_t   # row-vectors of cim live as columns of cim_t (SIMD-friendly)
     nvariants = cib.nvariants
     offsets = cib.desc_offsets
 
@@ -616,12 +623,12 @@ function find_basins(cib::CIB)
                 end
                 r1 = tndx[1]
                 @inbounds @simd for j in 1:ndim
-                    ib[j] = cim[r1, j]
+                    ib[j] = cim_t[j, r1]
                 end
                 for ki in 2:ndesc
                     r = @inbounds tndx[ki]
                     @inbounds @simd for j in 1:ndim
-                        ib[j] += cim[r, j]
+                        ib[j] += cim_t[j, r]
                     end
                 end
                 # Pick best variant per descriptor
