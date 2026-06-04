@@ -235,93 +235,98 @@ def find_good_seed(ndesc, nvars, value_range=3, max_seed=200):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-SAMPLE_DIR = "/home/user/CrossImpactBalances/test/sample_files"
-results = {}
+def main():
+    SAMPLE_DIR = "/home/user/CrossImpactBalances/test/sample_files"
+    results = {}
 
-# Medium: 5 descriptors, 4 variants each = 1024 scenarios
-# Use lower value_range to increase chance of fixed points
-print("Scanning for good seeds (medium)...")
-seed_med, nk_med = find_good_seed(5, [4, 4, 4, 4, 4], value_range=3)
-print(f"  Medium: seed={seed_med}, {nk_med} consistent scenarios")
+    # Medium: 5 descriptors, 4 variants each = 1024 scenarios
+    # Use lower value_range to increase chance of fixed points
+    print("Scanning for good seeds (medium)...")
+    seed_med, nk_med = find_good_seed(5, [4, 4, 4, 4, 4], value_range=3)
+    print(f"  Medium: seed={seed_med}, {nk_med} consistent scenarios")
 
-# Large: 8 descriptors, 3 variants each = 6561 scenarios
-print("Scanning for good seeds (large)...")
-seed_lrg, nk_lrg = find_good_seed(8, [3, 3, 3, 3, 3, 3, 3, 3], value_range=3)
-print(f"  Large: seed={seed_lrg}, {nk_lrg} consistent scenarios")
+    # Large: 8 descriptors, 3 variants each = 6561 scenarios
+    print("Scanning for good seeds (large)...")
+    seed_lrg, nk_lrg = find_good_seed(8, [3, 3, 3, 3, 3, 3, 3, 3], value_range=3)
+    print(f"  Large: seed={seed_lrg}, {nk_lrg} consistent scenarios")
 
-# Extra-large: 10 descriptors, 3 variants each = 59049 scenarios (uses MC sampling)
-print("Scanning for good seeds (xlarge, MC sampling)...")
-seed_xl, nk_xl = find_good_seed(10, [3, 3, 3, 3, 3, 3, 3, 3, 3, 3], value_range=2, max_seed=50)
-print(f"  XLarge: seed={seed_xl}, {nk_xl} consistent scenarios")
+    # Extra-large: 10 descriptors, 3 variants each = 59049 scenarios (uses MC sampling)
+    print("Scanning for good seeds (xlarge, MC sampling)...")
+    seed_xl, nk_xl = find_good_seed(10, [3, 3, 3, 3, 3, 3, 3, 3, 3, 3], value_range=2, max_seed=50)
+    print(f"  XLarge: seed={seed_xl}, {nk_xl} consistent scenarios")
 
-configs = [
-    ("bench_medium", 5, [4, 4, 4, 4, 4], 3, seed_med),
-    ("bench_large",  8, [3, 3, 3, 3, 3, 3, 3, 3], 3, seed_lrg),
-]
-if seed_xl is not None:
-    configs.append(("bench_xlarge", 10, [3, 3, 3, 3, 3, 3, 3, 3, 3, 3], 2, seed_xl))
+    configs = [
+        ("bench_medium", 5, [4, 4, 4, 4, 4], 3, seed_med),
+        ("bench_large",  8, [3, 3, 3, 3, 3, 3, 3, 3], 3, seed_lrg),
+    ]
+    if seed_xl is not None:
+        configs.append(("bench_xlarge", 10, [3, 3, 3, 3, 3, 3, 3, 3, 3, 3], 2, seed_xl))
 
-for name, ndesc, nvars, vrange, seed in configs:
-    scw_path = os.path.join(SAMPLE_DIR, f"{name}.scw")
+    for name, ndesc, nvars, vrange, seed in configs:
+        scw_path = os.path.join(SAMPLE_DIR, f"{name}.scw")
+        print(f"\n{'='*60}")
+        print(f"{name}: {ndesc} descriptors, variants={nvars}, "
+              f"total={np.prod(nvars)}, seed={seed}")
+
+        generate_scw(scw_path, ndesc, nvars, vrange, seed)
+
+        # Benchmark: find_consistent (3 runs, take median)
+        times_find = []
+        for trial in range(3):
+            t0 = time.perf_counter()
+            cib = CIB(scw_path)
+            times_find.append(time.perf_counter() - t0)
+
+        # Sort kernel by signature for deterministic ordering
+        cib.kernel.sort(key=lambda u: cib.signature(u))
+        kernel_sigs = [cib.signature(u) for u in cib.kernel]
+        t_find = sorted(times_find)[1]  # median of 3
+        print(f"  {len(cib.kernel)} consistent scenarios")
+        print(f"  find_consistent: {t_find:.4f}s (median of 3: {times_find})")
+
+        # Benchmark: inner_product_matrix (3 runs)
+        times_ipm = []
+        for trial in range(3):
+            t0 = time.perf_counter()
+            ipm = cib.inner_product_matrix()
+            times_ipm.append(time.perf_counter() - t0)
+
+        t_ipm = sorted(times_ipm)[1]
+        print(f"  inner_product_matrix: {t_ipm:.6f}s (median of 3)")
+
+        results[name] = {
+            "nvariants": nvars,
+            "total_scenarios": int(np.prod(nvars)),
+            "seed": seed,
+            "value_range": vrange,
+            "kernel_sigs": kernel_sigs,
+            "inner_product_matrix": ipm,
+            "n_kernel": len(cib.kernel),
+            "python_time_find_consistent_s": round(t_find, 6),
+            "python_time_ipm_s": round(t_ipm, 6),
+        }
+
+    # Save (convert numpy ints to native Python ints)
+    class NumpyEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return super().default(obj)
+
+    outpath = os.path.join(SAMPLE_DIR, "benchmark_expected.json")
+    with open(outpath, 'w') as f:
+        json.dump(results, f, indent=2, cls=NumpyEncoder)
+
     print(f"\n{'='*60}")
-    print(f"{name}: {ndesc} descriptors, variants={nvars}, "
-          f"total={np.prod(nvars)}, seed={seed}")
+    print(f"Results saved to {outpath}")
+    for name, r in results.items():
+        print(f"  {name}: {r['total_scenarios']} scenarios, "
+              f"{r['n_kernel']} consistent, "
+              f"python find={r['python_time_find_consistent_s']:.4f}s, "
+              f"python ipm={r['python_time_ipm_s']:.6f}s")
 
-    generate_scw(scw_path, ndesc, nvars, vrange, seed)
 
-    # Benchmark: find_consistent (3 runs, take median)
-    times_find = []
-    for trial in range(3):
-        t0 = time.perf_counter()
-        cib = CIB(scw_path)
-        times_find.append(time.perf_counter() - t0)
-
-    # Sort kernel by signature for deterministic ordering
-    cib.kernel.sort(key=lambda u: cib.signature(u))
-    kernel_sigs = [cib.signature(u) for u in cib.kernel]
-    t_find = sorted(times_find)[1]  # median of 3
-    print(f"  {len(cib.kernel)} consistent scenarios")
-    print(f"  find_consistent: {t_find:.4f}s (median of 3: {times_find})")
-
-    # Benchmark: inner_product_matrix (3 runs)
-    times_ipm = []
-    for trial in range(3):
-        t0 = time.perf_counter()
-        ipm = cib.inner_product_matrix()
-        times_ipm.append(time.perf_counter() - t0)
-
-    t_ipm = sorted(times_ipm)[1]
-    print(f"  inner_product_matrix: {t_ipm:.6f}s (median of 3)")
-
-    results[name] = {
-        "nvariants": nvars,
-        "total_scenarios": int(np.prod(nvars)),
-        "seed": seed,
-        "value_range": vrange,
-        "kernel_sigs": kernel_sigs,
-        "inner_product_matrix": ipm,
-        "n_kernel": len(cib.kernel),
-        "python_time_find_consistent_s": round(t_find, 6),
-        "python_time_ipm_s": round(t_ipm, 6),
-    }
-
-# Save (convert numpy ints to native Python ints)
-class NumpyEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return super().default(obj)
-
-outpath = os.path.join(SAMPLE_DIR, "benchmark_expected.json")
-with open(outpath, 'w') as f:
-    json.dump(results, f, indent=2, cls=NumpyEncoder)
-
-print(f"\n{'='*60}")
-print(f"Results saved to {outpath}")
-for name, r in results.items():
-    print(f"  {name}: {r['total_scenarios']} scenarios, "
-          f"{r['n_kernel']} consistent, "
-          f"python find={r['python_time_find_consistent_s']:.4f}s, "
-          f"python ipm={r['python_time_ipm_s']:.6f}s")
+if __name__ == "__main__":
+    main()
