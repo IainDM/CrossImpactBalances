@@ -1,0 +1,6 @@
+[deps]
+CrossImpactBalances = "afc69b00-438b-45c4-b5e2-26f87645c9e3"
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+
+[compat]
+Documenter = "1"
