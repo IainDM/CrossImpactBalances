@@ -1,0 +1,121 @@
+[
+  {
+    "file": "CIB_global",
+    "tool": "cibsa",
+    "total_scenarios": 36,
+    "parse_s": 0.000249,
+    "full_enum_s": 0.001626,
+    "full_enum_kernel_size": 4,
+    "full_enum_kernel_sigs": [
+      13,
+      16,
+      20,
+      21
+    ],
+    "mc_s": null,
+    "mc_threshold": 10000,
+    "mc_seed": 999,
+    "mc_kernel_size": null,
+    "mc_kernel_sigs": null,
+    "notes": ""
+  },
+  {
+    "file": "bench_medium",
+    "tool": "cibsa",
+    "total_scenarios": 1024,
+    "parse_s": 0.000315,
+    "full_enum_s": 0.151225,
+    "full_enum_kernel_size": 2,
+    "full_enum_kernel_sigs": [
+      191,
+      480
+    ],
+    "mc_s": null,
+    "mc_threshold": 10000,
+    "mc_seed": 999,
+    "mc_kernel_size": null,
+    "mc_kernel_sigs": null,
+    "notes": ""
+  },
+  {
+    "file": "bench_large",
+    "tool": "cibsa",
+    "total_scenarios": 6561,
+    "parse_s": 0.000429,
+    "full_enum_s": 2.668007,
+    "full_enum_kernel_size": 2,
+    "full_enum_kernel_sigs": [
+      1973,
+      2548
+    ],
+    "mc_s": null,
+    "mc_threshold": 10000,
+    "mc_seed": 999,
+    "mc_kernel_size": null,
+    "mc_kernel_sigs": null,
+    "notes": ""
+  },
+  {
+    "file": "bench_typical",
+    "tool": "cibsa",
+    "total_scenarios": 59049,
+    "parse_s": 0.001608,
+    "full_enum_s": 16.354517,
+    "full_enum_kernel_size": 2,
+    "full_enum_kernel_sigs": [
+      13785,
+      13839
+    ],
+    "mc_s": 2.729077,
+    "mc_threshold": 10000,
+    "mc_seed": 999,
+    "mc_kernel_size": 2,
+    "mc_kernel_sigs": [
+      13785,
+      13839
+    ],
+    "notes": ""
+  },
+  {
+    "file": "bench_xlarge",
+    "tool": "cibsa",
+    "total_scenarios": 59049,
+    "parse_s": 0.000535,
+    "full_enum_s": 15.237168,
+    "full_enum_kernel_size": 3,
+    "full_enum_kernel_sigs": [
+      15921,
+      18086,
+      36255
+    ],
+    "mc_s": 2.686013,
+    "mc_threshold": 10000,
+    "mc_seed": 999,
+    "mc_kernel_size": 3,
+    "mc_kernel_sigs": [
+      15921,
+      18086,
+      36255
+    ],
+    "notes": ""
+  },
+  {
+    "file": "bench_50x50",
+    "tool": "cibsa",
+    "total_scenarios": 60466176,
+    "parse_s": 0.000896,
+    "full_enum_s": null,
+    "full_enum_kernel_size": null,
+    "full_enum_kernel_sigs": null,
+    "mc_s": 30.126427,
+    "mc_threshold": 10000,
+    "mc_seed": 999,
+    "mc_kernel_size": 3,
+    "mc_kernel_sigs": [
+      8693546,
+      11540522,
+      19807290
+    ],
+    "notes": "full-enum DNF (60M, pure Python)"
+  }
+]
