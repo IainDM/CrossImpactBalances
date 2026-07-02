@@ -568,161 +568,393 @@ Exhaustive basin-of-attraction analysis. Follows the succession chain from
 every scenario in the space, counting how many starting points converge to
 each fixed point.
 
-Uses a flat cache so each scenario is resolved exactly once (O(n) total
-succession steps). Returns:
-- `fixed_points`: Vector of fixed-point scenarios (0-based variant indices)
+All threads share a single flat label array (4 bytes per scenario, e.g.
+~242 MB for a 6×10⁷ space), so each scenario is resolved once across all
+threads and trajectories resolved by one thread are reused by the others.
+Impact sums run in the narrowest integer type that can hold them, which
+widens the SIMD lanes. Returns:
+- `fixed_points`: Vector of fixed-point scenarios (0-based variant indices),
+  sorted by signature
 - `basin_sizes`:  corresponding basin sizes (same order as `fixed_points`)
 - `cycle_count`:  number of scenarios that fall into non-fixed-point cycles
 """
 function find_basins(cib::CIB)
     n = max_signature(cib) + 1
+    # Every impact-balance entry is a sum of ndesc CIM entries, so
+    # ndesc * max|cim| bounds |ib[j]| exactly. The narrowest accumulator that
+    # holds the bound doubles or quadruples the SIMD lanes per vector op.
+    bound = cib.ndesc * maximum(abs, cib.cim)
+    if bound <= Int(typemax(Int16))
+        return _find_basins_impl(cib, n, Matrix{Int16}(cib.cim_t))
+    elseif bound <= Int(typemax(Int32))
+        return _find_basins_impl(cib, n, Matrix{Int32}(cib.cim_t))
+    else
+        return _find_basins_impl(cib, n, cib.cim_t)
+    end
+end
+
+# Shared label values: 0 = unvisited, -1 = ends in a >=2-cycle (including the
+# tail leading into it), k >= 1 = converges to the fixed point with dense id k
+# (see _BasinRegistry).
+#
+# All workers read and write the one label array without locks. The race is
+# benign by construction: succession is deterministic and fixed-point ids are
+# globally unique, so every thread that labels state `s` writes the *same*
+# value. Aligned 4-byte stores cannot tear on supported platforms, and a stale
+# 0 read only causes redundant walking, never a wrong label. (Routing these
+# two helpers through Core.Intrinsics.atomic_pointerref/atomic_pointerset with
+# :monotonic ordering would make that formal at identical cost.)
+@inline _lbl_get(labels::Vector{Int32}, sig::Int) = @inbounds labels[sig + 1]
+@inline function _lbl_set!(labels::Vector{Int32}, sig::Int, v::Int32)
+    @inbounds labels[sig + 1] = v
+    return nothing
+end
+
+# Fixed-point signature -> dense id registry. Workers take the lock only when
+# a walk terminates at a fixed point (a handful of times per fixed point in
+# total), so contention is negligible.
+struct _BasinRegistry
+    lock::ReentrantLock
+    ids::Dict{Int,Int32}    # fp_sig -> dense id (1-based)
+    sigs::Vector{Int}       # id -> fp_sig
+end
+_BasinRegistry() = _BasinRegistry(ReentrantLock(), Dict{Int,Int32}(), Int[])
+
+@noinline function _register_fp!(reg::_BasinRegistry, fp_sig::Int)::Int32
+    lock(reg.lock)
+    try
+        id = get(reg.ids, fp_sig, Int32(0))
+        if id == 0
+            push!(reg.sigs, fp_sig)
+            length(reg.sigs) <= typemax(Int32) ||
+                error("find_basins: fixed-point id overflow")
+            id = Int32(length(reg.sigs))
+            reg.ids[fp_sig] = id
+        end
+        return id
+    finally
+        unlock(reg.lock)
+    end
+end
+
+# One in-place succession step on scenario `w`, scored against `cimT` (cim_t,
+# possibly narrowed — impact rows of cim are contiguous columns). The full
+# summation pass runs before the argmax pass, and ties keep the incumbent
+# variant (strict >), exactly like `succession_step`. Returns (changed,
+# new_sig); the signature is maintained incrementally from the mixed-radix
+# place values in `weights`, and `changed == false` means `w` is a fixed point.
+@inline function _succ_step!(w::Vector{Int}, ib::Vector{TA}, cimT::Matrix{TA},
+                             nvariants::Vector{Int}, offsets::Vector{Int},
+                             weights::Vector{Int}, ndesc::Int, ndim::Int,
+                             sig::Int) where {TA<:Integer}
+    b1 = (offsets[1] + w[1]) * ndim
+    @inbounds @simd for j in 1:ndim
+        ib[j] = cimT[b1 + j]
+    end
+    @inbounds for i in 2:ndesc
+        b = (offsets[i] + w[i]) * ndim
+        @simd for j in 1:ndim
+            ib[j] += cimT[b + j]
+        end
+    end
+    changed = false
+    @inbounds for i in 1:ndesc
+        off = offsets[i]
+        old = w[i]
+        wi = old
+        best = ib[off + old + 1]
+        for j in 0:nvariants[i]-1
+            s = ib[off + j + 1]
+            if s > best
+                best = s
+                wi = j
+            end
+        end
+        if wi != old
+            w[i] = wi
+            sig += (wi - old) * weights[i]
+            changed = true
+        end
+    end
+    return changed, sig
+end
+
+# Beyond this many trajectory states, cycle membership switches from a
+# backward linear scan of `history` to a Set.
+const _CYCLE_SCAN_LIMIT = 64
+
+# Number of interleaved walks per worker. The walk phase is bound by the
+# latency of dependent random label reads (roughly 200 ns/state DRAM-resident
+# vs ~30 ns of compute per succession step); stepping several independent
+# walks round-robin keeps that many label misses in flight per thread.
+const _WALK_SLOTS = 8
+
+# Software prefetch of a label's cache line, so a pending label load issues as
+# soon as the successor signature is known instead of when its walk is next
+# visited. LLVM 16+ (Julia 1.11+) requires opaque-pointer IR while LLVM 15
+# (Julia 1.10) only parses typed pointers, so both spellings are provided and
+# feature-detected at load time; if neither compiles, walks just take the load
+# latency at use.
+@inline function _prefetch_opaque(p::Ptr{Int32})
+    Base.llvmcall(("""
+        declare void @llvm.prefetch.p0(ptr, i32, i32, i32)
+        define void @main(i64 %p) alwaysinline {
+            %ptr = inttoptr i64 %p to ptr
+            call void @llvm.prefetch.p0(ptr %ptr, i32 0, i32 3, i32 1)
+            ret void
+        }
+        """, "main"), Cvoid, Tuple{Ptr{Int32}}, p)
+end
+
+@inline function _prefetch_typed(p::Ptr{Int32})
+    Base.llvmcall(("""
+        declare void @llvm.prefetch.p0i8(i8*, i32, i32, i32)
+        define void @main(i64 %p) alwaysinline {
+            %ptr = inttoptr i64 %p to i8*
+            call void @llvm.prefetch.p0i8(i8* %ptr, i32 0, i32 3, i32 1)
+            ret void
+        }
+        """, "main"), Cvoid, Tuple{Ptr{Int32}}, p)
+end
+
+const _PREFETCH_MODE = try
+    # Probing the wrong spelling makes LLVM warn on stderr, so pick by the
+    # Julia version (1.10 bundles LLVM 15, typed pointers; 1.11+ opaque) and
+    # only fall back to "no prefetch" if the expected spelling fails too.
+    if VERSION >= v"1.11"
+        _prefetch_opaque(Ptr{Int32}(0))   # prefetch never faults, even on null
+        1
+    else
+        _prefetch_typed(Ptr{Int32}(0))
+        2
+    end
+catch
+    0
+end
+
+@inline function _prefetch_label(labels::Vector{Int32}, sig::Int)
+    if _PREFETCH_MODE == 1
+        GC.@preserve labels _prefetch_opaque(pointer(labels) + 4 * sig)
+    elseif _PREFETCH_MODE == 2
+        GC.@preserve labels _prefetch_typed(pointer(labels) + 4 * sig)
+    end
+    return nothing
+end
+
+@inline function _advance_odometer!(w::Vector{Int}, nvariants::Vector{Int},
+                                    ndesc::Int)
+    @inbounds for i in 1:ndesc
+        w[i] += 1
+        w[i] < nvariants[i] && return nothing
+        w[i] = 0
+    end
+    return nothing
+end
+
+# Worker: pull blocks of signatures from the shared counter until none remain.
+# Within a block, decode the first signature once, then advance the scenario
+# digits with a mixed-radix odometer (no divisions), walking every state whose
+# label is still 0.
+#
+# Up to _WALK_SLOTS walks run interleaved, one succession step per visit, so
+# their (independent) label reads overlap instead of serializing on DRAM
+# latency. Each walk resolves exactly like the sequential version and then
+# backfills its entire history:
+#   * fixed point            -> the fp's dense id (the fp labels itself)
+#   * already-labeled state  -> that label, whatever it is (id or -1)
+#   * successor in `history` -> a genuine >=2-cycle: -1 for the entire
+#                               history, including the tail leading in
+# Check order (shared label, own history, fixed point after stepping) keeps
+# the shared-array race consistent: a state in our history lies on a
+# >=2-cycle, so a concurrent label for it can only be -1 — the same value we
+# would write.
+function _basin_worker!(labels::Vector{Int32}, reg::_BasinRegistry,
+                        next_block::Threads.Atomic{Int}, nblocks::Int,
+                        block_size::Int, n::Int, cimT::Matrix{TA},
+                        nvariants::Vector{Int}, offsets::Vector{Int},
+                        weights::Vector{Int}, ndesc::Int,
+                        ndim::Int) where {TA<:Integer}
+    K = _WALK_SLOTS
+    w_enum   = Vector{Int}(undef, ndesc)
+    ib       = Vector{TA}(undef, ndim)
+    ws       = [Vector{Int}(undef, ndesc) for _ in 1:K]
+    hists    = [sizehint!(Int[], 256) for _ in 1:K]
+    seens    = [Set{Int}() for _ in 1:K]
+    use_sets = fill(false, K)
+    pend     = Vector{Int}(undef, K)   # successor signature awaiting its label
+    active   = fill(false, K)
+
+    while true
+        blk = Threads.atomic_add!(next_block, 1)   # returns the previous value
+        blk >= nblocks && break
+        first_sig = blk * block_size
+        last_sig = min(first_sig + block_size, n) - 1
+        cursor = first_sig
+        s = first_sig
+        @inbounds for i in 1:ndesc
+            w_enum[i] = s % nvariants[i]
+            s = s ÷ nvariants[i]
+        end
+
+        while true
+            anyactive = false
+            for k in 1:K
+                if active[k]
+                    # ── advance walk k: consume its pending label, step once ──
+                    sig = pend[k]
+                    hist = hists[k]
+                    lbl = _lbl_get(labels, sig)
+                    if lbl != Int32(0)
+                        @inbounds for h in hist
+                            _lbl_set!(labels, h, lbl)
+                        end
+                        use_sets[k] && empty!(seens[k])
+                        active[k] = false
+                    else
+                        inhist = false
+                        if use_sets[k]
+                            inhist = sig in seens[k]
+                        else
+                            @inbounds for j in length(hist):-1:1
+                                if hist[j] == sig
+                                    inhist = true
+                                    break
+                                end
+                            end
+                        end
+                        if inhist
+                            @inbounds for h in hist
+                                _lbl_set!(labels, h, Int32(-1))
+                            end
+                            use_sets[k] && empty!(seens[k])
+                            active[k] = false
+                        else
+                            push!(hist, sig)
+                            if use_sets[k]
+                                push!(seens[k], sig)
+                            elseif length(hist) > _CYCLE_SCAN_LIMIT
+                                use_sets[k] = true
+                                for h in hist
+                                    push!(seens[k], h)
+                                end
+                            end
+                            changed, sig2 = _succ_step!(ws[k], ib, cimT,
+                                                        nvariants, offsets,
+                                                        weights, ndesc, ndim,
+                                                        sig)
+                            if !changed
+                                id = _register_fp!(reg, sig2)
+                                @inbounds for h in hist
+                                    _lbl_set!(labels, h, id)
+                                end
+                                use_sets[k] && empty!(seens[k])
+                                active[k] = false
+                            else
+                                pend[k] = sig2
+                                _prefetch_label(labels, sig2)
+                            end
+                        end
+                    end
+                end
+                if !active[k]
+                    # ── refill slot k from the enumeration cursor ──
+                    while cursor <= last_sig
+                        s0 = cursor
+                        cursor += 1
+                        if _lbl_get(labels, s0) == Int32(0)
+                            copyto!(ws[k], w_enum)
+                            _advance_odometer!(w_enum, nvariants, ndesc)
+                            changed, s1 = _succ_step!(ws[k], ib, cimT,
+                                                      nvariants, offsets,
+                                                      weights, ndesc, ndim, s0)
+                            if !changed
+                                # s0 is a fixed point; resolve without a slot.
+                                _lbl_set!(labels, s0, _register_fp!(reg, s0))
+                                continue
+                            end
+                            hist = hists[k]
+                            empty!(hist)
+                            push!(hist, s0)
+                            use_sets[k] = false
+                            pend[k] = s1
+                            _prefetch_label(labels, s1)
+                            active[k] = true
+                            break
+                        else
+                            _advance_odometer!(w_enum, nvariants, ndesc)
+                        end
+                    end
+                end
+                anyactive |= active[k]
+            end
+            anyactive || break
+        end
+    end
+    return nothing
+end
+
+# Count labels into per-worker basin tallies (indexed by dense fp id) plus a
+# cycle counter. Runs after the labeling barrier, so reads are race-free.
+function _tally(labels::Vector{Int32}, n::Int, nfp::Int, nt::Int)
+    counts = [zeros(Int, nfp) for _ in 1:nt]
+    cycs = zeros(Int, nt)
+    chunk = cld(n, nt)
+    @sync for t in 1:nt
+        Threads.@spawn begin
+            lo = (t - 1) * chunk + 1
+            hi = min(t * chunk, n)
+            c = counts[t]
+            cyc = 0
+            @inbounds for i in lo:hi
+                v = labels[i]
+                if v > Int32(0)
+                    c[v] += 1
+                elseif v == Int32(-1)
+                    cyc += 1
+                end
+            end
+            cycs[t] = cyc
+        end
+    end
+    total = zeros(Int, nfp)
+    for c in counts
+        total .+= c
+    end
+    return total, sum(cycs)
+end
+
+function _find_basins_impl(cib::CIB, n::Int, cimT::Matrix{TA}) where {TA<:Integer}
     nt = Threads.nthreads()
     ndesc = cib.ndesc
     ndim = cib.ndim
-    cim_t = cib.cim_t   # row-vectors of cim live as columns of cim_t (SIMD-friendly)
     nvariants = cib.nvariants
     offsets = cib.desc_offsets
 
-    chunk_size = cld(n, nt)
-
-    # Per-thread caches (memory cost: nt * n * 8 bytes — matches the single-thread
-    # version's footprint times the thread count). Each thread also produces a
-    # local basin tally; we merge at the end.
-    # cache values: 0 = unvisited, -1 = cycle, k>0 = converges to fp with sig (k-1).
-    thread_basins = [Dict{Int,Int}() for _ in 1:nt]
-    thread_cycle_counts = zeros(Int, nt)
-
-    Threads.@threads for tid in 1:nt
-        first_sig = (tid - 1) * chunk_size
-        last_sig  = min(tid * chunk_size, n) - 1
-        first_sig > last_sig && continue
-
-        cache    = zeros(Int, n)
-        w        = Vector{Int}(undef, ndesc)
-        ib       = Vector{Int}(undef, ndim)
-        tndx     = Vector{Int}(undef, ndesc)
-        history  = Int[]
-
-        for start_sig in first_sig:last_sig
-            @inbounds cache[start_sig + 1] != 0 && continue
-
-            # Decode start_sig into w
-            s = start_sig
-            @inbounds for i in 1:ndesc
-                w[i] = s % nvariants[i]
-                s = s ÷ nvariants[i]
-            end
-
-            empty!(history)
-            push!(history, start_sig)
-
-            while true
-                # ── inline succession_step: row-at-a-time with @simd ──
-                @inbounds for i in 1:ndesc
-                    tndx[i] = offsets[i] + w[i] + 1
-                end
-                r1 = tndx[1]
-                @inbounds @simd for j in 1:ndim
-                    ib[j] = cim_t[j, r1]
-                end
-                for ki in 2:ndesc
-                    r = @inbounds tndx[ki]
-                    @inbounds @simd for j in 1:ndim
-                        ib[j] += cim_t[j, r]
-                    end
-                end
-                # Pick best variant per descriptor
-                @inbounds for i in 1:ndesc
-                    nv = nvariants[i]
-                    off = offsets[i]
-                    max_val = ib[off + w[i] + 1]
-                    for j in 0:nv-1
-                        score = ib[off + j + 1]
-                        if score > max_val
-                            max_val = score
-                            w[i] = j
-                        end
-                    end
-                end
-
-                # Signature of w (the successor)
-                w_sig = 0
-                order = 1
-                @inbounds for i in 1:ndesc
-                    w_sig += order * w[i]
-                    order *= nvariants[i]
-                end
-
-                # ── Already resolved? Backfill entire history ──
-                @inbounds cached = cache[w_sig + 1]
-                if cached != 0
-                    @inbounds for h in history
-                        cache[h + 1] = cached
-                    end
-                    break
-                end
-
-                # ── Cycle detection: is w_sig already in our chain? ──
-                cycle_start = 0
-                for k in length(history):-1:1
-                    if @inbounds history[k] == w_sig
-                        cycle_start = k
-                        break
-                    end
-                end
-
-                if cycle_start > 0
-                    if cycle_start == length(history)
-                        val = w_sig + 1
-                        @inbounds for h in history
-                            cache[h + 1] = val
-                        end
-                    else
-                        @inbounds for h in history
-                            cache[h + 1] = -1
-                        end
-                    end
-                    break
-                end
-
-                push!(history, w_sig)
-            end
-        end
-
-        # ── Tally THIS thread's chunk through its own cache ──
-        local_basins = thread_basins[tid]
-        local_cycle = 0
-        @inbounds for sig in first_sig:last_sig
-            c = cache[sig + 1]
-            if c == -1
-                local_cycle += 1
-            elseif c > 0
-                fp_sig = c - 1
-                local_basins[fp_sig] = get(local_basins, fp_sig, 0) + 1
-            end
-        end
-        thread_cycle_counts[tid] = local_cycle
+    # Mixed-radix place values: signature(u) == sum(u[i] * weights[i]).
+    weights = Vector{Int}(undef, ndesc)
+    weights[1] = 1
+    for i in 1:ndesc-1
+        weights[i+1] = weights[i] * nvariants[i]
     end
 
-    # ── Merge per-thread basin tallies ──
-    cycle_count = sum(thread_cycle_counts)
-    kern = Vector{Vector{Int}}()
-    basins = Vector{Int}()
-    fp_order = Dict{Int, Int}()
-    for tid in 1:nt
-        for (fp_sig, count) in thread_basins[tid]
-            idx = get(fp_order, fp_sig, 0)
-            if idx == 0
-                push!(kern, inv_signature(cib, fp_sig))
-                push!(basins, count)
-                fp_order[fp_sig] = length(kern)
-            else
-                @inbounds basins[idx] += count
-            end
-        end
+    labels = fill(Int32(0), n)
+
+    reg = _BasinRegistry()
+    block_size = clamp(cld(n, 8 * nt), 1, 1 << 20)
+    nblocks = cld(n, block_size)
+    next_block = Threads.Atomic{Int}(0)
+    @sync for _ in 1:nt
+        Threads.@spawn _basin_worker!(labels, reg, next_block, nblocks,
+                                      block_size, n, cimT, nvariants, offsets,
+                                      weights, ndesc, ndim)
     end
 
-    return kern, basins, cycle_count
+    basins_by_id, cycle_count = _tally(labels, n, length(reg.sigs), nt)
+
+    # Deterministic output order regardless of discovery order or thread count.
+    order = sortperm(reg.sigs)
+    kern = [inv_signature(cib, reg.sigs[i]) for i in order]
+    return kern, basins_by_id[order], cycle_count
 end
 
 # ─── Simulated annealing ────────────────────────────────────────────────────
