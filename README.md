@@ -45,6 +45,16 @@ fixed_points, basin_sizes, cycle_count = find_basins(cib)
 For larger problems, use `load_scw(path; exhaustive=true)` to enumerate the
 full scenario space in parallel across threads.
 
+## Desktop app
+
+A point-and-click version for non-programmers lives in [`app/`](app): browse to
+a `.scw` file, then **Find Consistent Scenarios** or **Find Basins**, view the
+results (with basin sizes) and export the full basin analysis as CSV. It runs
+locally in your browser and has no external dependencies. Run it from source
+with `julia --project=app -t auto app/run.jl`, or build a standalone Windows
+installer (`.msi`) — no Julia needed on the target machine — via the pipeline
+in [`build/`](build/README.md).
+
 ## What's included
 
 | Function | Purpose |
