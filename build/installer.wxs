@@ -1,17 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   WiX v5 source for the Cross-Impact Balances MSI installer.
+  The build steps and exact wix command line are documented in build/README.md.
 
-  Build (on Windows, after create_app.jl has produced the app bundle):
-
-    dotnet tool install --global wix --version 5.*
-    wix build build\installer.wxs -arch x64 ^
-        -d AppDir="<abs path to build\CrossImpactBalances-app>" ^
-        -d Version=0.2.0 ^
-        -o CrossImpactBalances-0.2.0-x64.msi
-
-  AppDir must be the absolute path to the PackageCompiler bundle (the folder
-  that contains bin\, lib\, share\ and "Cross-Impact Balances.cmd").
+  Two preprocessor variables are supplied on the wix command line:
+    AppDir   absolute path to the PackageCompiler bundle (the folder that
+             contains bin, lib, share and the "Cross-Impact Balances.cmd"
+             launcher).
+    Version  installer version as X.Y.Z.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
