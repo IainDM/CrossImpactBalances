@@ -1,2 +1,4 @@
 Manifest.toml
 __pycache__/
+build/CrossImpactBalances-app/
+*.msi
