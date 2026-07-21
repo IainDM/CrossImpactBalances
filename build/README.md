@@ -39,8 +39,8 @@ and the [.NET SDK](https://dotnet.microsoft.com/download) (for WiX).
 From the repository root, in a shell where `%CD%` is that root:
 
 ```bat
-:: 1. one-time environment setup
-julia --project=app   -e "using Pkg; Pkg.instantiate()"
+:: 1. one-time environment setup (Pkg.develop resolves the engine by path)
+julia --project=app   -e "using Pkg; Pkg.develop(path=\".\"); Pkg.instantiate()"
 julia --project=build -e "using Pkg; Pkg.instantiate()"
 
 :: 2. compile the standalone app bundle (several minutes)

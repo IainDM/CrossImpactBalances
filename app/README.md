@@ -24,7 +24,8 @@ it packages cleanly into a self-contained installer.
 From the repository root:
 
 ```bash
-julia --project=app -e 'using Pkg; Pkg.instantiate()'   # first time only
+# first time only — resolve the engine from the repo root and install deps
+julia --project=app -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
 julia --project=app -t auto app/run.jl
 ```
 

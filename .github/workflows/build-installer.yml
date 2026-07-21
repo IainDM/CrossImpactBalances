@@ -53,7 +53,9 @@ jobs:
       - name: Instantiate build + app environments
         shell: bash
         run: |
-          julia --project=app   -e 'using Pkg; Pkg.instantiate()'
+          # Resolve the engine from the repo root by path (works on Julia 1.10+;
+          # avoids the 1.11-only [sources] table).
+          julia --project=app   -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
           julia --project=build -e 'using Pkg; Pkg.instantiate()'
 
       - name: Compile standalone app bundle
