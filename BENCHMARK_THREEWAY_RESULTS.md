@@ -188,7 +188,7 @@ sat at 11–16 ms; 0.013 s is representative.
 | bench_large | 6,561 | 2 | 2.668 | — | instant | 0.016824 | 0.000162 | 0.000740 |
 | bench_typical | 59,049 | 2 | 16.35 | 2.73 | instant | 0.229 | 0.000441 | 0.00254 |
 | bench_xlarge | 59,049 | 3 | 15.24 | 2.69 | instant | 0.232 | 0.000407 | 0.00251 |
-| bench_50x50 | 60,466,176 | 5 | DNF | 30.13 | ≈5 | (~4 min est.) | 0.013 | 1.61 |
+| bench_50x50 | 60,466,176 | 5 | DNF | 30.13 | ~6s | (~4 min est.) | 0.013 | 1.61 |
 
 ## Speedups
 
