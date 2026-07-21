@@ -149,3 +149,136 @@ end
         end
     end
 end
+
+# ─── Pluggable succession rules ──────────────────────────────────────────────
+#
+# A test-only rule whose step is exactly global succession, but as a distinct
+# type it is forced down the generic (non-specialised) find_consistent /
+# find_basins path. Comparing it to the fast GlobalSuccession path proves the
+# generic machinery yields identical results to the hand-optimised one.
+struct RefGlobal <: SuccessionRule end
+CrossImpactBalances.succession_step(::RefGlobal, cib::CIB, u::Vector{Int}) =
+    succession_step(GlobalSuccession(), cib, u)
+
+# Independent brute-force oracle for SEQUENTIAL succession — written from
+# scratch (Gauss–Seidel: update descriptors one at a time using the impact
+# balance of the partially-updated scenario), used to validate that a rule
+# with genuinely different dynamics flows correctly through the generic path.
+function seq_step_oracle(cib::CIB, u::Vector{Int})
+    v = copy(u)
+    for i in 1:cib.ndesc
+        ib = impact_balance(cib, v)
+        off = cib.desc_offsets[i]
+        nv = cib.nvariants[i]
+        best = v[i]
+        bestval = ib[off + v[i] + 1]
+        for j in 0:nv-1
+            if ib[off + j + 1] > bestval
+                bestval = ib[off + j + 1]
+                best = j
+            end
+        end
+        v[i] = best
+    end
+    return v
+end
+
+function seq_basins_oracle(cib::CIB)
+    tally = Dict{Int,Int}()
+    cyc = 0
+    for s0 in 0:max_signature(cib)
+        seen = Set{Int}()
+        v = inv_signature(cib, s0)
+        sig = s0
+        while true
+            push!(seen, sig)
+            v2 = seq_step_oracle(cib, v)
+            sig2 = signature(cib, v2)
+            if sig2 == sig                 # fixed point
+                tally[sig2] = get(tally, sig2, 0) + 1
+                break
+            elseif sig2 in seen            # entered a cycle of length > 1
+                cyc += 1
+                break
+            end
+            v = v2
+            sig = sig2
+        end
+    end
+    fp = sort!(collect(keys(tally)))
+    return fp, [tally[k] for k in fp], cyc
+end
+
+@testset "Property: pluggable succession rules" begin
+    rng = MersenneTwister(20260722)
+    cases = CIB[]
+    for _ in 1:20
+        ndesc = rand(rng, 2:5)
+        nvariants = [rand(rng, 1:4) for _ in 1:ndesc]
+        while prod(nvariants) > 2000
+            nvariants[argmax(nvariants)] -= 1
+        end
+        push!(cases, make_cib(nvariants, rand_cim(rng, nvariants)))
+    end
+
+    @testset "generic path reproduces the fast GlobalSuccession path" begin
+        for cib in cases
+            fast = [signature(cib, u) for u in find_consistent(cib; exhaustive=true)]
+            gen  = [signature(cib, u) for u in
+                    find_consistent(cib; rule=RefGlobal(), exhaustive=true)]
+            @test gen == fast
+
+            # Monte-Carlo / walk path also honours the rule argument.
+            walk = sorted_sigs(cib, find_consistent(cib; rule=RefGlobal()))
+            @test walk == fast
+
+            f1, s1, c1 = find_basins(cib)
+            f2, s2, c2 = find_basins(cib; rule=RefGlobal())
+            @test [signature(cib, u) for u in f2] == [signature(cib, u) for u in f1]
+            @test s2 == s1
+            @test c2 == c1
+        end
+    end
+
+    @testset "SequentialSuccession vs independent oracle" begin
+        differs = false
+        for cib in cases
+            # Kernel: generic scan finds exactly the sequential fixed points.
+            want_k = sort!([signature(cib, inv_signature(cib, s))
+                            for s in 0:max_signature(cib)
+                            if seq_step_oracle(cib, inv_signature(cib, s)) ==
+                               inv_signature(cib, s)])
+            got_k = [signature(cib, u) for u in
+                     find_consistent(cib; rule=SequentialSuccession(), exhaustive=true)]
+            @test got_k == want_k
+
+            # Basins: generic walk matches the from-scratch sequential oracle.
+            of, os, oc = seq_basins_oracle(cib)
+            gf, gs, gc = find_basins(cib; rule=SequentialSuccession())
+            @test [signature(cib, u) for u in gf] == of
+            @test gs == os
+            @test gc == oc
+            @test sum(gs) + gc == max_signature(cib) + 1
+
+            # Confirm the rule is genuinely distinct from global succession on
+            # at least one instance (guards against an accidental no-op rule).
+            for s in 0:max_signature(cib)
+                u = inv_signature(cib, s)
+                if succession_step(SequentialSuccession(), cib, u) !=
+                   succession_step(GlobalSuccession(), cib, u)
+                    differs = true
+                    break
+                end
+            end
+        end
+        @test differs
+    end
+
+    @testset "search-strategy kwargs reject non-global rules" begin
+        cib = cases[1]
+        @test_throws ArgumentError find_consistent(cib; rule=SequentialSuccession(),
+                                                   exhaustive=true, algorithm=:bnb)
+        @test_throws ArgumentError find_consistent(cib; rule=SequentialSuccession(),
+                                                   exhaustive=true, algorithm=:sweep)
+    end
+end
