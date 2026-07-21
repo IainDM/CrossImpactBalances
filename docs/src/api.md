@@ -1,5 +1,11 @@
 # API reference
 
+## Overview
+
+```@docs
+CrossImpactBalances
+```
+
 ## Loading data
 
 ```@docs
@@ -23,6 +29,18 @@ own_impact_balance
 cross_impact_balance
 inner_product
 inner_product_matrix
+```
+
+## Succession rules
+
+The succession dynamics is pluggable: define a `struct MyRule <: SuccessionRule`
+and a single `succession_step(::MyRule, cib, u)` method, and every analysis
+routine works with it through a generic path.
+
+```@docs
+SuccessionRule
+GlobalSuccession
+SequentialSuccession
 ```
 
 ## Dynamics

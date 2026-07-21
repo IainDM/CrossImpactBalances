@@ -87,7 +87,7 @@ function load_from_text(scwtext::AbstractString)
 end
 
 function analyze_consistent(cib)
-    kern = find_consistent(cib; exhaustive = true)
+    compute = @elapsed (kern = find_consistent(cib; exhaustive = true))
     total = max_signature(cib) + 1
     scenarios = [Dict("signature" => signature(cib, u),
                       "variants" => variant_names(cib, u)) for u in kern]
@@ -95,11 +95,13 @@ function analyze_consistent(cib)
                 "descriptors" => cib.descriptors,
                 "total" => total,
                 "count" => length(kern),
+                "compute_s" => round(compute; digits = 3),
+                "threads" => Threads.nthreads(),
                 "scenarios" => scenarios)
 end
 
 function analyze_basins(cib, state::AppState)
-    fps, sizes, cycles = find_basins(cib)
+    compute = @elapsed ((fps, sizes, cycles) = find_basins(cib))
     total = max_signature(cib) + 1
     order = sortperm(sizes; rev = true)      # largest basin first
 
@@ -135,6 +137,8 @@ function analyze_basins(cib, state::AppState)
                 "count" => length(fps),
                 "cycles" => cycles,
                 "covered" => sum(sizes; init = 0),
+                "compute_s" => round(compute; digits = 3),
+                "threads" => Threads.nthreads(),
                 "scenarios" => scenarios)
 end
 
@@ -234,9 +238,10 @@ function handle(sock, state::AppState)
     elseif method == "POST" && path == "/analyze"
         mode = get(params, "mode", "consistent")
         try
-            cib = load_from_text(body)
+            parse_s = @elapsed (cib = load_from_text(body))
             result = mode == "basins" ? analyze_basins(cib, state) :
                      analyze_consistent(cib)
+            result["parse_s"] = round(parse_s; digits = 3)
             respond(sock, 200, "application/json; charset=utf-8", to_json(result))
         catch e
             msg = sprint(showerror, e)
@@ -480,18 +485,28 @@ function render(data, secs) {
   const maxBasin = isBasins && data.scenarios.length
       ? Math.max(...data.scenarios.map(s => s.basin_size)) : 0;
 
+  let timing = `${secs}s`;
+  if (data.compute_s !== undefined) {
+    timing = `${data.compute_s}s compute on ${data.threads} thread`
+           + (data.threads === 1 ? "" : "s")
+           + (data.parse_s !== undefined ? ` · ${data.parse_s}s parse` : "")
+           + ` · ${secs}s total`;
+    if (data.threads === 1)
+      timing += " — single-threaded! Launch via the Start-menu shortcut to use all cores";
+  }
+
   let sum;
   if (isBasins) {
     const cov = (100 * data.covered / data.total).toFixed(2);
     sum = `<b>${data.count}</b> consistent scenario(s) across a space of `
         + `${data.total.toLocaleString()}. They attract <b>${cov}%</b> of all `
         + `scenarios; ${data.cycles.toLocaleString()} start(s) fall into `
-        + `non-fixed-point cycles. <span class="muted">(${secs}s)</span>`;
+        + `non-fixed-point cycles. <span class="muted">(${timing})</span>`;
     $("exportLink").style.display = "inline-block";
   } else {
     sum = `<b>${data.count}</b> consistent scenario(s) out of `
         + `${data.total.toLocaleString()}. `
-        + `<span class="muted">(${secs}s)</span>`;
+        + `<span class="muted">(${timing})</span>`;
     $("exportLink").style.display = "none";
   }
   $("summary").innerHTML = sum;
