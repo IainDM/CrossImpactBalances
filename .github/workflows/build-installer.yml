@@ -80,9 +80,16 @@ jobs:
           path: "CrossImpactBalances-*.msi"
           if-no-files-found: error
 
-      - name: Attach MSI to Release (tags only)
+      - name: Publish MSI to Release (tags only)
         if: github.ref_type == 'tag'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" CrossImpactBalances-*.msi --clobber
+        run: |
+          # Upload to an existing release, or create one if the tag has none yet.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" CrossImpactBalances-*.msi --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" CrossImpactBalances-*.msi \
+              --title "${GITHUB_REF_NAME}" --generate-notes
+          fi
