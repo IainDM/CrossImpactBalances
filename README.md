@@ -91,8 +91,18 @@ naive Python basin loop.
 The basin numbers stack four wins multiplicatively: language (~30×) ×
 memoization (~10×) × threading (~2.3× on 4 cores) × row-major SIMD (~2×).
 
-To reproduce: `julia --project=. -t auto test/benchmark.jl` and
-`test/benchmark_50x50.jl`.
+Since those measurements, `find_basins` was rebuilt around a single label
+array shared by all threads (4 bytes per scenario instead of 8 bytes per
+scenario *per thread*), narrow-integer SIMD scoring, work-stealing block
+scheduling, and several interleaved walks per thread to overlap the random
+label-array reads that otherwise bound the walk on DRAM latency. On a 4-core
+AVX-512 box this makes basin analysis another ~2× faster on the 60M-scenario
+model and ~6× faster on the 408M-scenario `CIB_nested` model — which
+previously could not run multi-threaded at all within 16 GB of RAM (the old
+per-thread caches would have needed ~13 GB; the shared array needs 1.6 GB).
+
+To reproduce: `julia --project=. -t auto test/benchmark.jl`,
+`test/benchmark_50x50.jl`, and `test/benchmark_basins.jl nested`.
 
 ### v0.2 optimizations
 
