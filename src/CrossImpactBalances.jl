@@ -603,161 +603,214 @@ Exhaustive basin-of-attraction analysis. Follows the succession chain from
 every scenario in the space, counting how many starting points converge to
 each fixed point.
 
-Uses a flat cache so each scenario is resolved exactly once (O(n) total
-succession steps). Returns:
-- `fixed_points`: Vector of fixed-point scenarios (0-based variant indices)
+Runs in two phases: a threaded sweep fills a flat successor table (every
+scenario's succession step, computed once via an incrementally maintained
+impact balance), then a sequential resolution pass walks the table with
+path compression so each scenario is resolved exactly once. Memory is
+~8n bytes for the two flat tables (Int32 entries when the space fits,
+Int64 otherwise), independent of the thread count.
+
+Returns:
+- `fixed_points`: Vector of fixed-point scenarios (0-based variant indices),
+  ordered by ascending signature
 - `basin_sizes`:  corresponding basin sizes (same order as `fixed_points`)
 - `cycle_count`:  number of scenarios that fall into non-fixed-point cycles
+  (including scenarios whose chain merely leads into a cycle)
 """
 function find_basins(cib::CIB)
     n = max_signature(cib) + 1
+    T = _score_type(cib)
+    if n <= Int(typemax(Int32)) - 1
+        return _find_basins(cib, Int32, Matrix{T}(cib.cim_t))
+    end
+    return _find_basins(cib, Int64, Matrix{T}(cib.cim_t))
+end
+
+function _find_basins(cib::CIB, ::Type{S}, cimT::Matrix{T}) where {S<:Union{Int32,Int64}, T<:Signed}
+    n = max_signature(cib) + 1
+    succ = Vector{S}(undef, n)
+    _successor_table!(succ, cib, cimT)
+    fp_sigs, sizes, cycle_count = _resolve_and_tally(succ, n)
+    kern = [inv_signature(cib, fp) for fp in fp_sigs]
+    return kern, sizes, cycle_count
+end
+
+"""
+    _successor_table!(succ, cib, cimT) -> succ
+
+Fill `succ[sig + 1]` with the succession-step signature of every scenario.
+Threaded over contiguous chunks (disjoint writes); each chunk advances a
+mixed-radix odometer and maintains the impact balance incrementally, then
+takes the per-descriptor argmax (ties favor the current variant, then the
+lowest index — identical to [`succession_step`](@ref)).
+"""
+function _successor_table!(succ::Vector{S}, cib::CIB, cimT::Matrix{T}) where {S,T}
+    n = max_signature(cib) + 1
+    orders = Vector{Int}(undef, cib.ndesc)   # mixed-radix place values
+    o = 1
+    for i in 1:cib.ndesc
+        orders[i] = o
+        o *= cib.nvariants[i]
+    end
+
+    nchunks = max(1, min(n, 16 * Threads.nthreads()))
+    chunk_size = cld(n, nchunks)
+    nchunks = cld(n, chunk_size)
+    @sync for c in 1:nchunks
+        first_sig = (c - 1) * chunk_size
+        last_sig = min(c * chunk_size, n) - 1
+        Threads.@spawn _successor_chunk!(succ, cimT, first_sig, last_sig,
+                                         cib.nvariants, cib.desc_offsets,
+                                         orders, cib.ndesc, cib.ndim)
+    end
+    return succ
+end
+
+function _successor_chunk!(succ::Vector{S}, cimT::Matrix{T},
+                           first_sig::Int, last_sig::Int,
+                           nvariants::Vector{Int}, offsets::Vector{Int},
+                           orders::Vector{Int}, ndesc::Int, ndim::Int) where {S,T}
+    v    = Vector{Int}(undef, ndesc)
+    rows = Vector{Int}(undef, ndesc)
+    ib   = zeros(T, ndim)
+
+    s = first_sig
+    @inbounds for i in 1:ndesc
+        nv = nvariants[i]
+        v[i] = s % nv
+        rows[i] = offsets[i] + v[i] + 1
+        s = s ÷ nv
+    end
+    @inbounds for i in 1:ndesc
+        r = rows[i]
+        @simd for j in 1:ndim
+            ib[j] += cimT[j, r]
+        end
+    end
+
+    @inbounds for sig in first_sig:last_sig
+        # ── Successor signature: full per-descriptor argmax over ib ──
+        w_sig = 0
+        for i in 1:ndesc
+            off = offsets[i]
+            wi = v[i]
+            max_val = ib[off + wi + 1]   # current variant seeds the max
+            for j in 0:nvariants[i]-1
+                score = ib[off + j + 1]
+                if score > max_val       # strict >: ties keep current/lower index
+                    max_val = score
+                    wi = j
+                end
+            end
+            w_sig += orders[i] * wi
+        end
+        succ[sig + 1] = S(w_sig)
+
+        # ── Odometer increment with fused row-delta ib update ──
+        if sig < last_sig
+            for i in 1:ndesc
+                nv = nvariants[i]
+                nv == 1 && continue      # radix-1: value stays 0, carry onward
+                rold = rows[i]
+                if v[i] + 1 < nv
+                    v[i] += 1
+                    rnew = rold + 1
+                    rows[i] = rnew
+                    @simd for j in 1:ndim
+                        ib[j] += cimT[j, rnew] - cimT[j, rold]
+                    end
+                    break
+                end
+                v[i] = 0                 # roll over; carry to next digit
+                rnew = offsets[i] + 1
+                rows[i] = rnew
+                @simd for j in 1:ndim
+                    ib[j] += cimT[j, rnew] - cimT[j, rold]
+                end
+            end
+        end
+    end
+    return succ
+end
+
+"""
+    _resolve_and_tally(succ, n) -> (fp_sigs, sizes, cycle_count)
+
+Resolve every scenario to its attractor by walking the successor table.
+`res` values: 0 = unvisited, -2 = on the chain currently being walked,
+-1 = falls into (or leads into) a non-fixed-point cycle, k > 0 = converges
+to the fixed point with signature k - 1. The in-progress marker makes cycle
+detection O(1) per step; on any resolution the entire walked chain is
+back-filled, so total work is O(n). The walk is sequential (the table is
+shared mutable state); the final tally pass is threaded.
+"""
+function _resolve_and_tally(succ::Vector{S}, n::Int) where {S}
+    res = zeros(S, n)
+    history = Int[]
+    marker = S(-2)
+
+    @inbounds for start in 0:n-1
+        res[start + 1] != 0 && continue
+        empty!(history)
+        cur = start
+        res[cur + 1] = marker
+        push!(history, cur)
+
+        while true
+            nxt = Int(succ[cur + 1])
+            r = res[nxt + 1]
+            if r == marker
+                # Hit our own chain: either the last element is a fixed
+                # point (succ maps it to itself) or we closed a true cycle.
+                # Chains *leading into* a cycle count as cycle scenarios too.
+                val = nxt == cur ? S(cur + 1) : S(-1)
+                for h in history
+                    res[h + 1] = val
+                end
+                break
+            elseif r != 0
+                for h in history        # already resolved: backfill chain
+                    res[h + 1] = r
+                end
+                break
+            end
+            res[nxt + 1] = marker
+            push!(history, nxt)
+            cur = nxt
+        end
+    end
+
+    # ── Threaded tally (read-only over res) ──
     nt = Threads.nthreads()
-    ndesc = cib.ndesc
-    ndim = cib.ndim
-    cim_t = cib.cim_t   # row-vectors of cim live as columns of cim_t (SIMD-friendly)
-    nvariants = cib.nvariants
-    offsets = cib.desc_offsets
-
-    chunk_size = cld(n, nt)
-
-    # Per-thread caches (memory cost: nt * n * 8 bytes — matches the single-thread
-    # version's footprint times the thread count). Each thread also produces a
-    # local basin tally; we merge at the end.
-    # cache values: 0 = unvisited, -1 = cycle, k>0 = converges to fp with sig (k-1).
-    thread_basins = [Dict{Int,Int}() for _ in 1:nt]
-    thread_cycle_counts = zeros(Int, nt)
-
-    Threads.@threads for tid in 1:nt
-        first_sig = (tid - 1) * chunk_size
-        last_sig  = min(tid * chunk_size, n) - 1
-        first_sig > last_sig && continue
-
-        cache    = zeros(Int, n)
-        w        = Vector{Int}(undef, ndesc)
-        ib       = Vector{Int}(undef, ndim)
-        tndx     = Vector{Int}(undef, ndesc)
-        history  = Int[]
-
-        for start_sig in first_sig:last_sig
-            @inbounds cache[start_sig + 1] != 0 && continue
-
-            # Decode start_sig into w
-            s = start_sig
-            @inbounds for i in 1:ndesc
-                w[i] = s % nvariants[i]
-                s = s ÷ nvariants[i]
+    tally_chunk = cld(n, nt)
+    local_counts = [Dict{Int,Int}() for _ in 1:nt]
+    local_cyc = zeros(Int, nt)
+    @sync for t in 1:nt
+        lo = (t - 1) * tally_chunk
+        hi = min(t * tally_chunk, n) - 1
+        counts = local_counts[t]
+        Threads.@spawn begin
+            cyc = 0
+            @inbounds for i in lo:hi
+                c = Int(res[i + 1])
+                if c == -1
+                    cyc += 1
+                else
+                    counts[c - 1] = get(counts, c - 1, 0) + 1
+                end
             end
-
-            empty!(history)
-            push!(history, start_sig)
-
-            while true
-                # ── inline succession_step: row-at-a-time with @simd ──
-                @inbounds for i in 1:ndesc
-                    tndx[i] = offsets[i] + w[i] + 1
-                end
-                r1 = tndx[1]
-                @inbounds @simd for j in 1:ndim
-                    ib[j] = cim_t[j, r1]
-                end
-                for ki in 2:ndesc
-                    r = @inbounds tndx[ki]
-                    @inbounds @simd for j in 1:ndim
-                        ib[j] += cim_t[j, r]
-                    end
-                end
-                # Pick best variant per descriptor
-                @inbounds for i in 1:ndesc
-                    nv = nvariants[i]
-                    off = offsets[i]
-                    max_val = ib[off + w[i] + 1]
-                    for j in 0:nv-1
-                        score = ib[off + j + 1]
-                        if score > max_val
-                            max_val = score
-                            w[i] = j
-                        end
-                    end
-                end
-
-                # Signature of w (the successor)
-                w_sig = 0
-                order = 1
-                @inbounds for i in 1:ndesc
-                    w_sig += order * w[i]
-                    order *= nvariants[i]
-                end
-
-                # ── Already resolved? Backfill entire history ──
-                @inbounds cached = cache[w_sig + 1]
-                if cached != 0
-                    @inbounds for h in history
-                        cache[h + 1] = cached
-                    end
-                    break
-                end
-
-                # ── Cycle detection: is w_sig already in our chain? ──
-                cycle_start = 0
-                for k in length(history):-1:1
-                    if @inbounds history[k] == w_sig
-                        cycle_start = k
-                        break
-                    end
-                end
-
-                if cycle_start > 0
-                    if cycle_start == length(history)
-                        val = w_sig + 1
-                        @inbounds for h in history
-                            cache[h + 1] = val
-                        end
-                    else
-                        @inbounds for h in history
-                            cache[h + 1] = -1
-                        end
-                    end
-                    break
-                end
-
-                push!(history, w_sig)
-            end
-        end
-
-        # ── Tally THIS thread's chunk through its own cache ──
-        local_basins = thread_basins[tid]
-        local_cycle = 0
-        @inbounds for sig in first_sig:last_sig
-            c = cache[sig + 1]
-            if c == -1
-                local_cycle += 1
-            elseif c > 0
-                fp_sig = c - 1
-                local_basins[fp_sig] = get(local_basins, fp_sig, 0) + 1
-            end
-        end
-        thread_cycle_counts[tid] = local_cycle
-    end
-
-    # ── Merge per-thread basin tallies ──
-    cycle_count = sum(thread_cycle_counts)
-    kern = Vector{Vector{Int}}()
-    basins = Vector{Int}()
-    fp_order = Dict{Int, Int}()
-    for tid in 1:nt
-        for (fp_sig, count) in thread_basins[tid]
-            idx = get(fp_order, fp_sig, 0)
-            if idx == 0
-                push!(kern, inv_signature(cib, fp_sig))
-                push!(basins, count)
-                fp_order[fp_sig] = length(kern)
-            else
-                @inbounds basins[idx] += count
-            end
+            local_cyc[t] = cyc
         end
     end
 
-    return kern, basins, cycle_count
+    merged = Dict{Int,Int}()
+    for counts in local_counts
+        for (fp, cnt) in counts
+            merged[fp] = get(merged, fp, 0) + cnt
+        end
+    end
+    fp_sigs = sort!(collect(keys(merged)))
+    return fp_sigs, [merged[fp] for fp in fp_sigs], sum(local_cyc)
 end
 
 # ─── Simulated annealing ────────────────────────────────────────────────────
