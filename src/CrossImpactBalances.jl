@@ -531,7 +531,7 @@ point is found, using all available threads (start Julia with `julia -t auto`).
 only supported for [`GlobalSuccession`](@ref)):
 - `:sweep` — enumerate every scenario with the incremental odometer sweep.
 - `:bnb`   — branch-and-bound: assign descriptors depth-first and prune
-  subtrees that provably contain no fixed point (see [`_bnb_bounds`](@ref)).
+  subtrees that provably contain no fixed point.
   Exact — returns the identical kernel — and typically visits a small
   fraction of the space on strongly-coupled matrices.
 - `:auto`  (default) — the sweep for small spaces (< 10^5 scenarios),

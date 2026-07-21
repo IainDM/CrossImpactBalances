@@ -32,7 +32,8 @@ runs both stages on a `windows-latest` runner and uploads the `.msi`.
 
 ## Manual build (on a Windows machine)
 
-Prerequisites: [Julia 1.10+](https://julialang.org/downloads/), a C compiler on
+Prerequisites: [Julia 1.11+](https://julialang.org/downloads/) (1.10 works but
+its basin analysis is ~2× slower — build with 1.11), a C compiler on
 `PATH` (`gcc` — MinGW; PackageCompiler also honours the `JULIA_CC` env var),
 and the [.NET SDK](https://dotnet.microsoft.com/download) (for WiX).
 

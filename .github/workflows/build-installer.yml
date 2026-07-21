@@ -39,9 +39,11 @@ jobs:
           echo "version=${v}" >> "$GITHUB_OUTPUT"
           echo "Building version ${v}"
 
+      # Build the app with 1.11: the sequential basin-resolve phase is ~2x
+      # faster than on 1.10 (the package itself still supports 1.10).
       - uses: julia-actions/setup-julia@v2
         with:
-          version: "1.10"
+          version: "1.11"
           arch: x64
 
       # PackageCompiler needs a C compiler on PATH; windows-latest ships gcc
