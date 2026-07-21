@@ -432,20 +432,45 @@ end
 
 """
     find_consistent(cib; ignore_cycles=true, exhaustive=false,
-                    rng=Random.default_rng()) -> Vector{Vector{Int}}
+                    algorithm=:auto, rng=Random.default_rng()) -> Vector{Vector{Int}}
 
 Find all consistent scenarios by running succession from every (or sampled) starting point.
 
-When `exhaustive=true`, every scenario in the space is enumerated, using all
-available threads (start Julia with `julia -t auto` or `julia -t8`).
-This guarantees finding all fixed points but requires iterating the full space.
+When `exhaustive=true`, the full scenario space is searched and every fixed
+point is found, using all available threads (start Julia with `julia -t auto`).
+`algorithm` selects the strategy (only consulted when `exhaustive=true`):
+- `:sweep` — enumerate every scenario with the incremental odometer sweep.
+- `:bnb`   — branch-and-bound: assign descriptors depth-first and prune
+  subtrees that provably contain no fixed point (see [`_bnb_bounds`](@ref)).
+  Exact — returns the identical kernel — and typically visits a small
+  fraction of the space on strongly-coupled matrices.
+- `:auto`  (default) — the sweep for small spaces (< 10^5 scenarios),
+  otherwise branch-and-bound with a node budget of `n ÷ 16`; if pruning is
+  too weak to pay off, the budget trips and the sweep runs instead.
+
+The returned kernel is ordered by ascending signature for every exhaustive
+algorithm.
 
 When `exhaustive=false` and the space exceeds `cib.mc_threshold`, scenarios
 are sampled without replacement using `rng`.
 """
 function find_consistent(cib::CIB; ignore_cycles::Bool=true, exhaustive::Bool=false,
+                         algorithm::Symbol=:auto,
+                         bnb_node_budget::Union{Nothing,Int}=nothing,
                          rng::AbstractRNG=Random.default_rng())
     if exhaustive
+        algorithm in (:auto, :bnb, :sweep) ||
+            throw(ArgumentError("algorithm must be :auto, :bnb or :sweep, got $(repr(algorithm))"))
+        n = max_signature(cib) + 1
+        if algorithm == :sweep || (algorithm == :auto && n < 100_000)
+            return _find_consistent_exhaustive(cib; ignore_cycles=ignore_cycles)
+        end
+        sufmin, sufmax = _bnb_bounds(cib)
+        budget = something(bnb_node_budget,
+                           algorithm == :bnb ? typemax(Int) : n ÷ 16)
+        kern, _ = _bnb_fixed_points(cib, sufmin, sufmax; node_budget=budget)
+        !isnothing(kern) && return kern
+        # Budget tripped: pruning too weak on this matrix — fall back.
         return _find_consistent_exhaustive(cib; ignore_cycles=ignore_cycles)
     end
     kern = Vector{Vector{Int}}()
@@ -594,6 +619,205 @@ function _sweep_chunk!(out::Vector{Vector{Int}}, cimT::Matrix{T},
         end
     end
     return out
+end
+
+# ─── Branch-and-bound exhaustive search ─────────────────────────────────────
+
+"""
+    _bnb_bounds(cib) -> (sufmin, sufmax)
+
+Suffix score bounds for branch-and-bound. `sufmin[k, c]` / `sufmax[k, c]`
+is the minimum / maximum total contribution descriptors `k..ndesc` can make
+to the impact score of flat variant column `c` over all choices of their
+variants. Row `ndesc + 1` is zero, so once descriptors `1..k` are assigned,
+`sufmin[k+1, c]`..`sufmax[k+1, c]` brackets what the still-free descriptors
+can add to column `c`.
+"""
+function _bnb_bounds(cib::CIB)
+    ndesc, ndim = cib.ndesc, cib.ndim
+    cim_t = cib.cim_t
+    sufmin = zeros(Int, ndesc + 1, ndim)
+    sufmax = zeros(Int, ndesc + 1, ndim)
+    @inbounds for k in ndesc:-1:1
+        off = cib.desc_offsets[k]
+        nv = cib.nvariants[k]
+        for c in 1:ndim
+            mn = typemax(Int)
+            mx = typemin(Int)
+            for s in 0:nv-1
+                val = Int(cim_t[c, off + s + 1])   # = cim[row of variant s, c]
+                mn = ifelse(val < mn, val, mn)
+                mx = ifelse(val > mx, val, mx)
+            end
+            sufmin[k, c] = sufmin[k + 1, c] + mn
+            sufmax[k, c] = sufmax[k + 1, c] + mx
+        end
+    end
+    return sufmin, sufmax
+end
+
+# Per-task DFS state. `p` is the running prefix impact balance (exact
+# contribution of the assigned descriptors to every column); `v` the current
+# partial assignment. `total`/`abort`/`budget` are shared across tasks.
+struct _BnBState
+    cim_t::Matrix{Int}
+    sufmin::Matrix{Int}
+    sufmax::Matrix{Int}
+    nvariants::Vector{Int}
+    offsets::Vector{Int}
+    ndesc::Int
+    ndim::Int
+    v::Vector{Int}
+    p::Vector{Int}
+    out::Vector{Vector{Int}}
+    nodes::Base.RefValue{Int}
+    total::Threads.Atomic{Int}
+    abort::Threads.Atomic{Bool}
+    budget::Int
+end
+
+"""
+    _bnb_pruned(st, k) -> Bool
+
+With descriptors `1..k` assigned, decide whether the current subtree can be
+discarded: true iff some assigned descriptor `j` has a competitor variant
+whose *worst-case* completed score still strictly exceeds the chosen
+variant's *best-case* completed score — then every completion fails the
+fixed-point test at `j`. Ties never prune (matching the favour-current
+convention), and at `k == ndesc` the suffix bounds are zero, so this
+condition IS the exact fixed-point predicate on the full scenario.
+"""
+function _bnb_pruned(st::_BnBState, k::Int)
+    p = st.p
+    sufmin = st.sufmin
+    sufmax = st.sufmax
+    kk = k + 1
+    @inbounds for j in 1:k
+        off = st.offsets[j]
+        cs = off + st.v[j] + 1
+        best_cur = p[cs] + sufmax[kk, cs]
+        for c in off+1:off+st.nvariants[j]
+            if p[c] + sufmin[kk, c] > best_cur
+                return true
+            end
+        end
+    end
+    return false
+end
+
+# Charge one visited node against the shared budget (flushed every 256).
+# Returns false when the budget has tripped and the search must abort.
+function _bnb_charge!(st::_BnBState)
+    st.nodes[] += 1
+    if st.nodes[] >= 256
+        Threads.atomic_add!(st.total, st.nodes[])
+        st.nodes[] = 0
+        if st.total[] > st.budget || st.abort[]
+            st.abort[] = true
+            return false
+        end
+    end
+    return true
+end
+
+# Depth-first over variants of descriptor k. Returns false on abort.
+function _bnb_node!(st::_BnBState, k::Int)
+    nv = st.nvariants[k]
+    off = st.offsets[k]
+    p = st.p
+    cim_t = st.cim_t
+    ndim = st.ndim
+    @inbounds for s in 0:nv-1
+        col = off + s + 1
+        @simd for j in 1:ndim          # push chosen row onto the prefix
+            p[j] += cim_t[j, col]
+        end
+        st.v[k] = s
+        ok = _bnb_charge!(st)
+        if ok && !_bnb_pruned(st, k)
+            if k == st.ndesc
+                push!(st.out, copy(st.v))
+            else
+                ok = _bnb_node!(st, k + 1)
+            end
+        end
+        @simd for j in 1:ndim          # pop
+            p[j] -= cim_t[j, col]
+        end
+        ok || return false
+    end
+    return true
+end
+
+"""
+    _bnb_fixed_points(cib, sufmin, sufmax; node_budget)
+        -> (Union{Nothing, Vector{Vector{Int}}}, nodes_visited)
+
+Threaded branch-and-bound search for all fixed points. Subtrees are fanned
+out as tasks over the assignments of the first `L` descriptors (chosen so
+the task count comfortably exceeds the thread count). The first element is
+`nothing` if the visited-node budget trips (pruning too weak to beat the
+sweep), else the complete kernel sorted by ascending signature; the second
+is the number of tree nodes visited (partial scenarios expanded).
+"""
+function _bnb_fixed_points(cib::CIB, sufmin::Matrix{Int}, sufmax::Matrix{Int};
+                           node_budget::Int)
+    ndesc = cib.ndesc
+    nvariants = cib.nvariants
+    offsets = cib.desc_offsets
+    ndim = cib.ndim
+    cim_t = cib.cim_t
+
+    # Prefix depth: enough top-level assignments to keep every thread busy.
+    L = 0
+    nprefix = 1
+    while L < ndesc && nprefix < 4 * Threads.nthreads()
+        L += 1
+        nprefix *= nvariants[L]
+    end
+
+    total = Threads.Atomic{Int}(0)
+    abort = Threads.Atomic{Bool}(false)
+    outs = [Vector{Vector{Int}}() for _ in 1:nprefix]
+
+    @sync for pid in 0:nprefix-1
+        out = outs[pid + 1]
+        Threads.@spawn begin
+            st = _BnBState(cim_t, sufmin, sufmax, nvariants, offsets,
+                           ndesc, ndim, zeros(Int, ndesc), zeros(Int, ndim),
+                           out, Ref(0), total, abort, node_budget)
+            # Build the prefix, checking the prune at every level so a
+            # subtree dead at depth i < L is skipped without descending.
+            s = pid
+            alive = true
+            @inbounds for i in 1:L
+                st.v[i] = s % nvariants[i]
+                s = s ÷ nvariants[i]
+                col = offsets[i] + st.v[i] + 1
+                @simd for j in 1:ndim
+                    st.p[j] += cim_t[j, col]
+                end
+                alive = _bnb_charge!(st) && !_bnb_pruned(st, i)
+                alive || break
+            end
+            if alive
+                if L == ndesc
+                    push!(out, copy(st.v))   # surviving depth-ndesc prune == fixed point
+                else
+                    _bnb_node!(st, L + 1)
+                end
+            end
+            Threads.atomic_add!(total, st.nodes[])   # flush residual node count
+        end
+    end
+
+    abort[] && return (nothing, total[])
+    kern = Vector{Vector{Int}}()
+    for out in outs
+        append!(kern, out)
+    end
+    sort!(kern; by = u -> signature(cib, u))
+    return (kern, total[])
 end
 
 """
