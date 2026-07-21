@@ -4,7 +4,9 @@
 Cross-Impact Balance (CIB) scenario analysis. A Julia implementation of the
 methodology in Weimer-Jehle (2006), ported from the Python
 [sei-international/cibsa](https://github.com/sei-international/cibsa) library
-with a memoized basin-of-attraction analysis and a threaded exhaustive search.
+with a two-phase basin-of-attraction analysis, a threaded incremental
+exhaustive sweep, and an exact branch-and-bound search that prunes
+provably-inconsistent regions of the scenario space.
 
 # Reference
 Weimer-Jehle, W. (2006). Cross-impact balances: A system-theoretical approach
