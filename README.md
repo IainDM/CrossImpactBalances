@@ -53,8 +53,8 @@ full scenario space in parallel across threads.
 | `signature`, `inv_signature`, `max_signature` | Bijection between scenarios and integers |
 | `impact_balance`, `own_impact_balance`, `cross_impact_balance`, `inner_product` | CIB scoring primitives |
 | `succession_step`, `succession` | Deterministic global-succession dynamics |
-| `find_consistent` | Find all fixed points (Monte-Carlo or `exhaustive=true`) |
-| `find_basins` | Basin-of-attraction analysis with memoization (Julia-only addition) |
+| `find_consistent` | Find all fixed points (Monte-Carlo, or `exhaustive=true` with `algorithm=:auto`/`:bnb`/`:sweep`) |
+| `find_basins` | Two-phase basin-of-attraction analysis (Julia-only addition) |
 | `sim_anneal`, `build_graph`, `merge_scenarios` | Threshold-gated fluctuation analysis for kernel reduction |
 | `inner_product_matrix` | Pairwise similarity of kernel scenarios |
 | `set_thresholds!`, `rand_scenario` | API helpers matching the Python reference |
@@ -93,6 +93,39 @@ memoization (~10×) × threading (~2.3× on 4 cores) × row-major SIMD (~2×).
 
 To reproduce: `julia --project=. -t auto test/benchmark.jl` and
 `test/benchmark_50x50.jl`.
+
+### v0.2 optimizations
+
+Version 0.2 rewrites all three engines (results are bit-identical; a
+property-test suite pins every algorithm against brute-force oracles):
+
+- **Exhaustive sweep**: the impact balance is maintained *incrementally* as a
+  mixed-radix odometer walks the space (two-row `@simd` delta per step, Int16
+  accumulation when the matrix allows), replacing per-scenario score
+  recomputation; work is split into fine-grained tasks for load balancing.
+- **`find_basins`**: two phases — a threaded flat successor table, then a
+  path-compressed resolution walk with O(1) cycle detection. Memory drops
+  from `nthreads × 8n` bytes to a thread-count-independent `~8n` bytes.
+- **Branch-and-bound** (`algorithm=:bnb`, chosen automatically by
+  `algorithm=:auto` for spaces ≥ 10^5): descriptors are assigned depth-first
+  and any subtree in which some assigned descriptor's chosen variant is
+  provably beaten in every completion is discarded using precomputed suffix
+  score bounds. Exact, and typically visits a few percent of the space; a
+  visited-node budget falls back to the sweep on weakly-coupled matrices
+  where pruning cannot pay off.
+
+Measured on a 4-core Intel Xeon @ 2.10 GHz, Julia 1.11.7 `-t 4`, find-only
+medians of 3 (`test/bench_optim.jl`):
+
+| File | Scenarios | v0.1 sweep | v0.2 sweep | v0.2 B&B (nodes visited) | v0.1 basins | v0.2 basins |
+|---|---:|---:|---:|---:|---:|---:|
+| `bench_typical` | 59,049 | 0.59 ms | 0.39 ms | 0.22 ms (13.3%) | 5.8 ms | 2.2 ms |
+| `bench_xlarge` | 59,049 | 0.61 ms | 0.39 ms | 0.22 ms (15.2%) | 5.5 ms | 1.8 ms |
+| `bench_50x50` | 60,466,176 | 915 ms | 348 ms | **23.6 ms** (2.25%) | 11.0 s | **1.91 s** |
+
+Net effect on the 60M-scenario stress file: exhaustive search is ~39× faster
+than v0.1 (and B&B's cost scales with the pruned tree, not the space, so the
+gap widens on larger problems); full basin analysis is ~5.8× faster.
 
 ## Citation
 

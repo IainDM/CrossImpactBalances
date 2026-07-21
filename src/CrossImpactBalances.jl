@@ -4,7 +4,9 @@
 Cross-Impact Balance (CIB) scenario analysis. A Julia implementation of the
 methodology in Weimer-Jehle (2006), ported from the Python
 [sei-international/cibsa](https://github.com/sei-international/cibsa) library
-with a memoized basin-of-attraction analysis and a threaded exhaustive search.
+with a two-phase basin-of-attraction analysis, a threaded incremental
+exhaustive sweep, and an exact branch-and-bound search that prunes
+provably-inconsistent regions of the scenario space.
 
 # Reference
 Weimer-Jehle, W. (2006). Cross-impact balances: A system-theoretical approach
@@ -432,20 +434,45 @@ end
 
 """
     find_consistent(cib; ignore_cycles=true, exhaustive=false,
-                    rng=Random.default_rng()) -> Vector{Vector{Int}}
+                    algorithm=:auto, rng=Random.default_rng()) -> Vector{Vector{Int}}
 
 Find all consistent scenarios by running succession from every (or sampled) starting point.
 
-When `exhaustive=true`, every scenario in the space is enumerated, using all
-available threads (start Julia with `julia -t auto` or `julia -t8`).
-This guarantees finding all fixed points but requires iterating the full space.
+When `exhaustive=true`, the full scenario space is searched and every fixed
+point is found, using all available threads (start Julia with `julia -t auto`).
+`algorithm` selects the strategy (only consulted when `exhaustive=true`):
+- `:sweep` — enumerate every scenario with the incremental odometer sweep.
+- `:bnb`   — branch-and-bound: assign descriptors depth-first and prune
+  subtrees that provably contain no fixed point (see [`_bnb_bounds`](@ref)).
+  Exact — returns the identical kernel — and typically visits a small
+  fraction of the space on strongly-coupled matrices.
+- `:auto`  (default) — the sweep for small spaces (< 10^5 scenarios),
+  otherwise branch-and-bound with a node budget of `n ÷ 16`; if pruning is
+  too weak to pay off, the budget trips and the sweep runs instead.
+
+The returned kernel is ordered by ascending signature for every exhaustive
+algorithm.
 
 When `exhaustive=false` and the space exceeds `cib.mc_threshold`, scenarios
 are sampled without replacement using `rng`.
 """
 function find_consistent(cib::CIB; ignore_cycles::Bool=true, exhaustive::Bool=false,
+                         algorithm::Symbol=:auto,
+                         bnb_node_budget::Union{Nothing,Int}=nothing,
                          rng::AbstractRNG=Random.default_rng())
     if exhaustive
+        algorithm in (:auto, :bnb, :sweep) ||
+            throw(ArgumentError("algorithm must be :auto, :bnb or :sweep, got $(repr(algorithm))"))
+        n = max_signature(cib) + 1
+        if algorithm == :sweep || (algorithm == :auto && n < 100_000)
+            return _find_consistent_exhaustive(cib; ignore_cycles=ignore_cycles)
+        end
+        sufmin, sufmax = _bnb_bounds(cib)
+        budget = something(bnb_node_budget,
+                           algorithm == :bnb ? typemax(Int) : n ÷ 16)
+        kern, _ = _bnb_fixed_points(cib, sufmin, sufmax; node_budget=budget)
+        !isnothing(kern) && return kern
+        # Budget tripped: pruning too weak on this matrix — fall back.
         return _find_consistent_exhaustive(cib; ignore_cycles=ignore_cycles)
     end
     kern = Vector{Vector{Int}}()
@@ -466,99 +493,333 @@ function find_consistent(cib::CIB; ignore_cycles::Bool=true, exhaustive::Bool=fa
 end
 
 """
+    _score_type(cib) -> Type{<:Signed}
+
+Narrowest safe integer type for impact-balance accumulation. `Int16` when
+`4 * (ndesc + 1) * maximum(abs, cim)` fits (margin covers the incremental
+row-delta updates; Int16 arithmetic wraps silently, so this guard is the
+only protection), otherwise `Int`. Realistic CIB matrices (entries ±3)
+are far inside the Int16 bound.
+"""
+function _score_type(cib::CIB)
+    maxabs = cib.ndim == 0 ? 0 : Int(maximum(abs, cib.cim))
+    return 4 * (cib.ndesc + 1) * maxabs <= Int(typemax(Int16)) ? Int16 : Int
+end
+
+"""
     _find_consistent_exhaustive(cib; ignore_cycles=true) -> Vector{Vector{Int}}
 
-Internal threaded exhaustive search. Partitions the signature space across
-`Threads.nthreads()` chunks; within each chunk uses a mixed-radix counter to
-avoid a `divmod` per signature, and a per-descriptor early-exit fixed-point
-check that bails as soon as any competitor variant beats the current one.
+Internal threaded exhaustive search. Splits the signature space into
+`16 × Threads.nthreads()` contiguous chunks scheduled as tasks (early-exit
+cost varies across the space, so fine-grained chunks load-balance better
+than one block per thread). Within a chunk, the impact-balance vector is
+maintained *incrementally*: a mixed-radix odometer advances the scenario,
+and each digit change updates the balance by the difference of two CIM
+rows (a `@simd` loop over the narrowed transpose from [`_score_type`](@ref)),
+so no per-scenario score recomputation happens at all. The fixed-point
+check is then a per-descriptor comparison over the balance vector with
+early exit.
+
+The returned kernel is ordered by ascending signature.
 
 `ignore_cycles` is accepted for API symmetry with [`find_consistent`](@ref)
 but is unused here: this routine only emits true fixed points (cycle length
 1), so non-fixed-point cycles never appear.
 """
 function _find_consistent_exhaustive(cib::CIB; ignore_cycles::Bool=true)
+    T = _score_type(cib)
+    return _sweep_fixed_points(cib, Matrix{T}(cib.cim_t))
+end
+
+function _sweep_fixed_points(cib::CIB, cimT::Matrix{T}) where {T<:Signed}
     n = max_signature(cib) + 1
-    nt = Threads.nthreads()
-    chunk_size = cld(n, nt)
-    ndesc = cib.ndesc
-    cim = cib.cim
-    nvariants = cib.nvariants
-    offsets = cib.desc_offsets
+    nchunks = max(1, min(n, 16 * Threads.nthreads()))
+    chunk_size = cld(n, nchunks)
+    nchunks = cld(n, chunk_size)
 
-    local_kerns = [Vector{Vector{Int}}() for _ in 1:nt]
-
-    Threads.@threads for chunk in 1:nt
-        v    = Vector{Int}(undef, ndesc)
-        tndx = Vector{Int}(undef, ndesc)
-
-        first_sig = (chunk - 1) * chunk_size
-        last_sig  = min(chunk * chunk_size - 1, n - 1)
-
-        # Decode first_sig once (the only divmod in this chunk)
-        s = first_sig
-        @inbounds for i in 1:ndesc
-            nv = nvariants[i]
-            v[i] = s % nv
-            tndx[i] = offsets[i] + v[i] + 1
-            s = s ÷ nv
-        end
-
-        for sig in first_sig:last_sig
-            # ── Per-descriptor fixed-point check with early exit ──
-            # Compute impact score only for columns we need. If any
-            # competitor variant beats the current one, bail immediately.
-            fixed = true
-            @inbounds for i in 1:ndesc
-                nv = nvariants[i]
-                off = offsets[i]
-                cur_col = off + v[i] + 1
-                # Score of current variant
-                cur_score = 0
-                for k in 1:ndesc
-                    cur_score += cim[tndx[k], cur_col]
-                end
-                # Does any other variant beat it?
-                for j in 0:nv-1
-                    j == v[i] && continue
-                    col = off + j + 1
-                    score = 0
-                    for k in 1:ndesc
-                        score += cim[tndx[k], col]
-                    end
-                    if score > cur_score
-                        fixed = false
-                        break
-                    end
-                end
-                fixed || break
-            end
-
-            if fixed
-                push!(local_kerns[chunk], copy(v))
-            end
-
-            # ── Mixed-radix increment (replaces inv_signature divmod) ──
-            if sig < last_sig
-                @inbounds for i in 1:ndesc
-                    v[i] += 1
-                    tndx[i] += 1
-                    if v[i] < nvariants[i]
-                        break
-                    end
-                    v[i] = 0
-                    tndx[i] = offsets[i] + 1
-                end
-            end
-        end
+    results = [Vector{Vector{Int}}() for _ in 1:nchunks]
+    @sync for c in 1:nchunks
+        out = results[c]
+        first_sig = (c - 1) * chunk_size
+        last_sig = min(c * chunk_size, n) - 1
+        Threads.@spawn _sweep_chunk!(out, cimT, first_sig, last_sig,
+                                     cib.nvariants, cib.desc_offsets,
+                                     cib.ndesc, cib.ndim)
     end
 
-    # Merge chunk-local results (no dedup needed — each point is unique)
+    # Chunks cover ascending contiguous signature ranges; merging in chunk
+    # order keeps the kernel sorted by signature. No dedup needed.
     kern = Vector{Vector{Int}}()
-    for chunk in 1:nt
-        append!(kern, local_kerns[chunk])
+    for c in 1:nchunks
+        append!(kern, results[c])
     end
     return kern
+end
+
+function _sweep_chunk!(out::Vector{Vector{Int}}, cimT::Matrix{T},
+                       first_sig::Int, last_sig::Int,
+                       nvariants::Vector{Int}, offsets::Vector{Int},
+                       ndesc::Int, ndim::Int) where {T<:Signed}
+    v    = Vector{Int}(undef, ndesc)
+    rows = Vector{Int}(undef, ndesc)   # column of cimT holding descriptor i's current row
+    ib   = zeros(T, ndim)
+
+    # Decode first_sig (the only divmod in this chunk) and build the
+    # initial impact balance from scratch.
+    s = first_sig
+    @inbounds for i in 1:ndesc
+        nv = nvariants[i]
+        v[i] = s % nv
+        rows[i] = offsets[i] + v[i] + 1
+        s = s ÷ nv
+    end
+    @inbounds for i in 1:ndesc
+        r = rows[i]
+        @simd for j in 1:ndim
+            ib[j] += cimT[j, r]
+        end
+    end
+
+    @inbounds for sig in first_sig:last_sig
+        # ── Fixed-point check: per-descriptor early-exit compare over ib ──
+        fixed = true
+        for i in 1:ndesc
+            off = offsets[i]
+            cur = ib[off + v[i] + 1]
+            for j in 1:nvariants[i]
+                if ib[off + j] > cur   # strict >: ties keep the current variant
+                    fixed = false
+                    break
+                end
+            end
+            fixed || break
+        end
+        fixed && push!(out, copy(v))
+
+        # ── Odometer increment with fused row-delta ib update ──
+        if sig < last_sig
+            for i in 1:ndesc
+                nv = nvariants[i]
+                nv == 1 && continue    # radix-1: value stays 0, carry onward
+                rold = rows[i]
+                if v[i] + 1 < nv
+                    v[i] += 1
+                    rnew = rold + 1
+                    rows[i] = rnew
+                    @simd for j in 1:ndim
+                        ib[j] += cimT[j, rnew] - cimT[j, rold]
+                    end
+                    break
+                end
+                v[i] = 0               # roll over; carry to next digit
+                rnew = offsets[i] + 1
+                rows[i] = rnew
+                @simd for j in 1:ndim
+                    ib[j] += cimT[j, rnew] - cimT[j, rold]
+                end
+            end
+        end
+    end
+    return out
+end
+
+# ─── Branch-and-bound exhaustive search ─────────────────────────────────────
+
+"""
+    _bnb_bounds(cib) -> (sufmin, sufmax)
+
+Suffix score bounds for branch-and-bound. `sufmin[k, c]` / `sufmax[k, c]`
+is the minimum / maximum total contribution descriptors `k..ndesc` can make
+to the impact score of flat variant column `c` over all choices of their
+variants. Row `ndesc + 1` is zero, so once descriptors `1..k` are assigned,
+`sufmin[k+1, c]`..`sufmax[k+1, c]` brackets what the still-free descriptors
+can add to column `c`.
+"""
+function _bnb_bounds(cib::CIB)
+    ndesc, ndim = cib.ndesc, cib.ndim
+    cim_t = cib.cim_t
+    sufmin = zeros(Int, ndesc + 1, ndim)
+    sufmax = zeros(Int, ndesc + 1, ndim)
+    @inbounds for k in ndesc:-1:1
+        off = cib.desc_offsets[k]
+        nv = cib.nvariants[k]
+        for c in 1:ndim
+            mn = typemax(Int)
+            mx = typemin(Int)
+            for s in 0:nv-1
+                val = Int(cim_t[c, off + s + 1])   # = cim[row of variant s, c]
+                mn = ifelse(val < mn, val, mn)
+                mx = ifelse(val > mx, val, mx)
+            end
+            sufmin[k, c] = sufmin[k + 1, c] + mn
+            sufmax[k, c] = sufmax[k + 1, c] + mx
+        end
+    end
+    return sufmin, sufmax
+end
+
+# Per-task DFS state. `p` is the running prefix impact balance (exact
+# contribution of the assigned descriptors to every column); `v` the current
+# partial assignment. `total`/`abort`/`budget` are shared across tasks.
+struct _BnBState
+    cim_t::Matrix{Int}
+    sufmin::Matrix{Int}
+    sufmax::Matrix{Int}
+    nvariants::Vector{Int}
+    offsets::Vector{Int}
+    ndesc::Int
+    ndim::Int
+    v::Vector{Int}
+    p::Vector{Int}
+    out::Vector{Vector{Int}}
+    nodes::Base.RefValue{Int}
+    total::Threads.Atomic{Int}
+    abort::Threads.Atomic{Bool}
+    budget::Int
+end
+
+"""
+    _bnb_pruned(st, k) -> Bool
+
+With descriptors `1..k` assigned, decide whether the current subtree can be
+discarded: true iff some assigned descriptor `j` has a competitor variant
+whose *worst-case* completed score still strictly exceeds the chosen
+variant's *best-case* completed score — then every completion fails the
+fixed-point test at `j`. Ties never prune (matching the favour-current
+convention), and at `k == ndesc` the suffix bounds are zero, so this
+condition IS the exact fixed-point predicate on the full scenario.
+"""
+function _bnb_pruned(st::_BnBState, k::Int)
+    p = st.p
+    sufmin = st.sufmin
+    sufmax = st.sufmax
+    kk = k + 1
+    @inbounds for j in 1:k
+        off = st.offsets[j]
+        cs = off + st.v[j] + 1
+        best_cur = p[cs] + sufmax[kk, cs]
+        for c in off+1:off+st.nvariants[j]
+            if p[c] + sufmin[kk, c] > best_cur
+                return true
+            end
+        end
+    end
+    return false
+end
+
+# Charge one visited node against the shared budget (flushed every 256).
+# Returns false when the budget has tripped and the search must abort.
+function _bnb_charge!(st::_BnBState)
+    st.nodes[] += 1
+    if st.nodes[] >= 256
+        Threads.atomic_add!(st.total, st.nodes[])
+        st.nodes[] = 0
+        if st.total[] > st.budget || st.abort[]
+            st.abort[] = true
+            return false
+        end
+    end
+    return true
+end
+
+# Depth-first over variants of descriptor k. Returns false on abort.
+function _bnb_node!(st::_BnBState, k::Int)
+    nv = st.nvariants[k]
+    off = st.offsets[k]
+    p = st.p
+    cim_t = st.cim_t
+    ndim = st.ndim
+    @inbounds for s in 0:nv-1
+        col = off + s + 1
+        @simd for j in 1:ndim          # push chosen row onto the prefix
+            p[j] += cim_t[j, col]
+        end
+        st.v[k] = s
+        ok = _bnb_charge!(st)
+        if ok && !_bnb_pruned(st, k)
+            if k == st.ndesc
+                push!(st.out, copy(st.v))
+            else
+                ok = _bnb_node!(st, k + 1)
+            end
+        end
+        @simd for j in 1:ndim          # pop
+            p[j] -= cim_t[j, col]
+        end
+        ok || return false
+    end
+    return true
+end
+
+"""
+    _bnb_fixed_points(cib, sufmin, sufmax; node_budget)
+        -> (Union{Nothing, Vector{Vector{Int}}}, nodes_visited)
+
+Threaded branch-and-bound search for all fixed points. Subtrees are fanned
+out as tasks over the assignments of the first `L` descriptors (chosen so
+the task count comfortably exceeds the thread count). The first element is
+`nothing` if the visited-node budget trips (pruning too weak to beat the
+sweep), else the complete kernel sorted by ascending signature; the second
+is the number of tree nodes visited (partial scenarios expanded).
+"""
+function _bnb_fixed_points(cib::CIB, sufmin::Matrix{Int}, sufmax::Matrix{Int};
+                           node_budget::Int)
+    ndesc = cib.ndesc
+    nvariants = cib.nvariants
+    offsets = cib.desc_offsets
+    ndim = cib.ndim
+    cim_t = cib.cim_t
+
+    # Prefix depth: enough top-level assignments to keep every thread busy.
+    L = 0
+    nprefix = 1
+    while L < ndesc && nprefix < 4 * Threads.nthreads()
+        L += 1
+        nprefix *= nvariants[L]
+    end
+
+    total = Threads.Atomic{Int}(0)
+    abort = Threads.Atomic{Bool}(false)
+    outs = [Vector{Vector{Int}}() for _ in 1:nprefix]
+
+    @sync for pid in 0:nprefix-1
+        out = outs[pid + 1]
+        Threads.@spawn begin
+            st = _BnBState(cim_t, sufmin, sufmax, nvariants, offsets,
+                           ndesc, ndim, zeros(Int, ndesc), zeros(Int, ndim),
+                           out, Ref(0), total, abort, node_budget)
+            # Build the prefix, checking the prune at every level so a
+            # subtree dead at depth i < L is skipped without descending.
+            s = pid
+            alive = true
+            @inbounds for i in 1:L
+                st.v[i] = s % nvariants[i]
+                s = s ÷ nvariants[i]
+                col = offsets[i] + st.v[i] + 1
+                @simd for j in 1:ndim
+                    st.p[j] += cim_t[j, col]
+                end
+                alive = _bnb_charge!(st) && !_bnb_pruned(st, i)
+                alive || break
+            end
+            if alive
+                if L == ndesc
+                    push!(out, copy(st.v))   # surviving depth-ndesc prune == fixed point
+                else
+                    _bnb_node!(st, L + 1)
+                end
+            end
+            Threads.atomic_add!(total, st.nodes[])   # flush residual node count
+        end
+    end
+
+    abort[] && return (nothing, total[])
+    kern = Vector{Vector{Int}}()
+    for out in outs
+        append!(kern, out)
+    end
+    sort!(kern; by = u -> signature(cib, u))
+    return (kern, total[])
 end
 
 """
@@ -568,161 +829,214 @@ Exhaustive basin-of-attraction analysis. Follows the succession chain from
 every scenario in the space, counting how many starting points converge to
 each fixed point.
 
-Uses a flat cache so each scenario is resolved exactly once (O(n) total
-succession steps). Returns:
-- `fixed_points`: Vector of fixed-point scenarios (0-based variant indices)
+Runs in two phases: a threaded sweep fills a flat successor table (every
+scenario's succession step, computed once via an incrementally maintained
+impact balance), then a sequential resolution pass walks the table with
+path compression so each scenario is resolved exactly once. Memory is
+~8n bytes for the two flat tables (Int32 entries when the space fits,
+Int64 otherwise), independent of the thread count.
+
+Returns:
+- `fixed_points`: Vector of fixed-point scenarios (0-based variant indices),
+  ordered by ascending signature
 - `basin_sizes`:  corresponding basin sizes (same order as `fixed_points`)
 - `cycle_count`:  number of scenarios that fall into non-fixed-point cycles
+  (including scenarios whose chain merely leads into a cycle)
 """
 function find_basins(cib::CIB)
     n = max_signature(cib) + 1
+    T = _score_type(cib)
+    if n <= Int(typemax(Int32)) - 1
+        return _find_basins(cib, Int32, Matrix{T}(cib.cim_t))
+    end
+    return _find_basins(cib, Int64, Matrix{T}(cib.cim_t))
+end
+
+function _find_basins(cib::CIB, ::Type{S}, cimT::Matrix{T}) where {S<:Union{Int32,Int64}, T<:Signed}
+    n = max_signature(cib) + 1
+    succ = Vector{S}(undef, n)
+    _successor_table!(succ, cib, cimT)
+    fp_sigs, sizes, cycle_count = _resolve_and_tally(succ, n)
+    kern = [inv_signature(cib, fp) for fp in fp_sigs]
+    return kern, sizes, cycle_count
+end
+
+"""
+    _successor_table!(succ, cib, cimT) -> succ
+
+Fill `succ[sig + 1]` with the succession-step signature of every scenario.
+Threaded over contiguous chunks (disjoint writes); each chunk advances a
+mixed-radix odometer and maintains the impact balance incrementally, then
+takes the per-descriptor argmax (ties favor the current variant, then the
+lowest index — identical to [`succession_step`](@ref)).
+"""
+function _successor_table!(succ::Vector{S}, cib::CIB, cimT::Matrix{T}) where {S,T}
+    n = max_signature(cib) + 1
+    orders = Vector{Int}(undef, cib.ndesc)   # mixed-radix place values
+    o = 1
+    for i in 1:cib.ndesc
+        orders[i] = o
+        o *= cib.nvariants[i]
+    end
+
+    nchunks = max(1, min(n, 16 * Threads.nthreads()))
+    chunk_size = cld(n, nchunks)
+    nchunks = cld(n, chunk_size)
+    @sync for c in 1:nchunks
+        first_sig = (c - 1) * chunk_size
+        last_sig = min(c * chunk_size, n) - 1
+        Threads.@spawn _successor_chunk!(succ, cimT, first_sig, last_sig,
+                                         cib.nvariants, cib.desc_offsets,
+                                         orders, cib.ndesc, cib.ndim)
+    end
+    return succ
+end
+
+function _successor_chunk!(succ::Vector{S}, cimT::Matrix{T},
+                           first_sig::Int, last_sig::Int,
+                           nvariants::Vector{Int}, offsets::Vector{Int},
+                           orders::Vector{Int}, ndesc::Int, ndim::Int) where {S,T}
+    v    = Vector{Int}(undef, ndesc)
+    rows = Vector{Int}(undef, ndesc)
+    ib   = zeros(T, ndim)
+
+    s = first_sig
+    @inbounds for i in 1:ndesc
+        nv = nvariants[i]
+        v[i] = s % nv
+        rows[i] = offsets[i] + v[i] + 1
+        s = s ÷ nv
+    end
+    @inbounds for i in 1:ndesc
+        r = rows[i]
+        @simd for j in 1:ndim
+            ib[j] += cimT[j, r]
+        end
+    end
+
+    @inbounds for sig in first_sig:last_sig
+        # ── Successor signature: full per-descriptor argmax over ib ──
+        w_sig = 0
+        for i in 1:ndesc
+            off = offsets[i]
+            wi = v[i]
+            max_val = ib[off + wi + 1]   # current variant seeds the max
+            for j in 0:nvariants[i]-1
+                score = ib[off + j + 1]
+                if score > max_val       # strict >: ties keep current/lower index
+                    max_val = score
+                    wi = j
+                end
+            end
+            w_sig += orders[i] * wi
+        end
+        succ[sig + 1] = S(w_sig)
+
+        # ── Odometer increment with fused row-delta ib update ──
+        if sig < last_sig
+            for i in 1:ndesc
+                nv = nvariants[i]
+                nv == 1 && continue      # radix-1: value stays 0, carry onward
+                rold = rows[i]
+                if v[i] + 1 < nv
+                    v[i] += 1
+                    rnew = rold + 1
+                    rows[i] = rnew
+                    @simd for j in 1:ndim
+                        ib[j] += cimT[j, rnew] - cimT[j, rold]
+                    end
+                    break
+                end
+                v[i] = 0                 # roll over; carry to next digit
+                rnew = offsets[i] + 1
+                rows[i] = rnew
+                @simd for j in 1:ndim
+                    ib[j] += cimT[j, rnew] - cimT[j, rold]
+                end
+            end
+        end
+    end
+    return succ
+end
+
+"""
+    _resolve_and_tally(succ, n) -> (fp_sigs, sizes, cycle_count)
+
+Resolve every scenario to its attractor by walking the successor table.
+`res` values: 0 = unvisited, -2 = on the chain currently being walked,
+-1 = falls into (or leads into) a non-fixed-point cycle, k > 0 = converges
+to the fixed point with signature k - 1. The in-progress marker makes cycle
+detection O(1) per step; on any resolution the entire walked chain is
+back-filled, so total work is O(n). The walk is sequential (the table is
+shared mutable state); the final tally pass is threaded.
+"""
+function _resolve_and_tally(succ::Vector{S}, n::Int) where {S}
+    res = zeros(S, n)
+    history = Int[]
+    marker = S(-2)
+
+    @inbounds for start in 0:n-1
+        res[start + 1] != 0 && continue
+        empty!(history)
+        cur = start
+        res[cur + 1] = marker
+        push!(history, cur)
+
+        while true
+            nxt = Int(succ[cur + 1])
+            r = res[nxt + 1]
+            if r == marker
+                # Hit our own chain: either the last element is a fixed
+                # point (succ maps it to itself) or we closed a true cycle.
+                # Chains *leading into* a cycle count as cycle scenarios too.
+                val = nxt == cur ? S(cur + 1) : S(-1)
+                for h in history
+                    res[h + 1] = val
+                end
+                break
+            elseif r != 0
+                for h in history        # already resolved: backfill chain
+                    res[h + 1] = r
+                end
+                break
+            end
+            res[nxt + 1] = marker
+            push!(history, nxt)
+            cur = nxt
+        end
+    end
+
+    # ── Threaded tally (read-only over res) ──
     nt = Threads.nthreads()
-    ndesc = cib.ndesc
-    ndim = cib.ndim
-    cim_t = cib.cim_t   # row-vectors of cim live as columns of cim_t (SIMD-friendly)
-    nvariants = cib.nvariants
-    offsets = cib.desc_offsets
-
-    chunk_size = cld(n, nt)
-
-    # Per-thread caches (memory cost: nt * n * 8 bytes — matches the single-thread
-    # version's footprint times the thread count). Each thread also produces a
-    # local basin tally; we merge at the end.
-    # cache values: 0 = unvisited, -1 = cycle, k>0 = converges to fp with sig (k-1).
-    thread_basins = [Dict{Int,Int}() for _ in 1:nt]
-    thread_cycle_counts = zeros(Int, nt)
-
-    Threads.@threads for tid in 1:nt
-        first_sig = (tid - 1) * chunk_size
-        last_sig  = min(tid * chunk_size, n) - 1
-        first_sig > last_sig && continue
-
-        cache    = zeros(Int, n)
-        w        = Vector{Int}(undef, ndesc)
-        ib       = Vector{Int}(undef, ndim)
-        tndx     = Vector{Int}(undef, ndesc)
-        history  = Int[]
-
-        for start_sig in first_sig:last_sig
-            @inbounds cache[start_sig + 1] != 0 && continue
-
-            # Decode start_sig into w
-            s = start_sig
-            @inbounds for i in 1:ndesc
-                w[i] = s % nvariants[i]
-                s = s ÷ nvariants[i]
+    tally_chunk = cld(n, nt)
+    local_counts = [Dict{Int,Int}() for _ in 1:nt]
+    local_cyc = zeros(Int, nt)
+    @sync for t in 1:nt
+        lo = (t - 1) * tally_chunk
+        hi = min(t * tally_chunk, n) - 1
+        counts = local_counts[t]
+        Threads.@spawn begin
+            cyc = 0
+            @inbounds for i in lo:hi
+                c = Int(res[i + 1])
+                if c == -1
+                    cyc += 1
+                else
+                    counts[c - 1] = get(counts, c - 1, 0) + 1
+                end
             end
-
-            empty!(history)
-            push!(history, start_sig)
-
-            while true
-                # ── inline succession_step: row-at-a-time with @simd ──
-                @inbounds for i in 1:ndesc
-                    tndx[i] = offsets[i] + w[i] + 1
-                end
-                r1 = tndx[1]
-                @inbounds @simd for j in 1:ndim
-                    ib[j] = cim_t[j, r1]
-                end
-                for ki in 2:ndesc
-                    r = @inbounds tndx[ki]
-                    @inbounds @simd for j in 1:ndim
-                        ib[j] += cim_t[j, r]
-                    end
-                end
-                # Pick best variant per descriptor
-                @inbounds for i in 1:ndesc
-                    nv = nvariants[i]
-                    off = offsets[i]
-                    max_val = ib[off + w[i] + 1]
-                    for j in 0:nv-1
-                        score = ib[off + j + 1]
-                        if score > max_val
-                            max_val = score
-                            w[i] = j
-                        end
-                    end
-                end
-
-                # Signature of w (the successor)
-                w_sig = 0
-                order = 1
-                @inbounds for i in 1:ndesc
-                    w_sig += order * w[i]
-                    order *= nvariants[i]
-                end
-
-                # ── Already resolved? Backfill entire history ──
-                @inbounds cached = cache[w_sig + 1]
-                if cached != 0
-                    @inbounds for h in history
-                        cache[h + 1] = cached
-                    end
-                    break
-                end
-
-                # ── Cycle detection: is w_sig already in our chain? ──
-                cycle_start = 0
-                for k in length(history):-1:1
-                    if @inbounds history[k] == w_sig
-                        cycle_start = k
-                        break
-                    end
-                end
-
-                if cycle_start > 0
-                    if cycle_start == length(history)
-                        val = w_sig + 1
-                        @inbounds for h in history
-                            cache[h + 1] = val
-                        end
-                    else
-                        @inbounds for h in history
-                            cache[h + 1] = -1
-                        end
-                    end
-                    break
-                end
-
-                push!(history, w_sig)
-            end
-        end
-
-        # ── Tally THIS thread's chunk through its own cache ──
-        local_basins = thread_basins[tid]
-        local_cycle = 0
-        @inbounds for sig in first_sig:last_sig
-            c = cache[sig + 1]
-            if c == -1
-                local_cycle += 1
-            elseif c > 0
-                fp_sig = c - 1
-                local_basins[fp_sig] = get(local_basins, fp_sig, 0) + 1
-            end
-        end
-        thread_cycle_counts[tid] = local_cycle
-    end
-
-    # ── Merge per-thread basin tallies ──
-    cycle_count = sum(thread_cycle_counts)
-    kern = Vector{Vector{Int}}()
-    basins = Vector{Int}()
-    fp_order = Dict{Int, Int}()
-    for tid in 1:nt
-        for (fp_sig, count) in thread_basins[tid]
-            idx = get(fp_order, fp_sig, 0)
-            if idx == 0
-                push!(kern, inv_signature(cib, fp_sig))
-                push!(basins, count)
-                fp_order[fp_sig] = length(kern)
-            else
-                @inbounds basins[idx] += count
-            end
+            local_cyc[t] = cyc
         end
     end
 
-    return kern, basins, cycle_count
+    merged = Dict{Int,Int}()
+    for counts in local_counts
+        for (fp, cnt) in counts
+            merged[fp] = get(merged, fp, 0) + cnt
+        end
+    end
+    fp_sigs = sort!(collect(keys(merged)))
+    return fp_sigs, [merged[fp] for fp in fp_sigs], sum(local_cyc)
 end
 
 # ─── Simulated annealing ────────────────────────────────────────────────────

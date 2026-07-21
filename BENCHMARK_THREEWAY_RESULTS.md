@@ -4,6 +4,15 @@ Wall-clock and correctness comparison of three Cross-Impact Balance (CIB)
 consistency-search implementations on a common set of `.scw` files.
 Run **2026-06-04**.
 
+> **Addendum (2026-07-21):** the JuCIB numbers below predate the v0.2
+> optimizations (incremental Int16 sweep, two-phase basin analysis, and an
+> exact branch-and-bound search that visits ~2% of the 60 M space). On the
+> v0.2 engine the 60 M-scenario exhaustive search runs in ~24 ms on a 4-core
+> VM — roughly 15× faster than the v0.1 sweep on the same machine, with a
+> bit-identical kernel. See the README's *v0.2 optimizations* section and
+> `test/bench_optim.jl`; results below are kept as the historical three-way
+> comparison.
+
 - **ScenarioWizard (SW)** — Weimer-Jehle's reference desktop app (GUI, driven via UI automation).
 - **CIBSA** — published Python package [`sei-international/cibsa`](https://github.com/sei-international/cibsa) (`CIB_sim_anneal.py`).
 - **JuCIB** — `CrossImpactBalances.jl` (this repo).
