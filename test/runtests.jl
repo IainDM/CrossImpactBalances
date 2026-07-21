@@ -382,4 +382,6 @@ const SAMPLE_DIR = joinpath(@__DIR__, "sample_files")
         @test length(cib.kernel) == 2
     end
 
+    include("property_tests.jl")
+
 end
