@@ -74,9 +74,19 @@ function check_case(cib::CIB)
     want = sorted_sigs(cib, naive_kernel(cib))
 
     # Threaded exhaustive sweep: exact same set, ascending-signature order.
-    got_exh = find_consistent(cib; exhaustive=true)
+    got_exh = find_consistent(cib; exhaustive=true, algorithm=:sweep)
     got_exh_sigs = [signature(cib, u) for u in got_exh]
     @test got_exh_sigs == want          # sorted == pins the ordering guarantee
+
+    # Branch-and-bound: identical kernel, same ascending order.
+    got_bnb = find_consistent(cib; exhaustive=true, algorithm=:bnb)
+    @test [signature(cib, u) for u in got_bnb] == want
+
+    # Tiny node budget: B&B trips (when the tree exceeds one charge batch)
+    # and the sweep fallback must deliver the identical kernel either way.
+    got_fb = find_consistent(cib; exhaustive=true, algorithm=:bnb,
+                             bnb_node_budget=1)
+    @test [signature(cib, u) for u in got_fb] == want
 
     # Succession-walk full enumeration (mc_threshold above space size).
     got_walk = find_consistent(cib; exhaustive=false)
