@@ -1,0 +1,95 @@
+name: Build Windows installer
+
+# Produces the Cross-Impact Balances .msi on a Windows runner:
+#   1. PackageCompiler compiles app/ into a standalone executable bundle.
+#   2. WiX wraps the bundle into an MSI.
+# The .msi is uploaded as a build artifact, and attached to the GitHub
+# Release when the workflow runs for a version tag (e.g. v0.2.0).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Installer version (X.Y.Z)"
+        required: true
+        default: "0.2.0"
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write        # needed to attach the .msi to a Release on tags
+
+jobs:
+  build-msi:
+    name: Compile app and build MSI
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="${{ github.event.inputs.version }}"
+          fi
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
+          echo "Building version ${v}"
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.10"
+          arch: x64
+
+      # PackageCompiler needs a C compiler on PATH; windows-latest ships gcc
+      # (mingw). Fail fast with a clear message if it is ever missing.
+      - name: Check C compiler
+        shell: bash
+        run: gcc --version || (echo "gcc not found — set JULIA_CC or install mingw" && exit 1)
+
+      - name: Instantiate build + app environments
+        shell: bash
+        run: |
+          julia --project=app   -e 'using Pkg; Pkg.instantiate()'
+          julia --project=build -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Compile standalone app bundle
+        shell: bash
+        run: julia --project=build build/create_app.jl "${GITHUB_WORKSPACE}/build/CrossImpactBalances-app"
+
+      - name: Install WiX
+        shell: bash
+        run: dotnet tool install --global wix --version "5.*"
+
+      - name: Build MSI
+        shell: bash
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          wix build build/installer.wxs -arch x64 \
+            -d AppDir="${GITHUB_WORKSPACE}/build/CrossImpactBalances-app" \
+            -d Version="${V}" \
+            -o "CrossImpactBalances-${V}-x64.msi"
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CrossImpactBalances-${{ steps.ver.outputs.version }}-msi
+          path: "CrossImpactBalances-*.msi"
+          if-no-files-found: error
+
+      - name: Publish MSI to Release (tags only)
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Upload to an existing release, or create one if the tag has none yet.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" CrossImpactBalances-*.msi --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" CrossImpactBalances-*.msi \
+              --title "${GITHUB_REF_NAME}" --generate-notes
+          fi

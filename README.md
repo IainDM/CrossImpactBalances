@@ -45,6 +45,16 @@ fixed_points, basin_sizes, cycle_count = find_basins(cib)
 For larger problems, use `load_scw(path; exhaustive=true)` to enumerate the
 full scenario space in parallel across threads.
 
+## Desktop app
+
+A point-and-click version for non-programmers lives in [`app/`](app): browse to
+a `.scw` file, then **Find Consistent Scenarios** or **Find Basins**, view the
+results (with basin sizes) and export the full basin analysis as CSV. It runs
+locally in your browser and has no external dependencies. Run it from source
+with `julia --project=app -t auto app/run.jl`, or build a standalone Windows
+installer (`.msi`) — no Julia needed on the target machine — via the pipeline
+in [`build/`](build/README.md).
+
 ## What's included
 
 | Function | Purpose |
@@ -52,12 +62,46 @@ full scenario space in parallel across threads.
 | `load_scw`, `load_solutions` | Parse ScenarioWizard `.scw` and `.sl` files |
 | `signature`, `inv_signature`, `max_signature` | Bijection between scenarios and integers |
 | `impact_balance`, `own_impact_balance`, `cross_impact_balance`, `inner_product` | CIB scoring primitives |
-| `succession_step`, `succession` | Deterministic global-succession dynamics |
-| `find_consistent` | Find all fixed points (Monte-Carlo, or `exhaustive=true` with `algorithm=:auto`/`:bnb`/`:sweep`) |
-| `find_basins` | Two-phase basin-of-attraction analysis (Julia-only addition) |
+| `SuccessionRule`, `GlobalSuccession`, `SequentialSuccession` | Pluggable succession dynamics (see [Pluggable succession rules](#pluggable-succession-rules)) |
+| `succession_step`, `succession` | Deterministic succession dynamics under a chosen rule |
+| `find_consistent` | Find all fixed points (Monte-Carlo, or `exhaustive=true` with `algorithm=:auto`/`:bnb`/`:sweep`); honours `rule=` |
+| `find_basins` | Two-phase basin-of-attraction analysis (Julia-only addition); honours `rule=` |
 | `sim_anneal`, `build_graph`, `merge_scenarios` | Threshold-gated fluctuation analysis for kernel reduction |
 | `inner_product_matrix` | Pairwise similarity of kernel scenarios |
 | `set_thresholds!`, `rand_scenario` | API helpers matching the Python reference |
+
+## Pluggable succession rules
+
+The succession *dynamics* — the deterministic map from a scenario to its
+successor — is an extension point. `GlobalSuccession` (the classical
+ScenarioWizard/CIBSA rule) is the default and carries the fast threaded
+sweep, branch-and-bound, and two-phase basin implementations. To add a new
+rule, subtype `SuccessionRule` and define one method:
+
+```julia
+struct MyRule <: SuccessionRule end
+
+function CrossImpactBalances.succession_step(::MyRule, cib::CIB, u::Vector{Int})
+    # return the successor scenario (0-based variant indices)
+end
+```
+
+That's the entire contract. Every analysis routine then works with it:
+
+```julia
+find_consistent(cib; rule=MyRule(), exhaustive=true)
+find_basins(cib; rule=MyRule())
+succession(MyRule(), cib, u)
+```
+
+A custom rule runs through a generic, single-threaded scan (a correctness
+baseline); a rule that needs the fast paths can additionally specialise the
+internal `_exhaustive_kernel(rule, cib; ...)` and `_basins(rule, cib)`
+methods on its own type. `SequentialSuccession` (Gauss–Seidel-style updates)
+ships as a second built-in rule, and
+[`examples/04_custom_succession_rule.jl`](examples/04_custom_succession_rule.jl)
+is a worked example. The `algorithm=:sweep/:bnb` search-strategy switch
+applies only to `GlobalSuccession`.
 
 ## Performance
 
