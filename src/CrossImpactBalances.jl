@@ -466,99 +466,134 @@ function find_consistent(cib::CIB; ignore_cycles::Bool=true, exhaustive::Bool=fa
 end
 
 """
+    _score_type(cib) -> Type{<:Signed}
+
+Narrowest safe integer type for impact-balance accumulation. `Int16` when
+`4 * (ndesc + 1) * maximum(abs, cim)` fits (margin covers the incremental
+row-delta updates; Int16 arithmetic wraps silently, so this guard is the
+only protection), otherwise `Int`. Realistic CIB matrices (entries ±3)
+are far inside the Int16 bound.
+"""
+function _score_type(cib::CIB)
+    maxabs = cib.ndim == 0 ? 0 : Int(maximum(abs, cib.cim))
+    return 4 * (cib.ndesc + 1) * maxabs <= Int(typemax(Int16)) ? Int16 : Int
+end
+
+"""
     _find_consistent_exhaustive(cib; ignore_cycles=true) -> Vector{Vector{Int}}
 
-Internal threaded exhaustive search. Partitions the signature space across
-`Threads.nthreads()` chunks; within each chunk uses a mixed-radix counter to
-avoid a `divmod` per signature, and a per-descriptor early-exit fixed-point
-check that bails as soon as any competitor variant beats the current one.
+Internal threaded exhaustive search. Splits the signature space into
+`16 × Threads.nthreads()` contiguous chunks scheduled as tasks (early-exit
+cost varies across the space, so fine-grained chunks load-balance better
+than one block per thread). Within a chunk, the impact-balance vector is
+maintained *incrementally*: a mixed-radix odometer advances the scenario,
+and each digit change updates the balance by the difference of two CIM
+rows (a `@simd` loop over the narrowed transpose from [`_score_type`](@ref)),
+so no per-scenario score recomputation happens at all. The fixed-point
+check is then a per-descriptor comparison over the balance vector with
+early exit.
+
+The returned kernel is ordered by ascending signature.
 
 `ignore_cycles` is accepted for API symmetry with [`find_consistent`](@ref)
 but is unused here: this routine only emits true fixed points (cycle length
 1), so non-fixed-point cycles never appear.
 """
 function _find_consistent_exhaustive(cib::CIB; ignore_cycles::Bool=true)
+    T = _score_type(cib)
+    return _sweep_fixed_points(cib, Matrix{T}(cib.cim_t))
+end
+
+function _sweep_fixed_points(cib::CIB, cimT::Matrix{T}) where {T<:Signed}
     n = max_signature(cib) + 1
-    nt = Threads.nthreads()
-    chunk_size = cld(n, nt)
-    ndesc = cib.ndesc
-    cim = cib.cim
-    nvariants = cib.nvariants
-    offsets = cib.desc_offsets
+    nchunks = max(1, min(n, 16 * Threads.nthreads()))
+    chunk_size = cld(n, nchunks)
+    nchunks = cld(n, chunk_size)
 
-    local_kerns = [Vector{Vector{Int}}() for _ in 1:nt]
-
-    Threads.@threads for chunk in 1:nt
-        v    = Vector{Int}(undef, ndesc)
-        tndx = Vector{Int}(undef, ndesc)
-
-        first_sig = (chunk - 1) * chunk_size
-        last_sig  = min(chunk * chunk_size - 1, n - 1)
-
-        # Decode first_sig once (the only divmod in this chunk)
-        s = first_sig
-        @inbounds for i in 1:ndesc
-            nv = nvariants[i]
-            v[i] = s % nv
-            tndx[i] = offsets[i] + v[i] + 1
-            s = s ÷ nv
-        end
-
-        for sig in first_sig:last_sig
-            # ── Per-descriptor fixed-point check with early exit ──
-            # Compute impact score only for columns we need. If any
-            # competitor variant beats the current one, bail immediately.
-            fixed = true
-            @inbounds for i in 1:ndesc
-                nv = nvariants[i]
-                off = offsets[i]
-                cur_col = off + v[i] + 1
-                # Score of current variant
-                cur_score = 0
-                for k in 1:ndesc
-                    cur_score += cim[tndx[k], cur_col]
-                end
-                # Does any other variant beat it?
-                for j in 0:nv-1
-                    j == v[i] && continue
-                    col = off + j + 1
-                    score = 0
-                    for k in 1:ndesc
-                        score += cim[tndx[k], col]
-                    end
-                    if score > cur_score
-                        fixed = false
-                        break
-                    end
-                end
-                fixed || break
-            end
-
-            if fixed
-                push!(local_kerns[chunk], copy(v))
-            end
-
-            # ── Mixed-radix increment (replaces inv_signature divmod) ──
-            if sig < last_sig
-                @inbounds for i in 1:ndesc
-                    v[i] += 1
-                    tndx[i] += 1
-                    if v[i] < nvariants[i]
-                        break
-                    end
-                    v[i] = 0
-                    tndx[i] = offsets[i] + 1
-                end
-            end
-        end
+    results = [Vector{Vector{Int}}() for _ in 1:nchunks]
+    @sync for c in 1:nchunks
+        out = results[c]
+        first_sig = (c - 1) * chunk_size
+        last_sig = min(c * chunk_size, n) - 1
+        Threads.@spawn _sweep_chunk!(out, cimT, first_sig, last_sig,
+                                     cib.nvariants, cib.desc_offsets,
+                                     cib.ndesc, cib.ndim)
     end
 
-    # Merge chunk-local results (no dedup needed — each point is unique)
+    # Chunks cover ascending contiguous signature ranges; merging in chunk
+    # order keeps the kernel sorted by signature. No dedup needed.
     kern = Vector{Vector{Int}}()
-    for chunk in 1:nt
-        append!(kern, local_kerns[chunk])
+    for c in 1:nchunks
+        append!(kern, results[c])
     end
     return kern
+end
+
+function _sweep_chunk!(out::Vector{Vector{Int}}, cimT::Matrix{T},
+                       first_sig::Int, last_sig::Int,
+                       nvariants::Vector{Int}, offsets::Vector{Int},
+                       ndesc::Int, ndim::Int) where {T<:Signed}
+    v    = Vector{Int}(undef, ndesc)
+    rows = Vector{Int}(undef, ndesc)   # column of cimT holding descriptor i's current row
+    ib   = zeros(T, ndim)
+
+    # Decode first_sig (the only divmod in this chunk) and build the
+    # initial impact balance from scratch.
+    s = first_sig
+    @inbounds for i in 1:ndesc
+        nv = nvariants[i]
+        v[i] = s % nv
+        rows[i] = offsets[i] + v[i] + 1
+        s = s ÷ nv
+    end
+    @inbounds for i in 1:ndesc
+        r = rows[i]
+        @simd for j in 1:ndim
+            ib[j] += cimT[j, r]
+        end
+    end
+
+    @inbounds for sig in first_sig:last_sig
+        # ── Fixed-point check: per-descriptor early-exit compare over ib ──
+        fixed = true
+        for i in 1:ndesc
+            off = offsets[i]
+            cur = ib[off + v[i] + 1]
+            for j in 1:nvariants[i]
+                if ib[off + j] > cur   # strict >: ties keep the current variant
+                    fixed = false
+                    break
+                end
+            end
+            fixed || break
+        end
+        fixed && push!(out, copy(v))
+
+        # ── Odometer increment with fused row-delta ib update ──
+        if sig < last_sig
+            for i in 1:ndesc
+                nv = nvariants[i]
+                nv == 1 && continue    # radix-1: value stays 0, carry onward
+                rold = rows[i]
+                if v[i] + 1 < nv
+                    v[i] += 1
+                    rnew = rold + 1
+                    rows[i] = rnew
+                    @simd for j in 1:ndim
+                        ib[j] += cimT[j, rnew] - cimT[j, rold]
+                    end
+                    break
+                end
+                v[i] = 0               # roll over; carry to next digit
+                rnew = offsets[i] + 1
+                rows[i] = rnew
+                @simd for j in 1:ndim
+                    ib[j] += cimT[j, rnew] - cimT[j, rold]
+                end
+            end
+        end
+    end
+    return out
 end
 
 """
