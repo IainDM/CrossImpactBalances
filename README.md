@@ -45,6 +45,52 @@ fixed_points, basin_sizes, cycle_count = find_basins(cib)
 For larger problems, use `load_scw(path; exhaustive=true)` to enumerate the
 full scenario space in parallel across threads.
 
+## Python interface
+
+A Pythonic wrapper lives in [`python/`](python/README.md). It embeds this Julia
+engine **in-process** via [`juliacall`](https://github.com/JuliaPy/PythonCall.jl),
+so a parsed model stays resident — you can batch-run many `.scw` files and even
+tweak individual cross-impact values in place without re-parsing.
+
+```bash
+pip install -e "python/[pandas]"          # from the repo root
+```
+
+```python
+from crossimpactbalances import Model, run_models, sweep_impact
+
+m = Model.load("test/sample_files/CIB_global.scw")
+m.consistent_scenarios()                  # [{'WTRD': 'FT', 'WSEC': 'Rlx', ...}, ...]
+
+# Edit an expert judgement and re-run — no re-parse of the .scw.
+m.set_impact(source=("WTRD", "FT"), target=("WSEC", "Alrt"), value=3)
+m.consistent_scenarios()
+
+# Or sweep one impact / batch over many model files.
+sweep_impact(m, ("WTRD", "FT"), ("WSEC", "Alrt"), [-3, 0, 3, 6])
+run_models("test/sample_files", analysis="basins")
+```
+
+Set `PYTHON_JULIACALL_THREADS=auto` before first use for multi-threaded
+exhaustive/basin analysis. The two new engine primitives that back in-place
+editing — `set_impact!` and `get_impact` — are also exported for Julia callers.
+See [`python/README.md`](python/README.md) and
+[`examples/python/run_many.py`](examples/python/run_many.py).
+
+### Two backends (including a source-free one)
+
+The same `Model` API runs on either backend, chosen by `Model.load(...,
+backend=...)` or the `CIB_BACKEND` env var:
+
+- **`juliacall`** — runs the Julia source package in-process (above). Best for
+  developing in this repo.
+- **`native`** — a compiled `libcib` shared library (machine code + bundled
+  Julia runtime) driven via `ctypes`, built with PackageCompiler from
+  [`capi/`](capi/README.md). It ships **no Julia source** and needs no Julia
+  install, so it's the way to distribute the engine as a black box. Build it
+  with `julia --project=build build/build_library.jl`; see
+  [`python/README.md`](python/README.md) for bundling it into a wheel.
+
 ## Desktop app
 
 A point-and-click version for non-programmers lives in [`app/`](app): browse to
@@ -69,6 +115,7 @@ in [`build/`](build/README.md).
 | `sim_anneal`, `build_graph`, `merge_scenarios` | Threshold-gated fluctuation analysis for kernel reduction |
 | `inner_product_matrix` | Pairwise similarity of kernel scenarios |
 | `set_thresholds!`, `rand_scenario` | API helpers matching the Python reference |
+| `set_impact!`, `get_impact` | Edit / read a single cross-impact value in place (keeps `cim`/`cim_t` in sync) |
 
 ## Pluggable succession rules
 

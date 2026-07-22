@@ -299,6 +299,47 @@ const SAMPLE_DIR = joinpath(@__DIR__, "sample_files")
         @test u1 == u2
     end
 
+    @testset "set_impact! / get_impact (in-place editing)" begin
+        cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"),
+                       sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))
+
+        d1 = cib.descriptors[1]
+        d2 = cib.descriptors[2]
+        v1 = cib.variants[d1][1]      # 0-based index 0
+        v2 = cib.variants[d2][2]      # 0-based index 1
+
+        # Name-based get/set round-trip; set returns the previous value.
+        original = get_impact(cib, d1, v1, d2, v2)
+        prev = set_impact!(cib, d1, v1, d2, v2, original + 5)
+        @test prev == original
+        @test get_impact(cib, d1, v1, d2, v2) == original + 5
+
+        # The stored transpose must stay consistent with cim after the edit.
+        @test cib.cim_t == permutedims(cib.cim)
+
+        # 0-based index form must resolve to the same cell as the name form.
+        @test get_impact(cib, 0, 0, 1, 1) == original + 5
+        set_impact!(cib, 0, 0, 1, 1, original)     # restore via index form
+        @test get_impact(cib, d1, v1, d2, v2) == original
+        @test cib.cim_t == permutedims(cib.cim)
+
+        # Editing the matrix in place changes the consistent set without a reload.
+        base_kernel = Set(signature(cib, u) for u in find_consistent(cib))
+        # Crank a few cells hard to force some fixed points to move.
+        set_impact!(cib, d2, cib.variants[d2][1],   d1, cib.variants[d1][1], 50)
+        set_impact!(cib, d2, cib.variants[d2][end], d1, cib.variants[d1][1], -50)
+        edited_kernel = Set(signature(cib, u) for u in find_consistent(cib))
+        @test cib.cim_t == permutedims(cib.cim)
+        @test edited_kernel != base_kernel
+
+        # Error paths (unknown names, out-of-range indices).
+        @test_throws ArgumentError get_impact(cib, "Nope", v1, d2, v2)
+        @test_throws ArgumentError get_impact(cib, d1, "Nope", d2, v2)
+        @test_throws ArgumentError set_impact!(cib, d1, v1, "Nope", v2, 1)
+        @test_throws ArgumentError CrossImpactBalances._table_index(cib, 0, 99)
+        @test_throws ArgumentError CrossImpactBalances._table_index(cib, 99, 0)
+    end
+
     @testset "Monte-Carlo find_consistent reproducibility" begin
         # bench_typical has 3^10 = 59,049 scenarios; with mc_threshold=500
         # we hit the sampling-without-replacement path of get_scenario_signatures.
