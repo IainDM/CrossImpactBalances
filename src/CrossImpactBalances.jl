@@ -19,6 +19,7 @@ to cross-impact analysis. *Technological Forecasting and Social Change*,
 module CrossImpactBalances
 
 using Random
+using SIMD: Vec, vload, vifelse
 using SparseArrays
 
 export CIB, load_scw, load_solutions,
@@ -1037,6 +1038,18 @@ function _successor_table!(succ::Vector{S}, cib::CIB, cimT::Matrix{T}) where {S,
     nchunks = max(1, min(n, 16 * Threads.nthreads()))
     chunk_size = cld(n, nchunks)
     nchunks = cld(n, chunk_size)
+    if S === Int32 && T === Int16 && cib.ndim > 0
+        # SIMD fast path: variant-major tiled argmax (identical output).
+        lay = _vm_layout(cib.nvariants, cib.desc_offsets, orders, cimT)
+        @sync for c in 1:nchunks
+            first_sig = (c - 1) * chunk_size
+            last_sig = min(c * chunk_size, n) - 1
+            Threads.@spawn _successor_chunk_vm!(succ, lay, first_sig, last_sig,
+                                                cib.nvariants, cib.desc_offsets,
+                                                cib.ndesc, cib.ndim)
+        end
+        return succ
+    end
     @sync for c in 1:nchunks
         first_sig = (c - 1) * chunk_size
         last_sig = min(c * chunk_size, n) - 1
@@ -1078,10 +1091,9 @@ function _successor_chunk!(succ::Vector{S}, cimT::Matrix{T},
             max_val = ib[off + wi + 1]   # current variant seeds the max
             for j in 0:nvariants[i]-1
                 score = ib[off + j + 1]
-                if score > max_val       # strict >: ties keep current/lower index
-                    max_val = score
-                    wi = j
-                end
+                better = score > max_val         # strict >: ties keep current/lower index
+                max_val = ifelse(better, score, max_val)
+                wi = ifelse(better, j, wi)        # branchless select (no misprediction)
             end
             w_sig += orders[i] * wi
         end
@@ -1114,57 +1126,273 @@ function _successor_chunk!(succ::Vector{S}, cimT::Matrix{T},
     return succ
 end
 
+# ─── SIMD successor chunk (Int16 scores, Int32 signatures) ──────────────────
+#
+# The scalar argmax above is the table build's hot spot (~60% of its time): a
+# data-dependent scan of 3-4 variants per descriptor that cannot vectorize.
+# This path restructures the impact-balance vector into *variant-major* order —
+# grouping descriptors by radix so that "variant j of every descriptor in the
+# group" is one contiguous plane — and then argmaxes 16 descriptors at once
+# with 256-bit integer SIMD. Semantics are identical to the scalar path (the
+# per-state successor table is byte-for-byte the same); only the evaluation
+# order changes.
+
 """
-    _resolve_and_tally(succ, n) -> (fp_sigs, sizes, cycle_count)
+    _vm_layout(nvariants, offsets, orders, cimT) -> NamedTuple
 
-Resolve every scenario to its attractor by walking the successor table.
-`res` values: 0 = unvisited, -2 = on the chain currently being walked,
--1 = falls into (or leads into) a non-fixed-point cycle, k > 0 = converges
-to the fixed point with signature k - 1. The in-progress marker makes cycle
-detection O(1) per step; on any resolution the entire walked chain is
-back-filled, so total work is O(n). The walk is sequential (the table is
-shared mutable state); the final tally pass is threaded.
+Build the variant-major layout for [`_successor_chunk_vm!`](@ref). Descriptors
+are grouped by radix; within a group the balance slots are reordered so plane
+`j` holds "variant `j` of each member descriptor" contiguously, and each group
+is split into 16-lane tiles. Returns:
+
+- `cimt_vm` — `cimT` with its slot axis permuted to variant-major (columns,
+  indexed by the odometer's descriptor-major `rows`, are untouched);
+- per-tile arrays `tile_r/tile_m/tile_base/tile_k0/tile_cur0` (radix, group
+  size = plane stride, group base slot, lane offset, current-variant buffer
+  offset);
+- `ordbuf` — 16 `Int32` mixed-radix place values per tile, zero in pad lanes
+  (pad lanes therefore contribute nothing to the signature);
+- `curpos_of` — where each descriptor's current variant lives in the per-worker
+  current-variant buffer (`ncur` entries).
 """
-function _resolve_and_tally(succ::Vector{S}, n::Int) where {S}
-    res = zeros(S, n)
-    history = Int[]
-    marker = S(-2)
-
-    @inbounds for start in 0:n-1
-        res[start + 1] != 0 && continue
-        empty!(history)
-        cur = start
-        res[cur + 1] = marker
-        push!(history, cur)
-
-        while true
-            nxt = Int(succ[cur + 1])
-            r = res[nxt + 1]
-            if r == marker
-                # Hit our own chain: either the last element is a fixed
-                # point (succ maps it to itself) or we closed a true cycle.
-                # Chains *leading into* a cycle count as cycle scenarios too.
-                val = nxt == cur ? S(cur + 1) : S(-1)
-                for h in history
-                    res[h + 1] = val
-                end
-                break
-            elseif r != 0
-                for h in history        # already resolved: backfill chain
-                    res[h + 1] = r
-                end
-                break
+function _vm_layout(nvariants::Vector{Int}, offsets::Vector{Int},
+                    orders::Vector{Int}, cimT::Matrix{Int16})
+    ndesc = length(nvariants)
+    ndim = size(cimT, 1)
+    radixes = sort!(unique(nvariants))
+    dm_of_vm = Vector{Int}(undef, ndim)      # variant-major slot -> descriptor-major slot
+    curpos_of = zeros(Int, ndesc)
+    tile_r = Int[]; tile_m = Int[]; tile_base = Int[]; tile_k0 = Int[]; tile_cur0 = Int[]
+    ordbuf = Int32[]
+    base = 0
+    for r in radixes
+        members = [i for i in 1:ndesc if nvariants[i] == r]
+        m = length(members)
+        for j in 0:r-1, (k, i) in enumerate(members)
+            dm_of_vm[base + j*m + k] = offsets[i] + j + 1
+        end
+        for k0 in 0:16:m-1
+            lanes = min(16, m - k0)
+            push!(tile_r, r); push!(tile_m, m); push!(tile_base, base); push!(tile_k0, k0)
+            push!(tile_cur0, length(tile_r) * 16 - 15)     # 16 cur lanes per tile
+            for l in 1:16
+                push!(ordbuf, l <= lanes ? Int32(orders[members[k0 + l]]) : Int32(0))
             end
-            res[nxt + 1] = marker
-            push!(history, nxt)
-            cur = nxt
+            for l in 1:lanes
+                curpos_of[members[k0 + l]] = (length(tile_r) - 1) * 16 + l
+            end
+        end
+        base += r * m
+    end
+    return (cimt_vm = cimT[dm_of_vm, :], ntiles = length(tile_r),
+            tile_r = tile_r, tile_m = tile_m, tile_base = tile_base,
+            tile_k0 = tile_k0, tile_cur0 = tile_cur0, ordbuf = ordbuf,
+            curpos_of = curpos_of, ncur = length(tile_r) * 16)
+end
+
+"""
+    _successor_chunk_vm!(succ, lay, first_sig, last_sig, nvariants, offsets,
+                         ndesc, ndim)
+
+Variant-major successor chunk: identical output to [`_successor_chunk!`](@ref)
+(same incremental odometer, same strict-`>`/current-wins tie-break), with the
+per-descriptor argmax vectorized across each 16-lane tile. Per variant plane
+the winner rule is a single blend:
+
+    wins = (score > max) | (lane's current variant == j  &  score == max)
+
+which reproduces the scalar tie-break exactly: the current variant beats an
+equal incumbent (the `==` arm fires only on the lane's own current plane), all
+other variants need strict `>`, and lower indices win otherwise because planes
+are scanned in ascending order. Pad lanes are harmless: their loads stay within
+the 16-slot padding of `ibv` and their place values in `ordbuf` are zero. The
+signature is then one SIMD widening multiply + horizontal sum per tile.
+"""
+function _successor_chunk_vm!(succ::Vector{Int32}, lay, first_sig::Int, last_sig::Int,
+                              nvariants::Vector{Int}, offsets::Vector{Int},
+                              ndesc::Int, ndim::Int)
+    cimt_vm = lay.cimt_vm
+    v    = Vector{Int}(undef, ndesc)
+    rows = Vector{Int}(undef, ndesc)
+    ibv  = zeros(Int16, ndim + 16)           # +16: tile loads may overhang the last group
+    cur  = zeros(Int16, lay.ncur)
+
+    s = first_sig
+    @inbounds for i in 1:ndesc
+        nv = nvariants[i]
+        v[i] = s % nv
+        rows[i] = offsets[i] + v[i] + 1
+        cur[lay.curpos_of[i]] = Int16(v[i])
+        s = s ÷ nv
+    end
+    @inbounds for i in 1:ndesc
+        r = rows[i]
+        @simd for j in 1:ndim
+            ibv[j] += cimt_vm[j, r]
         end
     end
 
-    # ── Threaded tally (read-only over res) ──
+    V = Vec{16,Int16}
+    W = Vec{16,Int32}
+    @inbounds for sig in first_sig:last_sig
+        # ── Successor signature: tiled SIMD argmax over the variant planes ──
+        w_sig = 0
+        for t in 1:lay.ntiles
+            r = lay.tile_r[t]; m = lay.tile_m[t]
+            off0 = lay.tile_base[t] + lay.tile_k0[t] + 1
+            cv = vload(V, cur, lay.tile_cur0[t])
+            mx = vload(V, ibv, off0)                     # plane 0 seeds (lowest index)
+            best = V(Int16(0))
+            for j in 1:r-1
+                pj = vload(V, ibv, off0 + j*m)
+                jv = V(Int16(j))
+                b = (pj > mx) | ((cv == jv) & (pj == mx))
+                mx = vifelse(b, pj, mx)
+                best = vifelse(b, jv, best)
+            end
+            w_sig += Int(sum(convert(W, best) * vload(W, lay.ordbuf, (t-1)*16 + 1)))
+        end
+        succ[sig + 1] = Int32(w_sig)
+
+        # ── Odometer increment with fused row-delta ibv update ──
+        if sig < last_sig
+            for i in 1:ndesc
+                nv = nvariants[i]
+                nv == 1 && continue      # radix-1: value stays 0, carry onward
+                rold = rows[i]
+                if v[i] + 1 < nv
+                    vi = v[i] + 1
+                    v[i] = vi
+                    rnew = rold + 1
+                    rows[i] = rnew
+                    cur[lay.curpos_of[i]] = Int16(vi)
+                    @simd for j in 1:ndim
+                        ibv[j] += cimt_vm[j, rnew] - cimt_vm[j, rold]
+                    end
+                    break
+                end
+                v[i] = 0                 # roll over; carry to next digit
+                rnew = offsets[i] + 1
+                rows[i] = rnew
+                cur[lay.curpos_of[i]] = Int16(0)
+                @simd for j in 1:ndim
+                    ibv[j] += cimt_vm[j, rnew] - cimt_vm[j, rold]
+                end
+            end
+        end
+    end
+    return succ
+end
+
+"""
+    _fp_id!(reg_lock, fp_sig_by_id, id_by_fp_sig, sig) -> id
+
+Locked get-or-assign of a dense 1-based id for the fixed point with signature
+`sig`. Called once per fixed point discovered (≈ `nfp` times total across all
+workers), so the lock is essentially uncontended. Concurrent discoverers of the
+same fixed point serialize here and receive the same id.
+"""
+@noinline function _fp_id!(reg_lock::ReentrantLock, fp_sig_by_id::Vector{Int},
+                           id_by_fp_sig::Dict{Int,Int}, sig::Int)
+    lock(reg_lock)
+    try
+        id = get(id_by_fp_sig, sig, 0)
+        if id == 0
+            push!(fp_sig_by_id, sig)
+            id = length(fp_sig_by_id)
+            id_by_fp_sig[sig] = id
+        end
+        return id
+    finally
+        unlock(reg_lock)
+    end
+end
+
+"""
+    _resolve_chunk!(res, succ, lo, hi, reg_lock, fp_sig_by_id, id_by_fp_sig)
+
+Resolve the starts in `lo:hi` into the shared `res`, following successor chains.
+Cycle detection is **thread-private** (a per-worker `history` + backward scan),
+so `res` only ever holds *final* labels — 0 = unvisited, -1 = cycle, k > 0 =
+converges to the fixed point with dense id `k`. There is no shared in-progress
+marker, so a worker that walks into another worker's not-yet-resolved chain just
+re-walks it (redundant, never a false cycle) and reaches the same attractor;
+every state's attractor is deterministic, so concurrent writes to the same slot
+store the same value — a benign race. Fixed-point ids come from the locked
+registry ([`_fp_id!`](@ref)), hit ≈ `nfp` times.
+"""
+function _resolve_chunk!(res::Vector{S}, succ::Vector{S}, lo::Int, hi::Int,
+                         reg_lock::ReentrantLock, fp_sig_by_id::Vector{Int},
+                         id_by_fp_sig::Dict{Int,Int}) where {S}
+    history = Int[]
+    @inbounds for start in lo:hi
+        res[start + 1] != 0 && continue
+        empty!(history)
+        cur = start
+        label = zero(S)
+        while true
+            r = res[cur + 1]
+            if r != 0                        # already resolved: inherit (fp id or -1)
+                label = r
+                break
+            end
+            onchain = false                  # already on our own chain? -> ≥2-cycle
+            for k in length(history):-1:1
+                if history[k] == cur
+                    onchain = true
+                    break
+                end
+            end
+            if onchain
+                label = S(-1)                # whole chain (incl. pre-cycle tail) is cycle
+                break
+            end
+            push!(history, cur)
+            nxt = Int(succ[cur + 1])
+            if nxt == cur                    # fixed point (counts itself: it's in history)
+                label = S(_fp_id!(reg_lock, fp_sig_by_id, id_by_fp_sig, cur))
+                break
+            end
+            cur = nxt
+        end
+        for h in history
+            res[h + 1] = label
+        end
+    end
+    return nothing
+end
+
+"""
+    _resolve_and_tally(succ, n) -> (fp_sigs, sizes, cycle_count)
+
+Resolve every scenario to its attractor by walking the successor table, then
+tally basin sizes and the cycle count. The walk is threaded over disjoint start
+ranges ([`_resolve_chunk!`](@ref)); it is race-safe because `res` holds only
+final labels and every attractor is deterministic. Each fixed point gets a dense
+id the first time it is reached (via a locked registry); the tally then indexes
+a dense per-fixed-point counter (fixed points are few), so it costs an array
+increment per scenario rather than a hash lookup. Output fixed points are sorted
+by signature, so the result is identical at any thread count.
+"""
+function _resolve_and_tally(succ::Vector{S}, n::Int) where {S}
+    res = zeros(S, n)
+    reg_lock = ReentrantLock()
+    fp_sig_by_id = Int[]             # dense id (1-based) -> fixed-point signature
+    id_by_fp_sig = Dict{Int,Int}()   # fixed-point signature -> dense id
+
     nt = Threads.nthreads()
+    chunk = cld(n, nt)
+    @sync for t in 1:nt
+        lo = (t - 1) * chunk
+        hi = min(t * chunk, n) - 1
+        Threads.@spawn _resolve_chunk!(res, succ, lo, hi, reg_lock,
+                                       fp_sig_by_id, id_by_fp_sig)
+    end
+
+    # ── Threaded tally: res holds a dense fixed-point id (>0) or -1 (cycle) ──
+    nfp = length(fp_sig_by_id)
     tally_chunk = cld(n, nt)
-    local_counts = [Dict{Int,Int}() for _ in 1:nt]
+    local_counts = [zeros(Int, nfp) for _ in 1:nt]
     local_cyc = zeros(Int, nt)
     @sync for t in 1:nt
         lo = (t - 1) * tally_chunk
@@ -1177,21 +1405,21 @@ function _resolve_and_tally(succ::Vector{S}, n::Int) where {S}
                 if c == -1
                     cyc += 1
                 else
-                    counts[c - 1] = get(counts, c - 1, 0) + 1
+                    counts[c] += 1              # c is a dense id in 1:nfp
                 end
             end
             local_cyc[t] = cyc
         end
     end
 
-    merged = Dict{Int,Int}()
+    total = zeros(Int, nfp)
     for counts in local_counts
-        for (fp, cnt) in counts
-            merged[fp] = get(merged, fp, 0) + cnt
+        @inbounds for k in 1:nfp
+            total[k] += counts[k]
         end
     end
-    fp_sigs = sort!(collect(keys(merged)))
-    return fp_sigs, [merged[fp] for fp in fp_sigs], sum(local_cyc)
+    perm = sortperm(fp_sig_by_id)
+    return fp_sig_by_id[perm], total[perm], sum(local_cyc)
 end
 
 # ─── Simulated annealing ────────────────────────────────────────────────────
