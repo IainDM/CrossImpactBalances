@@ -25,6 +25,10 @@ Source = "https://github.com/IainDM/CrossImpactBalances"
 
 [tool.hatch.build.targets.wheel]
 packages = ["crossimpactbalances"]
+# Include a compiled native library if one has been staged under _libcib/
+# (see docs). These files are gitignored build artifacts, so list them as
+# artifacts to override the VCS-ignore exclusion when present.
+artifacts = ["crossimpactbalances/_libcib/**"]
 
 # Ship the juliapkg dependency spec inside the package so juliacall can find it.
 [tool.hatch.build.targets.wheel.force-include]

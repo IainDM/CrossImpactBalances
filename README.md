@@ -77,6 +77,20 @@ editing — `set_impact!` and `get_impact` — are also exported for Julia calle
 See [`python/README.md`](python/README.md) and
 [`examples/python/run_many.py`](examples/python/run_many.py).
 
+### Two backends (including a source-free one)
+
+The same `Model` API runs on either backend, chosen by `Model.load(...,
+backend=...)` or the `CIB_BACKEND` env var:
+
+- **`juliacall`** — runs the Julia source package in-process (above). Best for
+  developing in this repo.
+- **`native`** — a compiled `libcib` shared library (machine code + bundled
+  Julia runtime) driven via `ctypes`, built with PackageCompiler from
+  [`capi/`](capi/README.md). It ships **no Julia source** and needs no Julia
+  install, so it's the way to distribute the engine as a black box. Build it
+  with `julia --project=build build/build_library.jl`; see
+  [`python/README.md`](python/README.md) for bundling it into a wheel.
+
 ## Desktop app
 
 A point-and-click version for non-programmers lives in [`app/`](app): browse to

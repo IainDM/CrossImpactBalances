@@ -1,5 +1,13 @@
-"""Shared fixtures. Integration tests need the Julia engine; skip gracefully
-when it cannot start (e.g. no network to provision Julia)."""
+"""Shared fixtures. Integration tests need an engine backend; skip gracefully
+when none can start.
+
+The backend under test is chosen by the ``CIB_BACKEND`` environment variable
+(``auto`` by default; ``juliacall`` or ``native`` to pin one) — the same
+override :func:`Model.load` consults for ``backend="auto"``, so ``run_models``
+and every other entry point agree. The juliacall and native backends each
+embed a Julia runtime, so they must not be initialised in the same process —
+verify each by running the suite once per backend in separate processes.
+"""
 
 import os
 
@@ -8,18 +16,20 @@ import pytest
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SAMPLE_DIR = os.path.join(REPO_ROOT, "test", "sample_files")
 GLOBAL_SCW = os.path.join(SAMPLE_DIR, "CIB_global.scw")
-GLOBAL_SL = os.path.join(SAMPLE_DIR, "CIB_global.sl")
+
+BACKEND = os.environ.get("CIB_BACKEND", "auto")
 
 
 @pytest.fixture(scope="session")
 def engine_available():
-    """True if the embedded Julia engine can start; otherwise skip."""
+    """True if the selected engine backend can load a model; else skip."""
     try:
-        from crossimpactbalances._engine import get_engine
-        get_engine()
+        from crossimpactbalances import Model
+        Model.load(GLOBAL_SCW, backend=BACKEND)
         return True
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"Julia engine unavailable: {type(exc).__name__}: {exc}")
+        pytest.skip(f"engine backend {BACKEND!r} unavailable: "
+                    f"{type(exc).__name__}: {exc}")
 
 
 @pytest.fixture(scope="session")
@@ -28,6 +38,6 @@ def sample_dir():
 
 
 @pytest.fixture
-def global_model(engine_available):
+def model(engine_available):
     from crossimpactbalances import Model
-    return Model.load(GLOBAL_SCW, sl_file=GLOBAL_SL)
+    return Model.load(GLOBAL_SCW, backend=BACKEND)
