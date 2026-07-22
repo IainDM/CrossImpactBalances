@@ -36,9 +36,9 @@ def test_run_models_records_errors(tmp_path):
     assert "error" in records[0]
 
 
-def test_sweep_impact_restores(global_model):
+def test_sweep_impact_restores(model):
     from crossimpactbalances import sweep_impact
-    m = global_model
+    m = model
     d1, d2 = m.descriptors[0], m.descriptors[1]
     src, tgt = (d1, m.variants[d1][0]), (d2, m.variants[d2][0])
     original = m.get_impact(src, tgt)

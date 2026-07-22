@@ -86,10 +86,56 @@ from crossimpactbalances import to_dataframe
 df = to_dataframe(records)          # requires the [pandas] extra
 ```
 
-## Packaging note
+## Backends
 
-`juliapkg.json` pins the engine with a `dev` path to the in-repo Julia source —
-correct for developing in this repository. To distribute the Python package on
-its own, replace the `dev`/`path` entry with a `url`/`rev` entry pointing at the
-GitHub repository (once the Julia package is registered, a plain version bound
-also works).
+The same `Model` API runs on either of two engine backends, selected by
+`Model.load(..., backend=...)` or the `CIB_BACKEND` environment variable:
+
+| Backend | Ships source? | How it runs |
+|---------|---------------|-------------|
+| `juliacall` | **Yes** — develops the Julia source package | In-process via juliacall; best for developing in this repo. |
+| `native` | **No** | A compiled `libcib` shared library (machine code) driven via `ctypes`. |
+| `auto` (default) | — | Uses the compiled library if one is found, else juliacall. |
+
+The two backends each embed a Julia runtime, so only one can be active per
+process — pin it rather than mixing.
+
+## Shipping without source (native backend)
+
+To distribute the engine as a black box — no `.jl` files on the user's
+machine — build the shared library and bundle it into the wheel.
+
+1. **Build the library** on each platform you ship (Linux/macOS/Windows ×
+   x86_64/arm64), from the repo root:
+
+   ```bash
+   julia --project=build build/build_library.jl
+   # → build/cib-lib/lib/libcib.{so,dylib,dll} (+ headers, runtime)
+   ```
+
+2. **Stage it into the package** so the wheel includes it:
+
+   ```bash
+   cp -r build/cib-lib python/crossimpactbalances/_libcib
+   ```
+
+   `_native.py` looks here first (then `build/cib-lib/`, then the
+   `CIB_NATIVE_LIB` env var). `pyproject.toml` already bundles
+   `crossimpactbalances/_libcib/**` into the wheel.
+
+3. **Build a platform wheel** (`pip wheel python/` or `python -m build`). The
+   resulting wheel carries the compiled engine and needs no Julia and no
+   source. Because the runtime is platform-specific, publish one wheel per
+   platform (a manylinux/macos/windows tag each).
+
+At runtime the native backend needs no juliacall and no network. Set
+`CIB_NATIVE_THREADS=auto` before first use for multi-threaded exhaustive/basin
+analysis.
+
+## Packaging note (juliacall backend)
+
+`juliapkg.json` pins the source engine with a `dev` path to the in-repo Julia
+source — correct for developing in this repository. To distribute the
+juliacall backend on its own, replace the `dev`/`path` entry with a `url`/`rev`
+entry pointing at the repository (note this puts the Julia source on the user's
+machine — use the native backend if that is not acceptable).
