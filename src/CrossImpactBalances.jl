@@ -27,7 +27,7 @@ export CIB, load_scw, load_solutions,
        succession_step, succession, find_consistent, find_basins,
        signature, inv_signature, max_signature,
        sim_anneal, inner_product_matrix, build_graph, merge_scenarios,
-       set_thresholds!, rand_scenario
+       set_thresholds!, rand_scenario, set_impact!, get_impact
 
 """
     CIB
@@ -1373,6 +1373,102 @@ function rand_scenario(cib::CIB; rng::AbstractRNG=Random.default_rng())
         u[i] = rand(rng, 0:cib.nvariants[i] - 1)
     end
     return u
+end
+
+# ─── In-place cross-impact editing ──────────────────────────────────────────
+
+"""
+    _desc_index(cib, desc) -> Int
+
+Resolve a descriptor given by name (`AbstractString`) or 0-based index
+(`Integer`) to its 1-based position in `cib.descriptors`. Throws on an unknown
+name or an out-of-range index.
+"""
+function _desc_index(cib::CIB, desc::AbstractString)
+    i = findfirst(==(String(desc)), cib.descriptors)
+    isnothing(i) && throw(ArgumentError(
+        "Unknown descriptor: \"$desc\". Available: $(join(cib.descriptors, ", "))"))
+    return i
+end
+
+function _desc_index(cib::CIB, desc::Integer)
+    (0 <= desc < cib.ndesc) || throw(ArgumentError(
+        "Descriptor index $desc out of range 0:$(cib.ndesc - 1)"))
+    return Int(desc) + 1
+end
+
+"""
+    _table_index(cib, desc, var) -> Int
+
+Resolve a (descriptor, variant) pair to the 1-based flat row/column index into
+`cib.cim`. Both `desc` and `var` may be given by name (`AbstractString`) or by
+0-based index (`Integer`). Mirrors the offset arithmetic in
+[`varndx_to_tablendx`](@ref): `desc_offsets[i] + var + 1`.
+"""
+function _table_index(cib::CIB, desc, var::AbstractString)
+    i = _desc_index(cib, desc)
+    dname = cib.descriptors[i]
+    vars = cib.variants[dname]
+    v = findfirst(==(String(var)), vars)
+    isnothing(v) && throw(ArgumentError(
+        "Unknown variant \"$var\" for descriptor \"$dname\". Available: $(join(vars, ", "))"))
+    return cib.desc_offsets[i] + v            # v is already 1-based here
+end
+
+function _table_index(cib::CIB, desc, var::Integer)
+    i = _desc_index(cib, desc)
+    nv = cib.nvariants[i]
+    (0 <= var < nv) || throw(ArgumentError(
+        "Variant index $var out of range 0:$(nv - 1) for descriptor \"$(cib.descriptors[i])\""))
+    return cib.desc_offsets[i] + Int(var) + 1
+end
+
+"""
+    set_impact!(cib, src_desc, src_var, tgt_desc, tgt_var, value) -> Int
+
+Set the cross-impact contributed by the source variant (`src_desc`=`src_var`)
+onto the target variant (`tgt_desc`=`tgt_var`), i.e. `cim[source, target]`, and
+return the previous value.
+
+Descriptors and variants may be given by name (`AbstractString`) or by 0-based
+index (`Integer`). This updates **both** the cross-impact matrix `cim` and its
+stored transpose `cim_t` so that every analysis routine (which may read either)
+sees a consistent matrix. Because `cim`/`cim_t` are mutated in place, the
+already-loaded model is edited without any re-parse; the next
+[`find_consistent`](@ref) / [`find_basins`](@ref) reflects the change.
+
+Note: `cib.kernel` (the kernel cached at load time) is **not** refreshed —
+recompute it with `find_consistent(cib)` if you rely on that field.
+
+# Example
+```julia
+cib = load_scw("model.scw")
+old = set_impact!(cib, "Trade", "Free", "Growth", "High", 3)
+new_kernel = find_consistent(cib)
+```
+"""
+function set_impact!(cib::CIB, src_desc, src_var, tgt_desc, tgt_var, value::Integer)
+    s = _table_index(cib, src_desc, src_var)
+    t = _table_index(cib, tgt_desc, tgt_var)
+    old = cib.cim[s, t]
+    v = Int(value)
+    cib.cim[s, t]   = v
+    cib.cim_t[t, s] = v          # keep the transpose in sync
+    return old
+end
+
+"""
+    get_impact(cib, src_desc, src_var, tgt_desc, tgt_var) -> Int
+
+Return the current cross-impact `cim[source, target]` contributed by the source
+variant (`src_desc`=`src_var`) onto the target variant (`tgt_desc`=`tgt_var`).
+Descriptors and variants may be given by name or 0-based index. Inverse lookup
+partner of [`set_impact!`](@ref).
+"""
+function get_impact(cib::CIB, src_desc, src_var, tgt_desc, tgt_var)
+    s = _table_index(cib, src_desc, src_var)
+    t = _table_index(cib, tgt_desc, tgt_var)
+    return cib.cim[s, t]
 end
 
 end # module
