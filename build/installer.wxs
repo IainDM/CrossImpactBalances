@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WiX v5 source for the Cross-Impact Balances MSI installer.
+  The build steps and exact wix command line are documented in build/README.md.
+
+  Two preprocessor variables are supplied on the wix command line:
+    AppDir   absolute path to the PackageCompiler bundle (the folder that
+             contains bin, lib, share and the "Cross-Impact Balances.cmd"
+             launcher).
+    Version  installer version as X.Y.Z.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Cross-Impact Balances"
+      Manufacturer="Iain Morrow"
+      Version="$(var.Version)"
+      UpgradeCode="22a1ce87-6ca1-419f-80b0-5377d0c3bc68"
+      Scope="perMachine">
+
+    <SummaryInformation Description="Cross-Impact Balance scenario analysis" />
+
+    <!-- Clean in-place upgrades: a newer version replaces an older one. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Program Files\Cross-Impact Balances -->
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="Cross-Impact Balances" />
+    </StandardDirectory>
+
+    <!-- Start-menu folder -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ShortcutFolder" Name="Cross-Impact Balances" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Cross-Impact Balances" Level="1">
+      <ComponentGroupRef Id="AppPayload" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <!-- Harvest the entire compiled app bundle into INSTALLFOLDER, preserving
+         the bin\ / lib\ / share\ structure and the launcher .cmd at the root. -->
+    <ComponentGroup Id="AppPayload" Directory="INSTALLFOLDER">
+      <Files Include="$(var.AppDir)\**" />
+    </ComponentGroup>
+
+    <!-- Start-menu shortcut to the thread-enabling launcher. -->
+    <Component Id="StartMenuShortcut" Directory="ShortcutFolder" Guid="46fc1e30-9373-4f7e-8ae7-218aa80aa9ef">
+      <Shortcut Id="AppShortcut"
+                Name="Cross-Impact Balances"
+                Description="Find consistent scenarios and basins of attraction from a .scw file"
+                Target="[INSTALLFOLDER]Cross-Impact Balances.cmd"
+                WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="RemoveShortcutFolder" Directory="ShortcutFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\IainMorrow\CrossImpactBalances"
+                     Name="installed" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+  </Package>
+</Wix>

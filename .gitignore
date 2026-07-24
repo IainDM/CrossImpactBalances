@@ -1,2 +1,11 @@
 Manifest.toml
 __pycache__/
+build/CrossImpactBalances-app/
+*.msi
+.pytest_cache/
+*.egg-info/
+python/build/
+python/dist/
+build/cib-lib/
+capi/Manifest.toml
+python/crossimpactbalances/_libcib/

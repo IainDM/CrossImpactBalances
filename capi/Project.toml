@@ -1,0 +1,16 @@
+name = "CIBCApi"
+uuid = "b0c1a2d3-e4f5-4a6b-8c7d-9e0f1a2b3c4d"
+authors = ["Iain Morrow"]
+version = "0.1.0"
+description = "C-callable shared-library surface over CrossImpactBalances, for non-Julia callers."
+
+[deps]
+CrossImpactBalances = "afc69b00-438b-45c4-b5e2-26f87645c9e3"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+
+# CrossImpactBalances is resolved from the parent repo via `Pkg.develop`
+# (see build/build_library.jl). Not pinned with a [sources] table because that
+# is a Julia 1.11+ feature and this package supports Julia 1.10.
+
+[compat]
+julia = "1.10"
