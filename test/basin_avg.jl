@@ -4,7 +4,7 @@
 using CrossImpactBalances
 const SAMPLE = raw"D:\GitHub\CrossImpactBalances\test\sample_files"
 const N = 3
-cib = load_scw(joinpath(SAMPLE, "bench_50x50.scw"); kernel=Vector{Vector{Int}}(), mc_threshold=10^18)
+cib = load_scw(joinpath(SAMPLE, "bench_50x50.scw"); kernel=Vector{Vector{Int}}())
 find_basins(cib)  # warmup (exclude JIT)
 ts = Float64[]
 for i in 1:N

@@ -5,6 +5,7 @@
 ```@docs
 load_scw
 load_solutions
+CIB
 ```
 
 ## Scenario encoding
@@ -15,37 +16,16 @@ inv_signature
 max_signature
 ```
 
-## Impact-balance primitives
+## Scoring
 
 ```@docs
 impact_balance
-own_impact_balance
-cross_impact_balance
-inner_product
-inner_product_matrix
 ```
 
 ## Dynamics
 
 ```@docs
 succession_step
-succession
 find_consistent
 find_basins
-```
-
-## Threshold-gated fluctuation analysis
-
-```@docs
-sim_anneal
-build_graph
-merge_scenarios
-```
-
-## Utilities
-
-```@docs
-set_thresholds!
-rand_scenario
-CIB
 ```

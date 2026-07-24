@@ -15,15 +15,10 @@ to cross-impact analysis. *Technological Forecasting and Social Change*,
 """
 module CrossImpactBalances
 
-using Random
-using SparseArrays
-
 export CIB, load_scw, load_solutions,
-       impact_balance, own_impact_balance, cross_impact_balance, inner_product,
-       succession_step, succession, find_consistent, find_basins,
-       signature, inv_signature, max_signature,
-       sim_anneal, inner_product_matrix, build_graph, merge_scenarios,
-       set_thresholds!, rand_scenario
+       impact_balance, succession_step,
+       find_consistent, find_basins,
+       signature, inv_signature, max_signature
 
 """
     CIB
@@ -44,12 +39,10 @@ Fields:
 - `ndim`: total number of variants (size of CIM)
 - `ndesc`: number of descriptors
 - `kernel`: list of consistent scenarios (each a Vector{Int}, 0-based variant indices)
-- `thresholds`: per-descriptor thresholds for simulated annealing
-- `mc_threshold`: cutoff for switching to Monte Carlo sampling
 - `desc_offsets`: cumulative 0-based variant offsets per descriptor
 
-`CIB` is immutable in its field bindings. `kernel` and `thresholds` are
-`Vector`s whose contents may be mutated in place (see `set_thresholds!`).
+`CIB` is immutable in its field bindings. `kernel` is a `Vector` whose
+contents may be mutated in place.
 """
 struct CIB
     descriptors::Vector{String}
@@ -60,32 +53,25 @@ struct CIB
     ndim::Int
     ndesc::Int
     kernel::Vector{Vector{Int}}
-    thresholds::Vector{Int}
-    mc_threshold::Int
     desc_offsets::Vector{Int}
 end
 
 # ─── .scw file parser ───────────────────────────────────────────────────────
 
 """
-    load_scw(scw_file; sl_file=nothing, kernel=nothing,
-             mc_threshold=10000, exhaustive=false,
-             rng=Random.default_rng()) -> CIB
+    load_scw(scw_file; sl_file=nothing, kernel=nothing, algorithm=:auto) -> CIB
 
 Parse a ScenarioWizard .scw file and optionally a .sl solutions file.
 Returns a fully populated CIB object.
 
-When `exhaustive=true`, every scenario in the space is checked (using threads
-when Julia is started with multiple threads, e.g. `julia -t8`).
-
-When the scenario space exceeds `mc_threshold` and `exhaustive=false`, a
-Monte-Carlo sample of that size is drawn without replacement using `rng`.
+Unless a `kernel` or an `sl_file` is supplied, the kernel is computed by
+[`find_consistent`](@ref), which always searches the full scenario space and
+uses every available thread (start Julia with `julia -t auto`). `algorithm`
+is forwarded to select the search strategy.
 """
 function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
                   kernel::Union{Vector{Vector{Int}},Nothing}=nothing,
-                  mc_threshold::Int=10000,
-                  exhaustive::Bool=false,
-                  rng::AbstractRNG=Random.default_rng())
+                  algorithm::Symbol=:auto)
     descriptors = String[]
     variants = Dict{String, Vector{String}}()
     nvars = Int[]
@@ -151,7 +137,6 @@ function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
     end
 
     ndesc = d + 1
-    thresholds = zeros(Int, ndesc)
 
     desc_offsets = Vector{Int}(undef, ndesc)
     off = 0
@@ -166,14 +151,14 @@ function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
 
     # Build CIB without a kernel first; if needed, populate kernel in place.
     cib = CIB(descriptors, variants, nvars, cim, cim_t, n, ndesc,
-              Vector{Vector{Int}}(), thresholds, mc_threshold, desc_offsets)
+              Vector{Vector{Int}}(), desc_offsets)
 
     if !isnothing(kernel)
         append!(cib.kernel, kernel)
     elseif !isnothing(sl_file)
         append!(cib.kernel, load_solutions(cib, sl_file))
     else
-        append!(cib.kernel, find_consistent(cib; exhaustive=exhaustive, rng=rng))
+        append!(cib.kernel, find_consistent(cib; algorithm=algorithm))
     end
 
     return cib
@@ -202,29 +187,6 @@ function load_solutions(cib::CIB, sl_file::String)
         push!(kern, indices .- 1)
     end
     return kern
-end
-
-# ─── Index conversion helpers ───────────────────────────────────────────────
-
-"""
-    varndx_to_tablendx(cib, u) -> Vector{Int}
-
-Convert a scenario `u` (length-`ndesc` vector of 0-based variant indices) to
-the corresponding 1-based row/column indices into `cib.cim`, i.e. the indices
-of `u`'s selected variants in the flat variant space.
-
-This is an internal helper used by [`impact_balance`](@ref) and friends. Hot
-loops in `find_basins` and `_find_consistent_exhaustive` inline the equivalent
-arithmetic to avoid the per-call allocation here.
-"""
-function varndx_to_tablendx(cib::CIB, u::Vector{Int})
-    tablendx = similar(u)
-    offset = 0
-    for i in eachindex(u)
-        tablendx[i] = offset + u[i] + 1  # +1 for Julia 1-based indexing
-        offset += cib.nvariants[i]
-    end
-    return tablendx
 end
 
 # ─── Signature (unique integer ID for a scenario) ──────────────────────────
@@ -267,61 +229,6 @@ function max_signature(cib::CIB)
     return signature(cib, [nv - 1 for nv in cib.nvariants])
 end
 
-# ─── Scenario sampling ──────────────────────────────────────────────────────
-
-"""
-    get_scenario_signatures(cib; max=cib.mc_threshold, allow_dups=false, rng=...)
-
-Return scenario signatures: every signature in `0:n-1` if the space size `n`
-does not exceed `max`, otherwise a random sample of `max` signatures.
-
-By default the sample is drawn without replacement, matching Python CIBSA's
-`np.random.choice(..., replace=False)` behavior. Pass `allow_dups=true` to
-sample with replacement (cheaper but biased toward duplicates).
-
-`rng` controls reproducibility; pass a seeded `AbstractRNG` for deterministic
-sampling.
-"""
-function get_scenario_signatures(cib::CIB;
-                                 max::Int=cib.mc_threshold,
-                                 allow_dups::Bool=false,
-                                 rng::AbstractRNG=Random.default_rng())
-    n = max_signature(cib) + 1
-    if n <= max
-        return 0:n-1
-    end
-    if allow_dups
-        return rand(rng, 0:n-1, max)
-    end
-    return _sample_without_replacement(rng, n, max)
-end
-
-# Reservoir-style partial Fisher-Yates: O(max) extra memory + O(max) swaps.
-# Returns `max` distinct integers from 0:n-1 in random order.
-function _sample_without_replacement(rng::AbstractRNG, n::Int, max::Int)
-    @assert max <= n
-    # When `max` is close to `n` a dense permutation is cheaper; otherwise a
-    # hash-table-based partial shuffle keeps memory at O(max).
-    if max * 4 >= n
-        perm = randperm(rng, n) .- 1  # 0-based signatures
-        return perm[1:max]
-    end
-    seen = Dict{Int,Int}()  # virtual swap map: i -> what value lives at position i
-    result = Vector{Int}(undef, max)
-    @inbounds for i in 1:max
-        # Pick j uniformly from {i, i+1, ..., n} (1-based positions in conceptual array)
-        j = rand(rng, i:n)
-        # Read the value at position j (default = j-1, the original integer)
-        vj = get(seen, j, j - 1)
-        # Read the value at position i (default = i-1)
-        vi = get(seen, i, i - 1)
-        # Swap positions i and j conceptually
-        seen[j] = vi
-        result[i] = vj
-    end
-    return result
-end
-
 # ─── Impact balance ─────────────────────────────────────────────────────────
 
 """
@@ -342,36 +249,6 @@ function impact_balance(cib::CIB, u::Vector{Int})
         end
     end
     return ib
-end
-
-"""
-    own_impact_balance(cib, u) -> Vector{Int}
-
-The impact balance entries corresponding to the scenario's own selected variants.
-"""
-function own_impact_balance(cib::CIB, u::Vector{Int})
-    ib = impact_balance(cib, u)
-    return ib[varndx_to_tablendx(cib, u)]
-end
-
-"""
-    cross_impact_balance(cib, u, v) -> Vector{Int}
-
-The impact balance of scenario `u` evaluated at the variants of scenario `v`.
-"""
-function cross_impact_balance(cib::CIB, u::Vector{Int}, v::Vector{Int})
-    ib = impact_balance(cib, u)
-    return ib[varndx_to_tablendx(cib, v)]
-end
-
-"""
-    inner_product(cib, u, v) -> Int
-
-Inner product of impact balance of `u` evaluated at `v`.
-"""
-function inner_product(cib::CIB, u::Vector{Int}, v::Vector{Int})
-    ib = impact_balance(cib, u)
-    return sum(ib[varndx_to_tablendx(cib, v)])
 end
 
 # ─── Succession ─────────────────────────────────────────────────────────────
@@ -402,45 +279,16 @@ function succession_step(cib::CIB, u::Vector{Int})
     return v
 end
 
-"""
-    succession(cib, u) -> (cycle_length, attractor)
-
-Follow global succession from scenario `u` until convergence to a fixed point
-or detection of a cycle. Returns (cycle_length, final_scenario).
-cycle_length=1 means a consistent scenario (fixed point).
-
-Cycle detection uses an O(1)-per-step hashtable, so total work is linear in
-the trajectory length.
-"""
-function succession(cib::CIB, u::Vector{Int})
-    start_sig = signature(cib, u)
-    history_sig = Int[start_sig]
-    seen = Dict{Int,Int}()  # signature -> 1-based position in history_sig
-    seen[start_sig] = 1
-    v = copy(u)
-    while true
-        v = succession_step(cib, v)
-        v_sig = signature(cib, v)
-        if haskey(seen, v_sig)
-            cycle_len = length(history_sig) - seen[v_sig] + 1
-            return (cycle_len, v)
-        end
-        push!(history_sig, v_sig)
-        seen[v_sig] = length(history_sig)
-    end
-end
-
 # ─── Find consistent scenarios ──────────────────────────────────────────────
 
 """
-    find_consistent(cib; ignore_cycles=true, exhaustive=false,
-                    algorithm=:auto, rng=Random.default_rng()) -> Vector{Vector{Int}}
+    find_consistent(cib; algorithm=:auto) -> Vector{Vector{Int}}
 
-Find all consistent scenarios by running succession from every (or sampled) starting point.
+Find every consistent scenario — every fixed point of the global-succession
+operator — by searching the full scenario space with all available threads
+(start Julia with `julia -t auto`).
 
-When `exhaustive=true`, the full scenario space is searched and every fixed
-point is found, using all available threads (start Julia with `julia -t auto`).
-`algorithm` selects the strategy (only consulted when `exhaustive=true`):
+`algorithm` selects the strategy:
 - `:sweep` — enumerate every scenario with the incremental odometer sweep.
 - `:bnb`   — branch-and-bound: assign descriptors depth-first and prune
   subtrees that provably contain no fixed point (see [`_bnb_bounds`](@ref)).
@@ -450,46 +298,25 @@ point is found, using all available threads (start Julia with `julia -t auto`).
   otherwise branch-and-bound with a node budget of `n ÷ 16`; if pruning is
   too weak to pay off, the budget trips and the sweep runs instead.
 
-The returned kernel is ordered by ascending signature for every exhaustive
-algorithm.
-
-When `exhaustive=false` and the space exceeds `cib.mc_threshold`, scenarios
-are sampled without replacement using `rng`.
+The returned kernel is ordered by ascending signature for every algorithm.
+Only true fixed points are returned; scenarios that fall into longer cycles
+never appear.
 """
-function find_consistent(cib::CIB; ignore_cycles::Bool=true, exhaustive::Bool=false,
-                         algorithm::Symbol=:auto,
-                         bnb_node_budget::Union{Nothing,Int}=nothing,
-                         rng::AbstractRNG=Random.default_rng())
-    if exhaustive
-        algorithm in (:auto, :bnb, :sweep) ||
-            throw(ArgumentError("algorithm must be :auto, :bnb or :sweep, got $(repr(algorithm))"))
-        n = max_signature(cib) + 1
-        if algorithm == :sweep || (algorithm == :auto && n < 100_000)
-            return _find_consistent_exhaustive(cib; ignore_cycles=ignore_cycles)
-        end
-        sufmin, sufmax = _bnb_bounds(cib)
-        budget = something(bnb_node_budget,
-                           algorithm == :bnb ? typemax(Int) : n ÷ 16)
-        kern, _ = _bnb_fixed_points(cib, sufmin, sufmax; node_budget=budget)
-        !isnothing(kern) && return kern
-        # Budget tripped: pruning too weak on this matrix — fall back.
-        return _find_consistent_exhaustive(cib; ignore_cycles=ignore_cycles)
+function find_consistent(cib::CIB; algorithm::Symbol=:auto,
+                         bnb_node_budget::Union{Nothing,Int}=nothing)
+    algorithm in (:auto, :bnb, :sweep) ||
+        throw(ArgumentError("algorithm must be :auto, :bnb or :sweep, got $(repr(algorithm))"))
+    n = max_signature(cib) + 1
+    if algorithm == :sweep || (algorithm == :auto && n < 100_000)
+        return _find_consistent_exhaustive(cib)
     end
-    kern = Vector{Vector{Int}}()
-    seen = Set{Int}()
-    for v_sig in get_scenario_signatures(cib; rng=rng)
-        v = inv_signature(cib, v_sig)
-        nper, veqm = succession(cib, v)
-        if ignore_cycles && nper > 1
-            continue
-        end
-        veqm_sig = signature(cib, veqm)
-        if !(veqm_sig in seen)
-            push!(seen, veqm_sig)
-            push!(kern, veqm)
-        end
-    end
-    return kern
+    sufmin, sufmax = _bnb_bounds(cib)
+    budget = something(bnb_node_budget,
+                       algorithm == :bnb ? typemax(Int) : n ÷ 16)
+    kern, _ = _bnb_fixed_points(cib, sufmin, sufmax; node_budget=budget)
+    !isnothing(kern) && return kern
+    # Budget tripped: pruning too weak on this matrix — fall back.
+    return _find_consistent_exhaustive(cib)
 end
 
 """
@@ -507,7 +334,7 @@ function _score_type(cib::CIB)
 end
 
 """
-    _find_consistent_exhaustive(cib; ignore_cycles=true) -> Vector{Vector{Int}}
+    _find_consistent_exhaustive(cib) -> Vector{Vector{Int}}
 
 Internal threaded exhaustive search. Splits the signature space into
 `16 × Threads.nthreads()` contiguous chunks scheduled as tasks (early-exit
@@ -520,13 +347,10 @@ so no per-scenario score recomputation happens at all. The fixed-point
 check is then a per-descriptor comparison over the balance vector with
 early exit.
 
-The returned kernel is ordered by ascending signature.
-
-`ignore_cycles` is accepted for API symmetry with [`find_consistent`](@ref)
-but is unused here: this routine only emits true fixed points (cycle length
-1), so non-fixed-point cycles never appear.
+The returned kernel is ordered by ascending signature. Only true fixed points
+(cycle length 1) are emitted, so non-fixed-point cycles never appear.
 """
-function _find_consistent_exhaustive(cib::CIB; ignore_cycles::Bool=true)
+function _find_consistent_exhaustive(cib::CIB)
     T = _score_type(cib)
     return _sweep_fixed_points(cib, Matrix{T}(cib.cim_t))
 end
@@ -1037,187 +861,6 @@ function _resolve_and_tally(succ::Vector{S}, n::Int) where {S}
     end
     fp_sigs = sort!(collect(keys(merged)))
     return fp_sigs, [merged[fp] for fp in fp_sigs], sum(local_cyc)
-end
-
-# ─── Simulated annealing ────────────────────────────────────────────────────
-
-"""
-    sim_anneal(cib, u; ignore_cycles=true, return_weights=false,
-               rng=Random.default_rng())
-
-Threshold-gated accessibility analysis (a misnomer carried over from the
-Python CIBSA reference — it is *not* a classical simulated-annealing
-optimizer). For each candidate scenario `v` drawn from the scenario space (or
-a Monte-Carlo sample when it exceeds `cib.mc_threshold`), accept `v` only if
-its cross-impact at `v` exceeds `u`'s own impact by at least
-`cib.thresholds[i]` in every descriptor `i`. Each accepted `v` is then
-deterministically run to a fixed point via [`succession`](@ref).
-
-When `return_weights=true`, returns a `Dict` mapping the signature of each
-reachable fixed point to the number of accepted candidates that converge to
-it (with a special `"reject"` key for candidates that fail the threshold
-gate). Otherwise returns the list of distinct reachable fixed points.
-
-`rng` controls the Monte-Carlo sample when one is drawn.
-"""
-function sim_anneal(cib::CIB, u::Vector{Int};
-                    ignore_cycles::Bool=true, return_weights::Bool=false,
-                    rng::AbstractRNG=Random.default_rng())
-    accessible = Vector{Vector{Int}}()
-    weights = Dict{Any,Int}()
-    weights["reject"] = 0
-    uib = own_impact_balance(cib, u)
-    sig_set = get_scenario_signatures(cib; rng=rng)
-
-    for v_sig in sig_set
-        v = inv_signature(cib, v_sig)
-        xib = cross_impact_balance(cib, u, v)
-        valid = true
-        for (ui, xi, thr) in zip(uib, xib, cib.thresholds)
-            if xi + thr <= ui
-                valid = false
-                break
-            end
-        end
-        if valid
-            nper, veqm = succession(cib, v)
-            if ignore_cycles && nper > 1
-                continue
-            end
-            veqm_sig = signature(cib, veqm)
-            if haskey(weights, veqm_sig)
-                weights[veqm_sig] += 1
-            else
-                weights[veqm_sig] = 1
-                push!(accessible, veqm)
-            end
-        else
-            weights["reject"] += 1
-        end
-    end
-
-    return return_weights ? weights : accessible
-end
-
-# ─── Inner product matrix ───────────────────────────────────────────────────
-
-"""
-    inner_product_matrix(cib) -> Matrix{Int}
-
-Compute the matrix of inner products between all kernel scenarios.
-
-Threaded over rows when Julia is started with multiple threads. Each row
-hoists its single [`impact_balance`](@ref) call out of the inner loop, so
-total work is `O(k × ndim)` impact-balance accumulations rather than `O(k²)`.
-"""
-function inner_product_matrix(cib::CIB)
-    k = length(cib.kernel)
-    M = zeros(Int, k, k)
-    # Precompute table indices for every kernel element once
-    tndxs = [varndx_to_tablendx(cib, v) for v in cib.kernel]
-    Threads.@threads for i in 1:k
-        ib = impact_balance(cib, cib.kernel[i])
-        @inbounds for j in 1:k
-            s = 0
-            for r in tndxs[j]
-                s += ib[r]
-            end
-            M[i, j] = s
-        end
-    end
-    return M
-end
-
-# ─── Graph and merge ────────────────────────────────────────────────────────
-
-"""
-    build_graph(cib) -> SparseMatrixCSC
-
-Build an adjacency matrix of kernel scenarios connected through simulated annealing.
-"""
-function build_graph(cib::CIB)
-    k = length(cib.kernel)
-    kernel_sigs = [signature(cib, u) for u in cib.kernel]
-    adj = zeros(Int, k, k)
-    for (r, u) in enumerate(cib.kernel)
-        accessible = sim_anneal(cib, u)
-        for w in accessible
-            w_sig = signature(cib, w)
-            idx = findfirst(==(w_sig), kernel_sigs)
-            if !isnothing(idx)
-                adj[r, idx] = 1
-            end
-        end
-    end
-    return sparse(adj)
-end
-
-"""
-    merge_scenarios(cib) -> Vector{Vector{Int}}
-
-Find connected components of the fluctuation-connected graph.
-Returns groups of scenario signatures that merge under simulated annealing.
-"""
-function merge_scenarios(cib::CIB)
-    adj = build_graph(cib)
-    k = size(adj, 1)
-
-    # Simple BFS connected components (avoids needing Graphs.jl)
-    visited = falses(k)
-    components = Vector{Vector{Int}}()
-
-    for start in 1:k
-        visited[start] && continue
-        component = Int[]
-        queue = [start]
-        visited[start] = true
-        while !isempty(queue)
-            node = popfirst!(queue)
-            push!(component, signature(cib, cib.kernel[node]))
-            for neighbor in 1:k
-                if !visited[neighbor] && (adj[node, neighbor] != 0 || adj[neighbor, node] != 0)
-                    visited[neighbor] = true
-                    push!(queue, neighbor)
-                end
-            end
-        end
-        push!(components, component)
-    end
-
-    return components
-end
-
-# ─── Mutators and helpers ────────────────────────────────────────────────────
-
-"""
-    set_thresholds!(cib::CIB, thr::AbstractVector{<:Integer}) -> CIB
-
-Replace `cib.thresholds` element-wise with `thr`. The length of `thr` must
-equal `cib.ndesc`. Returns `cib` so calls can be chained.
-
-The threshold vector is consumed by [`sim_anneal`](@ref), [`build_graph`](@ref),
-and [`merge_scenarios`](@ref); it has no effect on `find_consistent` or
-`find_basins`.
-"""
-function set_thresholds!(cib::CIB, thr::AbstractVector{<:Integer})
-    length(thr) == cib.ndesc ||
-        throw(DimensionMismatch("set_thresholds!: expected length $(cib.ndesc), got $(length(thr))"))
-    copyto!(cib.thresholds, thr)
-    return cib
-end
-
-"""
-    rand_scenario(cib::CIB; rng=Random.default_rng()) -> Vector{Int}
-
-Return a uniformly random scenario, i.e. a length-`ndesc` vector of 0-based
-variant indices with `0 ≤ u[i] < cib.nvariants[i]`.
-"""
-function rand_scenario(cib::CIB; rng::AbstractRNG=Random.default_rng())
-    u = Vector{Int}(undef, cib.ndesc)
-    @inbounds for i in 1:cib.ndesc
-        u[i] = rand(rng, 0:cib.nvariants[i] - 1)
-    end
-    return u
 end
 
 end # module

@@ -42,8 +42,13 @@ end
 fixed_points, basin_sizes, cycle_count = find_basins(cib)
 ```
 
-For larger problems, use `load_scw(path; exhaustive=true)` to enumerate the
-full scenario space in parallel across threads.
+`load_scw` always enumerates the full scenario space in parallel across
+threads — there is no sampling mode and no completeness caveat. Pass
+`algorithm=:sweep` or `:bnb` to force a search strategy; the default `:auto`
+picks one from the space size.
+
+The package has no dependencies outside the Julia standard library — in fact,
+no dependencies at all.
 
 ## What's included
 
@@ -51,13 +56,13 @@ full scenario space in parallel across threads.
 |----------|---------|
 | `load_scw`, `load_solutions` | Parse ScenarioWizard `.scw` and `.sl` files |
 | `signature`, `inv_signature`, `max_signature` | Bijection between scenarios and integers |
-| `impact_balance`, `own_impact_balance`, `cross_impact_balance`, `inner_product` | CIB scoring primitives |
-| `succession_step`, `succession` | Deterministic global-succession dynamics |
-| `find_consistent` | Find all fixed points (Monte-Carlo, or `exhaustive=true` with `algorithm=:auto`/`:bnb`/`:sweep`) |
+| `impact_balance` | Score every variant against a scenario |
+| `succession_step` | One step of deterministic global succession |
+| `find_consistent` | Find every fixed point by exhaustive search (`algorithm=:auto`/`:bnb`/`:sweep`) |
 | `find_basins` | Two-phase basin-of-attraction analysis (Julia-only addition) |
-| `sim_anneal`, `build_graph`, `merge_scenarios` | Threshold-gated fluctuation analysis for kernel reduction |
-| `inner_product_matrix` | Pairwise similarity of kernel scenarios |
-| `set_thresholds!`, `rand_scenario` | API helpers matching the Python reference |
+
+Ten exported names, no dependencies. Every one of them is either an entry
+point or is called from inside the package.
 
 ## Performance
 

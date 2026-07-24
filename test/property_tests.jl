@@ -1,6 +1,6 @@
 # Property tests: cross-check the optimized search/basin implementations
-# against brute-force oracles built only on the public scoring primitives
-# (succession_step / succession). Instances are constructed directly, so
+# against brute-force oracles built only on the public scoring primitive
+# succession_step. Instances are constructed directly, so
 # these tests cover shapes the .scw fixtures don't: radix-1 descriptors,
 # ties-only matrices, all-zero matrices, and entries large enough to force
 # the wide-integer arithmetic path.
@@ -19,8 +19,7 @@ function make_cib(nvariants::Vector{Int}, cim::Matrix{Int})
                     for i in 1:ndesc)
     desc_offsets = cumsum(vcat(0, nvariants[1:end-1]))
     return CIB(descriptors, variants, nvariants, cim, permutedims(cim),
-               ndim, ndesc, Vector{Vector{Int}}(), zeros(Int, ndesc),
-               10^9, desc_offsets)
+               ndim, ndesc, Vector{Vector{Int}}(), desc_offsets)
 end
 
 # Oracle 1: a scenario is consistent iff succession_step maps it to itself.
@@ -33,13 +32,28 @@ function naive_kernel(cib::CIB)
     return kern
 end
 
+# Follow succession_step from `u` until a signature repeats. Returns
+# (cycle_length, attractor); cycle_length == 1 means a fixed point.
+function naive_trace(cib::CIB, u::Vector{Int})
+    seen = Dict{Int,Int}(signature(cib, u) => 1)
+    history = 1
+    v = copy(u)
+    while true
+        v = succession_step(cib, v)
+        s = signature(cib, v)
+        haskey(seen, s) && return (history - seen[s] + 1, v)
+        history += 1
+        seen[s] = history
+    end
+end
+
 # Oracle 2: follow succession from every scenario; tally fixed-point basins
 # and count starts that end in non-fixed-point cycles.
 function naive_basins(cib::CIB)
     tally = Dict{Int,Int}()
     cyc = 0
     for s in 0:max_signature(cib)
-        nper, veqm = succession(cib, inv_signature(cib, s))
+        nper, veqm = naive_trace(cib, inv_signature(cib, s))
         if nper > 1
             cyc += 1
         else
@@ -74,23 +88,28 @@ function check_case(cib::CIB)
     want = sorted_sigs(cib, naive_kernel(cib))
 
     # Threaded exhaustive sweep: exact same set, ascending-signature order.
-    got_exh = find_consistent(cib; exhaustive=true, algorithm=:sweep)
+    got_exh = find_consistent(cib; algorithm=:sweep)
     got_exh_sigs = [signature(cib, u) for u in got_exh]
     @test got_exh_sigs == want          # sorted == pins the ordering guarantee
 
     # Branch-and-bound: identical kernel, same ascending order.
-    got_bnb = find_consistent(cib; exhaustive=true, algorithm=:bnb)
+    got_bnb = find_consistent(cib; algorithm=:bnb)
     @test [signature(cib, u) for u in got_bnb] == want
 
     # Tiny node budget: B&B trips (when the tree exceeds one charge batch)
     # and the sweep fallback must deliver the identical kernel either way.
-    got_fb = find_consistent(cib; exhaustive=true, algorithm=:bnb,
-                             bnb_node_budget=1)
+    got_fb = find_consistent(cib; algorithm=:bnb, bnb_node_budget=1)
     @test [signature(cib, u) for u in got_fb] == want
 
-    # Succession-walk full enumeration (mc_threshold above space size).
-    got_walk = find_consistent(cib; exhaustive=false)
-    @test sorted_sigs(cib, got_walk) == want
+    # Independent oracle: trace from every start and collect the fixed points
+    # it lands on. Built only on succession_step, so it shares no code with
+    # the sweep or the branch-and-bound search.
+    got_walk = Set{Int}()
+    for s in 0:max_signature(cib)
+        nper, veqm = naive_trace(cib, inv_signature(cib, s))
+        nper == 1 && push!(got_walk, signature(cib, veqm))
+    end
+    @test sort!(collect(got_walk)) == want
 
     # Basin analysis vs chain-following oracle.
     want_fps, want_sizes, want_cyc = naive_basins(cib)
