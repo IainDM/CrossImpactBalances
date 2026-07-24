@@ -87,7 +87,7 @@ function load_from_text(scwtext::AbstractString)
 end
 
 function analyze_consistent(cib)
-    compute = @elapsed (kern = find_consistent(cib; exhaustive = true))
+    compute = @elapsed (kern = find_consistent(cib))
     total = max_signature(cib) + 1
     scenarios = [Dict("signature" => signature(cib, u),
                       "variants" => variant_names(cib, u)) for u in kern]

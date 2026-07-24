@@ -18,8 +18,12 @@ to cross-impact analysis. *Technological Forecasting and Social Change*,
 """
 module CrossImpactBalances
 
+using SIMD: Vec, vload, vifelse
+
 export CIB, load_scw, load_solutions,
-       impact_balance, succession_step,
+       impact_balance,
+       SuccessionRule, GlobalSuccession, SequentialSuccession,
+       succession_step, succession,
        find_consistent, find_basins,
        signature, inv_signature, max_signature
 
@@ -339,16 +343,6 @@ function succession_step(::GlobalSuccession, cib::CIB, u::Vector{Int})
     return v
 end
 
-# ─── Find consistent scenarios ──────────────────────────────────────────────
-
-"""
-    find_consistent(cib; algorithm=:auto) -> Vector{Vector{Int}}
-
-Find every consistent scenario — every fixed point of the global-succession
-operator — by searching the full scenario space with all available threads
-(start Julia with `julia -t auto`).
-
-`algorithm` selects the strategy:
 function succession_step(::SequentialSuccession, cib::CIB, u::Vector{Int})
     v = copy(u)
     @inbounds for i in 1:cib.ndesc
@@ -401,21 +395,19 @@ end
 # ─── Find consistent scenarios ──────────────────────────────────────────────
 
 """
-    find_consistent(cib; rule=GlobalSuccession(), ignore_cycles=true,
-                    exhaustive=false, algorithm=:auto,
-                    rng=Random.default_rng()) -> Vector{Vector{Int}}
+    find_consistent(cib; rule=GlobalSuccession(), algorithm=:auto,
+                    bnb_node_budget=nothing) -> Vector{Vector{Int}}
 
-Find all consistent scenarios (fixed points of the succession map) by running
-succession under `rule` from every (or sampled) starting point.
+Find every consistent scenario — every fixed point of the succession map under
+`rule` — by exhaustively searching the whole scenario space with all available
+threads (start Julia with `julia -t auto`).
 
 `rule` selects the succession *dynamics* ([`SuccessionRule`](@ref); default
-[`GlobalSuccession`](@ref)). Any rule works through a generic scan; the
-default additionally uses the fast strategies below.
+[`GlobalSuccession`](@ref)). The default uses the fast sweep / branch-and-bound
+kernel; any other rule uses a generic ascending-signature scan.
 
-When `exhaustive=true`, the full scenario space is searched and every fixed
-point is found, using all available threads (start Julia with `julia -t auto`).
-`algorithm` selects the strategy (only consulted when `exhaustive=true`, and
-only supported for [`GlobalSuccession`](@ref)):
+`algorithm` selects the search strategy (only supported for
+[`GlobalSuccession`](@ref)):
 - `:sweep` — enumerate every scenario with the incremental odometer sweep.
 - `:bnb`   — branch-and-bound: assign descriptors depth-first and prune
   subtrees that provably contain no fixed point.
@@ -425,12 +417,24 @@ only supported for [`GlobalSuccession`](@ref)):
   otherwise branch-and-bound with a node budget of `n ÷ 16`; if pruning is
   too weak to pay off, the budget trips and the sweep runs instead.
 
-The returned kernel is ordered by ascending signature for every algorithm.
-Only true fixed points are returned; scenarios that fall into longer cycles
-never appear.
+The returned kernel is ordered by ascending signature.
 """
-function find_consistent(cib::CIB; algorithm::Symbol=:auto,
+function find_consistent(cib::CIB; rule::SuccessionRule=GlobalSuccession(),
+                         algorithm::Symbol=:auto,
                          bnb_node_budget::Union{Nothing,Int}=nothing)
+    return _exhaustive_kernel(rule, cib; algorithm=algorithm,
+                              bnb_node_budget=bnb_node_budget)
+end
+
+"""
+    _exhaustive_kernel(rule, cib; algorithm, bnb_node_budget)
+
+Exhaustive fixed-point search under `rule`. Dispatched on the rule type:
+[`GlobalSuccession`](@ref) gets the fast sweep / branch-and-bound path; any
+other rule gets a generic ascending-signature scan.
+"""
+function _exhaustive_kernel(::GlobalSuccession, cib::CIB; algorithm::Symbol=:auto,
+                            bnb_node_budget::Union{Nothing,Int}=nothing)
     algorithm in (:auto, :bnb, :sweep) ||
         throw(ArgumentError("algorithm must be :auto, :bnb or :sweep, got $(repr(algorithm))"))
     n = max_signature(cib) + 1
@@ -446,37 +450,11 @@ function find_consistent(cib::CIB; algorithm::Symbol=:auto,
     return _find_consistent_exhaustive(cib)
 end
 
-"""
-    _exhaustive_kernel(rule, cib; ignore_cycles, algorithm, bnb_node_budget)
-
-Exhaustive fixed-point search under `rule`. Dispatched on the rule type:
-[`GlobalSuccession`](@ref) gets the fast sweep / branch-and-bound path; any
-other rule gets a generic ascending-signature scan.
-"""
-function _exhaustive_kernel(::GlobalSuccession, cib::CIB; ignore_cycles::Bool=true,
-                            algorithm::Symbol=:auto,
-                            bnb_node_budget::Union{Nothing,Int}=nothing)
-    algorithm in (:auto, :bnb, :sweep) ||
-        throw(ArgumentError("algorithm must be :auto, :bnb or :sweep, got $(repr(algorithm))"))
-    n = max_signature(cib) + 1
-    if algorithm == :sweep || (algorithm == :auto && n < 100_000)
-        return _find_consistent_exhaustive(cib; ignore_cycles=ignore_cycles)
-    end
-    sufmin, sufmax = _bnb_bounds(cib)
-    budget = something(bnb_node_budget,
-                       algorithm == :bnb ? typemax(Int) : n ÷ 16)
-    kern, _ = _bnb_fixed_points(cib, sufmin, sufmax; node_budget=budget)
-    !isnothing(kern) && return kern
-    # Budget tripped: pruning too weak on this matrix — fall back.
-    return _find_consistent_exhaustive(cib; ignore_cycles=ignore_cycles)
-end
-
 # Generic fallback: works for any rule. Enumerate the whole space in
 # ascending-signature order and keep the scenarios that are their own
 # successor. Single-threaded and O(n) — a correctness baseline that a new
 # rule can override with a faster specialisation if warranted.
-function _exhaustive_kernel(rule::SuccessionRule, cib::CIB; ignore_cycles::Bool=true,
-                            algorithm::Symbol=:auto,
+function _exhaustive_kernel(rule::SuccessionRule, cib::CIB; algorithm::Symbol=:auto,
                             bnb_node_budget::Union{Nothing,Int}=nothing)
     algorithm === :auto || throw(ArgumentError(
         "algorithm=$(repr(algorithm)) is only available for GlobalSuccession; " *
