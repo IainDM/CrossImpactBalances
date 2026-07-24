@@ -17,7 +17,8 @@ using Pkg
 Pkg.add(url="https://github.com/IainDM/CrossImpactBalances.jl")
 ```
 
-For multi-threaded exhaustive search, start Julia with multiple threads:
+`find_consistent` and `find_basins` always search the whole scenario space.
+For multi-threaded search, start Julia with multiple threads:
 
 ```bash
 julia -t auto --project=.

@@ -1,11 +1,21 @@
 using Test
-using Random
 using CrossImpactBalances
 
-# Shared minimal JSON parser used for Python-CIBSA cross-validation fixtures
-include(joinpath(@__DIR__, "..", "mcp", "json.jl"))
-
 const SAMPLE_DIR = joinpath(@__DIR__, "sample_files")
+
+# Follow succession_step until a signature repeats.
+# Returns (cycle_length, attractor); cycle_length == 1 means a fixed point.
+function trace(cib, u)
+    seen = Dict(signature(cib, u) => 1)
+    n = 1
+    v = copy(u)
+    while true
+        v = succession_step(cib, v)
+        s = signature(cib, v)
+        haskey(seen, s) && return (n - seen[s] + 1, v)
+        seen[s] = (n += 1)
+    end
+end
 
 @testset "CrossImpactBalances" begin
 
@@ -85,21 +95,21 @@ const SAMPLE_DIR = joinpath(@__DIR__, "sample_files")
                        sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))
 
         # [0,0,0] has a cycle of length 2 (verified in Python)
-        nper, veqm = succession(cib, [0, 0, 0])
+        nper, veqm = trace(cib, [0, 0, 0])
         @test nper == 2
 
         # [1,0,0] converges to [1,2,1] (sig=16)
-        nper, veqm = succession(cib, [1, 0, 0])
+        nper, veqm = trace(cib, [1, 0, 0])
         @test nper == 1
         @test veqm == [1, 2, 1]
 
         # [0,0,1] converges to [2,0,2] (sig=20)
-        nper, veqm = succession(cib, [0, 0, 1])
+        nper, veqm = trace(cib, [0, 0, 1])
         @test nper == 1
         @test veqm == [2, 0, 2]
 
         # [0,1,2] is already consistent
-        nper, veqm = succession(cib, [0, 1, 2])
+        nper, veqm = trace(cib, [0, 1, 2])
         @test nper == 1
         @test veqm == [0, 1, 2]
     end
@@ -118,7 +128,7 @@ const SAMPLE_DIR = joinpath(@__DIR__, "sample_files")
     end
 
     @testset "Exhaustive search (small)" begin
-        cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"); exhaustive=true)
+        cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"))
 
         sigs = sort([signature(cib, u) for u in cib.kernel])
         @test sigs == [13, 16, 20, 21]
@@ -166,7 +176,7 @@ const SAMPLE_DIR = joinpath(@__DIR__, "sample_files")
         scw = joinpath(SAMPLE_DIR, "bench_typical.scw")
 
         # Exhaustive: must find the 2 fixed points verified by Python
-        cib = load_scw(scw; exhaustive=true)
+        cib = load_scw(scw)
         sigs = sort([signature(cib, u) for u in cib.kernel])
         @test sigs == [13785, 13839]
         for u in cib.kernel
@@ -186,154 +196,6 @@ const SAMPLE_DIR = joinpath(@__DIR__, "sample_files")
         @test basins[idx] == 52329
     end
 
-    @testset "Inner product matrix" begin
-        cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"),
-                       sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))
-
-        M = inner_product_matrix(cib)
-        @test size(M) == (4, 4)
-
-        # Exact expected values from Python CIBSA
-        expected = [
-            15  -10  15  -6;
-           -12   12  -7   9;
-             9   -7   9  -2;
-           -11    8  -5   8
-        ]
-        @test M == expected
-    end
-
-    @testset "own / cross / inner_product (vs Python)" begin
-        cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"),
-                       sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))
-
-        u = [1, 2, 1]    # sig 16
-        v = [0, 1, 2]    # sig 21
-
-        # impact_balance(u) = [-4, 6, -2, -4, 2, 2, 4, 7, -4, -7]
-        # u's variants live at flat indices [2, 6, 8] (1-based) -> [6, 2, 7]
-        @test own_impact_balance(cib, u) == [6, 2, 7]
-        # v's variants live at flat indices [1, 5, 9] -> [-4, 2, -4]
-        @test cross_impact_balance(cib, u, v) == [-4, 2, -4]
-        @test inner_product(cib, u, v) == -6
-        @test inner_product(cib, u, u) == sum(own_impact_balance(cib, u))
-
-        # Inner-product matrix M[i,j] == inner_product(kernel[i], kernel[j])
-        M = inner_product_matrix(cib)
-        for (i, ui) in enumerate(cib.kernel), (j, uj) in enumerate(cib.kernel)
-            @test M[i, j] == inner_product(cib, ui, uj)
-        end
-    end
-
-    @testset "sim_anneal / build_graph / merge_scenarios (vs Python)" begin
-        # Cross-validated against Python CIBSA via test/generate_sim_anneal_expected.py
-        cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"),
-                       sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))
-        expected = parse_json_file(joinpath(SAMPLE_DIR, "sim_anneal_expected.json"))
-
-        # Sanity: kernel must be in the same order Python produced for the fixture
-        py_kernel_sigs = Int[v for v in expected["kernel_sigs"]]
-        @test [signature(cib, u) for u in cib.kernel] == py_kernel_sigs
-
-        for case in expected["cases"]
-            thr = Int[v for v in case["thresholds"]]
-            set_thresholds!(cib, thr)
-            ignore_cycles = case["ignore_cycles"]
-
-            # ── sim_anneal per kernel scenario ──
-            for sa_entry in case["sim_anneal"]
-                u = Int[v for v in sa_entry["u"]]
-                @test signature(cib, u) == sa_entry["u_sig"]
-
-                accessible = sim_anneal(cib, u; ignore_cycles=ignore_cycles)
-                got_sigs = sort([signature(cib, w) for w in accessible])
-                want_sigs = Int[v for v in sa_entry["accessible_sigs"]]
-                @test got_sigs == want_sigs
-
-                weights = sim_anneal(cib, u; ignore_cycles=ignore_cycles,
-                                     return_weights=true)
-                @test weights["reject"] == sa_entry["reject"]
-                got_pairs = sort([[Int(k), Int(v)] for (k, v) in weights if k != "reject"])
-                want_pairs = [[Int(p[1]), Int(p[2])] for p in sa_entry["weights"]]
-                @test got_pairs == want_pairs
-            end
-
-            # ── build_graph: compare dense adjacency element-wise ──
-            adj_jl = Matrix(build_graph(cib))
-            adj_py = case["adjacency"]
-            @test size(adj_jl) == (length(adj_py), length(adj_py[1]))
-            for (i, row) in enumerate(adj_py), (j, val) in enumerate(row)
-                @test adj_jl[i, j] == Int(val)
-            end
-
-            # ── merge_scenarios: components are sets, order-independent ──
-            comps_jl = [sort(Int[s for s in c]) for c in merge_scenarios(cib)]
-            comps_py = [sort(Int[s for s in c]) for c in case["components"]]
-            @test sort(comps_jl) == sort(comps_py)
-        end
-    end
-
-    @testset "set_thresholds! and rand_scenario" begin
-        cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"),
-                       sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))
-
-        @test cib.thresholds == [0, 0, 0]
-        set_thresholds!(cib, [1, 2, 3])
-        @test cib.thresholds == [1, 2, 3]
-        @test_throws DimensionMismatch set_thresholds!(cib, [1, 2])
-        @test_throws DimensionMismatch set_thresholds!(cib, [1, 2, 3, 4])
-
-        # rand_scenario must produce valid 0-based indices for every descriptor
-        rng = MersenneTwister(42)
-        for _ in 1:200
-            u = rand_scenario(cib; rng=rng)
-            @test length(u) == cib.ndesc
-            for i in 1:cib.ndesc
-                @test 0 <= u[i] < cib.nvariants[i]
-            end
-        end
-
-        # Reproducibility: same seed -> same scenario
-        u1 = rand_scenario(cib; rng=MersenneTwister(123))
-        u2 = rand_scenario(cib; rng=MersenneTwister(123))
-        @test u1 == u2
-    end
-
-    @testset "Monte-Carlo find_consistent reproducibility" begin
-        # bench_typical has 3^10 = 59,049 scenarios; with mc_threshold=500
-        # we hit the sampling-without-replacement path of get_scenario_signatures.
-        scw = joinpath(SAMPLE_DIR, "bench_typical.scw")
-
-        # Same RNG seed → identical kernels
-        k1 = sort([signature(load_scw(scw; mc_threshold=500,
-                                      rng=MersenneTwister(7)),
-                            u)
-                   for u in load_scw(scw; mc_threshold=500,
-                                     rng=MersenneTwister(7)).kernel])
-        k2 = sort([signature(load_scw(scw; mc_threshold=500,
-                                      rng=MersenneTwister(7)),
-                            u)
-                   for u in load_scw(scw; mc_threshold=500,
-                                     rng=MersenneTwister(7)).kernel])
-        @test k1 == k2
-
-        # Sampling without replacement: the 500-element sample must be
-        # 500 distinct signatures.
-        cib = load_scw(scw; kernel=Vector{Vector{Int}}())
-        sample = CrossImpactBalances.get_scenario_signatures(
-            cib; max=500, allow_dups=false, rng=MersenneTwister(99))
-        @test length(sample) == 500
-        @test length(unique(sample)) == 500
-
-        # allow_dups=true uses sampling with replacement (Julia's original
-        # behavior). Distinct count will typically be less than `max`.
-        sample_dups = CrossImpactBalances.get_scenario_signatures(
-            cib; max=500, allow_dups=true, rng=MersenneTwister(99))
-        @test length(sample_dups) == 500
-        # With high probability some duplicates appear (birthday paradox)
-        @test length(unique(sample_dups)) < 500
-    end
-
     @testset "Round-trip every sample .scw/.sl pair" begin
         # For each sample file, load_scw + find_consistent (no .sl) must
         # produce the same kernel signatures as loading with the .sl file.
@@ -344,7 +206,7 @@ const SAMPLE_DIR = joinpath(@__DIR__, "sample_files")
             isfile(sl) || continue   # nonstandard file has no .sl
 
             cib_loaded   = load_scw(scw; sl_file=sl)
-            cib_computed = load_scw(scw; exhaustive=true)
+            cib_computed = load_scw(scw)
 
             sigs_loaded   = sort([signature(cib_loaded, u) for u in cib_loaded.kernel])
             sigs_computed = sort([signature(cib_computed, u) for u in cib_computed.kernel])

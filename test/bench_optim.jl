@@ -22,16 +22,16 @@ for name in ["bench_typical", "bench_xlarge", "bench_50x50"]
     cib = load_scw(joinpath(SAMPLE_DIR, "$name.scw"); kernel=Vector{Vector{Int}}())
     n = max_signature(cib) + 1
 
-    t_sweep = med3(() -> find_consistent(cib; exhaustive=true, algorithm=:sweep))
-    t_bnb   = med3(() -> find_consistent(cib; exhaustive=true, algorithm=:bnb))
+    t_sweep = med3(() -> find_consistent(cib; algorithm=:sweep))
+    t_bnb   = med3(() -> find_consistent(cib; algorithm=:bnb))
     t_bas   = med3(() -> find_basins(cib))
 
     sufmin, sufmax = CrossImpactBalances._bnb_bounds(cib)
     _, nodes = CrossImpactBalances._bnb_fixed_points(cib, sufmin, sufmax;
                                                      node_budget=typemax(Int))
 
-    ks = [signature(cib, u) for u in find_consistent(cib; exhaustive=true, algorithm=:sweep)]
-    kb = [signature(cib, u) for u in find_consistent(cib; exhaustive=true, algorithm=:bnb)]
+    ks = [signature(cib, u) for u in find_consistent(cib; algorithm=:sweep)]
+    kb = [signature(cib, u) for u in find_consistent(cib; algorithm=:bnb)]
     fps, _, _ = find_basins(cib)
     kf = [signature(cib, u) for u in fps]
     ks == kb == kf || error("algorithms disagree on $name: sweep=$ks bnb=$kb basins=$kf")

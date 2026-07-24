@@ -21,24 +21,12 @@ println("="^70)
 
 # ── Warmup (compilation) ────────────────────────────────────────────────────
 println("\nWarmup (compilation)...")
-_ = load_scw(joinpath(@__DIR__, "sample_files", "CIB_global.scw"); exhaustive=true)
-
-# ── MC sampling baseline (10K) ──────────────────────────────────────────────
-println("\nMC sampling baseline (mc_threshold=10,000)...")
-t0 = time_ns()
-cib_mc = load_scw(scw_path; mc_threshold=10_000)
-t_mc = (time_ns() - t0) / 1e9
-
-sort!(cib_mc.kernel, by=u->signature(cib_mc, u))
-mc_sigs = [signature(cib_mc, u) for u in cib_mc.kernel]
-println("  Time:    $(round(t_mc, digits=3))s")
-println("  Found:   $(length(cib_mc.kernel)) fixed points")
-println("  Sigs:    $mc_sigs")
+_ = load_scw(joinpath(@__DIR__, "sample_files", "CIB_global.scw"))
 
 # ── Exhaustive search ───────────────────────────────────────────────────────
 println("\nExhaustive search ($(Threads.nthreads()) threads)...")
 t0 = time_ns()
-cib_ex = load_scw(scw_path; exhaustive=true)
+cib_ex = load_scw(scw_path)
 t_ex = (time_ns() - t0) / 1e9
 
 sort!(cib_ex.kernel, by=u->signature(cib_ex, u))
@@ -73,15 +61,10 @@ end
 println("  Check: basins + cycles = $(sum(basins) + cyc) (expect 60,466,176)")
 
 # ── Summary ─────────────────────────────────────────────────────────────────
-missed = setdiff(Set(ex_sigs), Set(mc_sigs))
 println("\n", "-"^70)
 println("SUMMARY")
 println("-"^70)
-println("  MC sampling (10K):  $(length(mc_sigs)) fixed points in $(round(t_mc, digits=3))s")
 println("  Exhaustive search:  $(length(ex_sigs)) fixed points in $(round(t_ex, digits=2))s")
 println("  Basin analysis:     $(length(fps)) fixed points + basins in $(round(t_ba, digits=2))s")
-if !isempty(missed)
-    println("  MC missed:          $(length(missed)) fixed points (sigs: $(sort(collect(missed))))")
-end
 println("  All verified:       $all_valid")
 println("\n", "="^70)

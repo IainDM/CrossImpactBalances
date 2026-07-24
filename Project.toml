@@ -4,15 +4,12 @@ authors = ["Iain Morrow"]
 version = "0.2.0"
 description = "Cross-Impact Balance scenario analysis in Julia — a faster reimplementation of sei-international/cibsa."
 
-[deps]
-Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
-SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
-
 [compat]
 julia = "1.10"
 
 [extras]
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test"]
+test = ["Test", "Random"]

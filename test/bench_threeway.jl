@@ -1,12 +1,10 @@
 #!/usr/bin/env julia
 # Three-way CIB benchmark — JuCIB (Julia) leg.
 #
-# For each .scw file, times three modes on a PRE-PARSED model (find-only, so the
+# For each .scw file, times two modes on a PRE-PARSED model (find-only, so the
 # parse cost is excluded and the numbers compare like-for-like with CIBSA):
-#   1. full-enum, single-thread  (exhaustive=false, mc_threshold huge) — same
-#      algorithm as CIBSA full enumeration; the apples-to-apples cell.
-#   2. exhaustive, threaded      (exhaustive=true) — JuCIB's fast path / ground truth.
-#   3. find_basins               — basin-of-attraction analysis (single-thread).
+#   1. find_consistent, threaded — JuCIB's fast path / ground truth.
+#   2. find_basins               — basin-of-attraction analysis (single-thread).
 # Emits test/bench_results_julia.json.
 #
 # Run:  julia -t 10 --project=. test/bench_threeway.jl
@@ -29,7 +27,7 @@ function timed(f; n::Int=3)
 end
 
 # parse only — passing a non-nothing kernel makes load_scw skip the search
-preload(p) = load_scw(p; kernel = Vector{Vector{Int}}(), mc_threshold = 10^18)
+preload(p) = load_scw(p; kernel = Vector{Vector{Int}}())
 canon(cib, k) = sort!([signature(cib, u) for u in k])
 
 # ── minimal JSON writer (repo avoids JSON.jl) ───────────────────────────────
@@ -55,18 +53,14 @@ for name in FILES
 
     cib   = preload(path)
     total = max_signature(cib) + 1
-    big   = total > 1_000_000
-    ntr   = big ? 2 : 3
-    do_fe1t = !big                         # single-thread full enum infeasible on huge spaces
+    ntr   = total > 1_000_000 ? 2 : 3
 
     println("\n=== $name  ($total scenarios, $(cib.ndesc) descriptors) ===")
 
     parse_s = timed(() -> preload(path); n = ntr)
 
-    fe1t_s = do_fe1t ? timed(() -> find_consistent(cib; exhaustive = false); n = ntr) : nothing
-
-    exh_s = timed(() -> find_consistent(cib; exhaustive = true); n = ntr)
-    kern  = find_consistent(cib; exhaustive = true)
+    exh_s = timed(() -> find_consistent(cib); n = ntr)
+    kern  = find_consistent(cib)
     ksigs = canon(cib, kern)
 
     bas_s = timed(() -> find_basins(cib); n = ntr)
@@ -82,7 +76,6 @@ for name in FILES
         "file" => name, "tool" => "julia", "threads" => NT,
         "total_scenarios" => total,
         "parse_s"         => round(parse_s, digits = 6),
-        "full_enum_1t_s"  => fe1t_s === nothing ? nothing : round(fe1t_s, digits = 6),
         "exhaustive_s"    => round(exh_s, digits = 6),
         "basins_s"        => round(bas_s, digits = 6),
         "kernel_size"     => length(kern),
@@ -93,9 +86,8 @@ for name in FILES
         "verified_fixed_points" => verified,
     ])
 
-    fe_str = fe1t_s === nothing ? "—(skip)" : "$(round(fe1t_s, digits = 4))s"
-    println("  parse=$(round(parse_s, digits = 4))s  fe1t=$fe_str  " *
-            "exh=$(round(exh_s, digits = 4))s  basins=$(round(bas_s, digits = 4))s")
+    println("  parse=$(round(parse_s, digits = 4))s  " *
+            "find=$(round(exh_s, digits = 4))s  basins=$(round(bas_s, digits = 4))s")
     println("  kernel=$(length(kern))  cycles=$cyc  min_basin=$min_basin  verified=$verified")
     println("  sigs=$ksigs")
 end

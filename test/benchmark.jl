@@ -30,9 +30,7 @@ for (name, expected) in sort(collect(EXPECTED), by=x->x[2]["total_scenarios"])
     total = expected["total_scenarios"]
     n_kernel_expected = expected["n_kernel"]
     expected_sigs = sort(Int[v for v in expected["kernel_sigs"]])
-    expected_ipm = expected["inner_product_matrix"]
     py_time_find = expected["python_time_find_consistent_s"]
-    py_time_ipm = expected["python_time_ipm_s"]
 
     println("\n", "-"^60)
     println("$name: $(length(nvars)) descriptors, variants=$nvars, total=$total")
@@ -63,40 +61,14 @@ for (name, expected) in sort(collect(EXPECTED), by=x->x[2]["total_scenarios"])
         println("  Consistent scenarios: $(length(cib.kernel))")
         println("  Kernel sigs: $kernel_sigs")
 
-        # ── Benchmark: inner_product_matrix ──
-        times_ipm = Float64[]
-        local M
-        for trial in 1:3
-            t0 = time_ns()
-            M = inner_product_matrix(cib)
-            push!(times_ipm, (time_ns() - t0) / 1e9)
-        end
-        sort!(times_ipm)
-        jl_time_ipm = times_ipm[2]
-
-        # ── Verify IPM agreement ──
-        if n_kernel_expected > 0
-            for (i, row) in enumerate(expected_ipm)
-                for (j, val) in enumerate(row)
-                    @test M[i, j] == val
-                end
-            end
-        end
-
         # ── Report timing ──
         speedup_find = py_time_find / max(jl_time_find, 1e-9)
-        speedup_ipm = py_time_ipm / max(jl_time_ipm, 1e-9)
 
         println()
         println("  find_consistent:")
         println("    Python:  $(round(py_time_find, digits=4))s")
         println("    Julia:   $(round(jl_time_find, digits=6))s")
         println("    Speedup: $(round(speedup_find, digits=1))x")
-        println()
-        println("  inner_product_matrix:")
-        println("    Python:  $(round(py_time_ipm, digits=6))s")
-        println("    Julia:   $(round(jl_time_ipm, digits=6))s")
-        println("    Speedup: $(round(speedup_ipm, digits=1))x")
     end
 end
 

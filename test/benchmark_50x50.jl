@@ -25,9 +25,7 @@ nvars = Int[v for v in expected["nvariants"]]
 total = expected["total_scenarios"]
 py_kernel = [Int[v for v in row] for row in expected["kernel"]]
 py_sigs = sort(Int[v for v in expected["kernel_sigs"]])
-py_ipm = expected["inner_product_matrix"]
 py_time_find = expected["python_time_find_consistent_s"]
-py_time_ipm = expected["python_time_ipm_s"]
 
 println("="^70)
 println("50x50 CIM Benchmark: Julia vs Python CIBSA")
@@ -93,31 +91,6 @@ println("="^70)
     @test length(cib.kernel) >= 1
     @test length(py_kernel) >= 1
 
-    # ── IPM for Julia's kernel ──
-    times_ipm = Float64[]
-    local M
-    for trial in 1:3
-        t0 = time_ns()
-        M = inner_product_matrix(cib)
-        push!(times_ipm, (time_ns() - t0) / 1e9)
-    end
-    sort!(times_ipm)
-    jl_time_ipm = times_ipm[2]
-
-    # If kernels match exactly, also verify IPM agreement
-    if jl_sigs == py_sigs
-        println("\n  Kernels match exactly — verifying IPM agreement...")
-        @testset "IPM agreement" begin
-            for (i, row) in enumerate(py_ipm)
-                for (j, val) in enumerate(row)
-                    @test M[i, j] == val
-                end
-            end
-        end
-    else
-        println("\n  Kernels differ (different MC samples) — skipping IPM comparison")
-    end
-
     # ── Timing report ──
     speedup_find = py_time_find / max(jl_time_find, 1e-9)
 
@@ -129,15 +102,6 @@ println("="^70)
     println("    Python:  $(round(py_time_find, digits=2))s")
     println("    Julia:   $(round(jl_time_find, digits=4))s")
     println("    Speedup: $(round(speedup_find, digits=1))x")
-
-    if length(cib.kernel) > 0
-        speedup_ipm = py_time_ipm / max(jl_time_ipm, 1e-9)
-        println()
-        println("  inner_product_matrix ($(length(cib.kernel))×$(length(cib.kernel))):")
-        println("    Python:  $(round(py_time_ipm, digits=6))s")
-        println("    Julia:   $(round(jl_time_ipm, digits=6))s")
-        println("    Speedup: $(round(speedup_ipm, digits=1))x")
-    end
 end
 
 println("\n", "="^70)
