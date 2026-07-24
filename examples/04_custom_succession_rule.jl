@@ -50,7 +50,7 @@ end
 
 # ── Use it exactly like the built-in rule ────────────────────────────────────
 for rule in (GlobalSuccession(), InertialSuccession(1), InertialSuccession(3))
-    kern = find_consistent(cib; rule=rule, exhaustive=true)
+    kern = find_consistent(cib; rule=rule)
     _, sizes, cycles = find_basins(cib; rule=rule)
     println(rpad(string(rule), 24),
             "consistent scenarios: ", length(kern),

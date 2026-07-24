@@ -6,7 +6,6 @@ description = "Cross-Impact Balance scenario analysis in Julia — a faster reim
 
 [deps]
 SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
-SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
 [compat]
 SIMD = "3.4"

@@ -242,14 +242,10 @@ end
 
     @testset "generic path reproduces the fast GlobalSuccession path" begin
         for cib in cases
-            fast = [signature(cib, u) for u in find_consistent(cib; exhaustive=true)]
+            fast = [signature(cib, u) for u in find_consistent(cib)]
             gen  = [signature(cib, u) for u in
-                    find_consistent(cib; rule=RefGlobal(), exhaustive=true)]
+                    find_consistent(cib; rule=RefGlobal())]
             @test gen == fast
-
-            # Monte-Carlo / walk path also honours the rule argument.
-            walk = sorted_sigs(cib, find_consistent(cib; rule=RefGlobal()))
-            @test walk == fast
 
             f1, s1, c1 = find_basins(cib)
             f2, s2, c2 = find_basins(cib; rule=RefGlobal())
@@ -268,7 +264,7 @@ end
                             if seq_step_oracle(cib, inv_signature(cib, s)) ==
                                inv_signature(cib, s)])
             got_k = [signature(cib, u) for u in
-                     find_consistent(cib; rule=SequentialSuccession(), exhaustive=true)]
+                     find_consistent(cib; rule=SequentialSuccession())]
             @test got_k == want_k
 
             # Basins: generic walk matches the from-scratch sequential oracle.
@@ -296,8 +292,8 @@ end
     @testset "search-strategy kwargs reject non-global rules" begin
         cib = cases[1]
         @test_throws ArgumentError find_consistent(cib; rule=SequentialSuccession(),
-                                                   exhaustive=true, algorithm=:bnb)
+                                                   algorithm=:bnb)
         @test_throws ArgumentError find_consistent(cib; rule=SequentialSuccession(),
-                                                   exhaustive=true, algorithm=:sweep)
+                                                   algorithm=:sweep)
     end
 end
