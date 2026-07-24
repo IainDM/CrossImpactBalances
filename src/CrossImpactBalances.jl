@@ -279,11 +279,13 @@ and a single method
 
 and every analysis routine — [`succession`](@ref), [`find_consistent`](@ref)
 and [`find_basins`](@ref) — works with it immediately through a generic,
-rule-agnostic path. The built-in [`GlobalSuccession`](@ref) additionally
-carries hand-optimised exhaustive-search and basin implementations; a new
-rule may opt into the same speed by specialising the internal
-`_exhaustive_kernel(rule, cib; ...)` and `_basins(rule, cib)` methods on its
-own type, but that is optional — correctness never depends on it.
+rule-agnostic path. [`find_basins`](@ref) is already fast for any rule (it
+fills a successor table and reuses the shared path-compressed resolver). A
+*threshold* rule — one whose fixed points are a separable, impact-balance-only
+per-descriptor condition — can additionally opt [`find_consistent`](@ref) into
+the fast threaded sweep and branch-and-bound by defining
+[`fixed_point_margin`](@ref); otherwise `find_consistent` uses a generic scan.
+Both are optional — correctness never depends on them.
 """
 abstract type SuccessionRule end
 
@@ -309,6 +311,30 @@ rule-agnostic — it plugs into [`find_consistent`](@ref) and
 [`find_basins`](@ref) through the generic path with no engine changes.
 """
 struct SequentialSuccession <: SuccessionRule end
+
+"""
+    fixed_point_margin(rule) -> Union{Nothing,Int}
+
+Fast-path opt-in for a *threshold* succession rule. Return an integer margin
+`m ≥ 0` when this rule's fixed points are exactly the scenarios in which, for
+every descriptor, no competing variant's impact score exceeds the current
+variant's by more than `m` — i.e. the fixed-point test is separable per
+descriptor and a function of the impact balance alone. Return `nothing` (the
+default) for any rule without that structure.
+
+Declaring a margin lets [`find_consistent`](@ref) reach the fast threaded
+sweep and branch-and-bound (the margin parameterises their per-descriptor
+fixed-point test) instead of the generic per-scenario scan. The two must
+agree, so a margin is a *promise* about the rule's fixed points worth
+validating in tests. [`GlobalSuccession`](@ref) is the `m = 0` case: a
+competitor strictly beating the current variant unseats it.
+
+Note this concerns *fixed points* only, not the full dynamics — a rule may be
+a threshold rule for consistency yet have basins that still need its own
+[`succession_step`](@ref) (e.g. sequential/Gauss–Seidel updates).
+"""
+fixed_point_margin(::SuccessionRule) = nothing
+fixed_point_margin(::GlobalSuccession) = 0
 
 # ─── Succession ─────────────────────────────────────────────────────────────
 
@@ -403,11 +429,13 @@ Find every consistent scenario — every fixed point of the succession map under
 threads (start Julia with `julia -t auto`).
 
 `rule` selects the succession *dynamics* ([`SuccessionRule`](@ref); default
-[`GlobalSuccession`](@ref)). The default uses the fast sweep / branch-and-bound
-kernel; any other rule uses a generic ascending-signature scan.
+[`GlobalSuccession`](@ref)). A rule that declares a [`fixed_point_margin`](@ref)
+— including the default `GlobalSuccession` (`m = 0`) and any threshold/inertial
+rule — uses the fast sweep / branch-and-bound kernel; any other rule uses a
+generic ascending-signature scan.
 
-`algorithm` selects the search strategy (only supported for
-[`GlobalSuccession`](@ref)):
+`algorithm` selects the search strategy (only for rules with a
+[`fixed_point_margin`](@ref)):
 - `:sweep` — enumerate every scenario with the incremental odometer sweep.
 - `:bnb`   — branch-and-bound: assign descriptors depth-first and prune
   subtrees that provably contain no fixed point.
@@ -429,43 +457,44 @@ end
 """
     _exhaustive_kernel(rule, cib; algorithm, bnb_node_budget)
 
-Exhaustive fixed-point search under `rule`. Dispatched on the rule type:
-[`GlobalSuccession`](@ref) gets the fast sweep / branch-and-bound path; any
-other rule gets a generic ascending-signature scan.
+Exhaustive fixed-point search under `rule`. A rule that declares a
+[`fixed_point_margin`](@ref) gets the fast threaded sweep / branch-and-bound —
+the margin parameterises the per-descriptor fixed-point test, so both paths
+serve global succession (`m = 0`), inertial/threshold rules (`m > 0`) and any
+other rule with the same separable structure. A rule with no margin falls back
+to a generic ascending-signature scan that tests `succession_step(rule, u) == u`.
 """
-function _exhaustive_kernel(::GlobalSuccession, cib::CIB; algorithm::Symbol=:auto,
+function _exhaustive_kernel(rule::SuccessionRule, cib::CIB; algorithm::Symbol=:auto,
                             bnb_node_budget::Union{Nothing,Int}=nothing)
+    margin = fixed_point_margin(rule)
+    if margin === nothing
+        # Generic fallback: enumerate the whole space in ascending-signature
+        # order and keep the scenarios that are their own successor. Single-
+        # threaded O(n) correctness baseline for a rule with no separable path.
+        algorithm === :auto || throw(ArgumentError(
+            "algorithm=$(repr(algorithm)) needs a rule with a fixed_point_margin; " *
+            "this rule uses the generic scan (algorithm=:auto)"))
+        kern = Vector{Vector{Int}}()
+        for sig in 0:max_signature(cib)
+            u = inv_signature(cib, sig)
+            succession_step(rule, cib, u) == u && push!(kern, u)
+        end
+        return kern
+    end
+    # Threshold rule: the fast paths, parameterised by the margin.
     algorithm in (:auto, :bnb, :sweep) ||
         throw(ArgumentError("algorithm must be :auto, :bnb or :sweep, got $(repr(algorithm))"))
     n = max_signature(cib) + 1
     if algorithm == :sweep || (algorithm == :auto && n < 100_000)
-        return _find_consistent_exhaustive(cib)
+        return _find_consistent_exhaustive(cib; margin=margin)
     end
     sufmin, sufmax = _bnb_bounds(cib)
     budget = something(bnb_node_budget,
                        algorithm == :bnb ? typemax(Int) : n ÷ 16)
-    kern, _ = _bnb_fixed_points(cib, sufmin, sufmax; node_budget=budget)
+    kern, _ = _bnb_fixed_points(cib, sufmin, sufmax; node_budget=budget, margin=margin)
     !isnothing(kern) && return kern
     # Budget tripped: pruning too weak on this matrix — fall back.
-    return _find_consistent_exhaustive(cib)
-end
-
-# Generic fallback: works for any rule. Enumerate the whole space in
-# ascending-signature order and keep the scenarios that are their own
-# successor. Single-threaded and O(n) — a correctness baseline that a new
-# rule can override with a faster specialisation if warranted.
-function _exhaustive_kernel(rule::SuccessionRule, cib::CIB; algorithm::Symbol=:auto,
-                            bnb_node_budget::Union{Nothing,Int}=nothing)
-    algorithm === :auto || throw(ArgumentError(
-        "algorithm=$(repr(algorithm)) is only available for GlobalSuccession; " *
-        "custom succession rules use the generic scan (algorithm=:auto)"))
-    n = max_signature(cib) + 1
-    kern = Vector{Vector{Int}}()
-    for sig in 0:n-1
-        u = inv_signature(cib, sig)
-        succession_step(rule, cib, u) == u && push!(kern, u)
-    end
-    return kern
+    return _find_consistent_exhaustive(cib; margin=margin)
 end
 
 """
@@ -499,12 +528,12 @@ early exit.
 The returned kernel is ordered by ascending signature. Only true fixed points
 (cycle length 1) are emitted, so non-fixed-point cycles never appear.
 """
-function _find_consistent_exhaustive(cib::CIB)
+function _find_consistent_exhaustive(cib::CIB; margin::Int=0)
     T = _score_type(cib)
-    return _sweep_fixed_points(cib, Matrix{T}(cib.cim_t))
+    return _sweep_fixed_points(cib, Matrix{T}(cib.cim_t); margin=margin)
 end
 
-function _sweep_fixed_points(cib::CIB, cimT::Matrix{T}) where {T<:Signed}
+function _sweep_fixed_points(cib::CIB, cimT::Matrix{T}; margin::Int=0) where {T<:Signed}
     n = max_signature(cib) + 1
     nchunks = max(1, min(n, 16 * Threads.nthreads()))
     chunk_size = cld(n, nchunks)
@@ -517,7 +546,7 @@ function _sweep_fixed_points(cib::CIB, cimT::Matrix{T}) where {T<:Signed}
         last_sig = min(c * chunk_size, n) - 1
         Threads.@spawn _sweep_chunk!(out, cimT, first_sig, last_sig,
                                      cib.nvariants, cib.desc_offsets,
-                                     cib.ndesc, cib.ndim)
+                                     cib.ndesc, cib.ndim, margin)
     end
 
     # Chunks cover ascending contiguous signature ranges; merging in chunk
@@ -532,7 +561,7 @@ end
 function _sweep_chunk!(out::Vector{Vector{Int}}, cimT::Matrix{T},
                        first_sig::Int, last_sig::Int,
                        nvariants::Vector{Int}, offsets::Vector{Int},
-                       ndesc::Int, ndim::Int) where {T<:Signed}
+                       ndesc::Int, ndim::Int, margin::Int) where {T<:Signed}
     v    = Vector{Int}(undef, ndesc)
     rows = Vector{Int}(undef, ndesc)   # column of cimT holding descriptor i's current row
     ib   = zeros(T, ndim)
@@ -558,9 +587,9 @@ function _sweep_chunk!(out::Vector{Vector{Int}}, cimT::Matrix{T},
         fixed = true
         for i in 1:ndesc
             off = offsets[i]
-            cur = ib[off + v[i] + 1]
+            curm = ib[off + v[i] + 1] + margin   # unseated only by a variant beating this
             for j in 1:nvariants[i]
-                if ib[off + j] > cur   # strict >: ties keep the current variant
+                if ib[off + j] > curm   # strict >: ties / within-margin keep the current variant
                     fixed = false
                     break
                 end
@@ -649,6 +678,7 @@ struct _BnBState
     total::Threads.Atomic{Int}
     abort::Threads.Atomic{Bool}
     budget::Int
+    margin::Int
 end
 
 """
@@ -656,11 +686,13 @@ end
 
 With descriptors `1..k` assigned, decide whether the current subtree can be
 discarded: true iff some assigned descriptor `j` has a competitor variant
-whose *worst-case* completed score still strictly exceeds the chosen
-variant's *best-case* completed score — then every completion fails the
-fixed-point test at `j`. Ties never prune (matching the favour-current
-convention), and at `k == ndesc` the suffix bounds are zero, so this
-condition IS the exact fixed-point predicate on the full scenario.
+whose *worst-case* completed score still exceeds the chosen variant's
+*best-case* completed score by more than the rule's `margin` — then every
+completion fails the fixed-point test at `j`. Ties (and gaps within the
+margin) never prune, matching the favour-current convention, and at
+`k == ndesc` the suffix bounds are zero, so this condition IS the exact
+margin fixed-point predicate on the full scenario (`margin = 0` recovers
+plain global consistency).
 """
 function _bnb_pruned(st::_BnBState, k::Int)
     p = st.p
@@ -670,7 +702,7 @@ function _bnb_pruned(st::_BnBState, k::Int)
     @inbounds for j in 1:k
         off = st.offsets[j]
         cs = off + st.v[j] + 1
-        best_cur = p[cs] + sufmax[kk, cs]
+        best_cur = p[cs] + sufmax[kk, cs] + st.margin
         for c in off+1:off+st.nvariants[j]
             if p[c] + sufmin[kk, c] > best_cur
                 return true
@@ -736,7 +768,7 @@ sweep), else the complete kernel sorted by ascending signature; the second
 is the number of tree nodes visited (partial scenarios expanded).
 """
 function _bnb_fixed_points(cib::CIB, sufmin::Matrix{Int}, sufmax::Matrix{Int};
-                           node_budget::Int)
+                           node_budget::Int, margin::Int=0)
     ndesc = cib.ndesc
     nvariants = cib.nvariants
     offsets = cib.desc_offsets
@@ -760,7 +792,7 @@ function _bnb_fixed_points(cib::CIB, sufmin::Matrix{Int}, sufmax::Matrix{Int};
         Threads.@spawn begin
             st = _BnBState(cim_t, sufmin, sufmax, nvariants, offsets,
                            ndesc, ndim, zeros(Int, ndesc), zeros(Int, ndim),
-                           out, Ref(0), total, abort, node_budget)
+                           out, Ref(0), total, abort, node_budget, margin)
             # Build the prefix, checking the prune at every level so a
             # subtree dead at depth i < L is skipped without descending.
             s = pid
@@ -808,7 +840,9 @@ incrementally maintained impact balance), then a sequential resolution pass
 walks the table with path compression so each scenario is resolved exactly
 once. Memory is ~8n bytes for the two flat tables (Int32 entries when the
 space fits, Int64 otherwise), independent of the thread count. Any other rule
-uses a generic per-scenario walk with the same result semantics.
+fills the same successor table one step at a time (still threaded, disjoint
+writes) and reuses the identical resolver — so the result semantics are
+identical to the fast path, only the table fill differs.
 
 Returns:
 - `fixed_points`: Vector of fixed-point scenarios (0-based variant indices),
@@ -830,28 +864,40 @@ function _basins(::GlobalSuccession, cib::CIB)
     return _find_basins(cib, Int64, Matrix{T}(cib.cim_t))
 end
 
-# Generic fallback: works for any rule. Walk succession from every scenario,
-# tally which fixed point each lands on, and count starts that fall into
-# non-fixed-point cycles. Mirrors the fast path's semantics (into-cycle
-# starts are counted, not assigned to any basin) and its ascending-signature
-# ordering. Single-threaded — a correctness baseline a new rule can override.
+# Generic fallback: works for any rule. The successor of a scenario depends only
+# on that scenario (the dynamics is memoryless), so the successor table can be
+# filled one step at a time with disjoint, threaded writes — then handed to the
+# very same path-compressed resolver the fast GlobalSuccession path uses. Only
+# the table *fill* is rule-specific; resolution is shared, so semantics (into-
+# cycle starts counted, not assigned to any basin) and ascending-signature
+# ordering are identical to the fast path by construction. A rule may still
+# override `_basins` with a faster fill of its own, but never needs to.
 function _basins(rule::SuccessionRule, cib::CIB)
     n = max_signature(cib) + 1
-    tally = Dict{Int,Int}()      # fixed-point signature -> basin size
-    cycle_count = 0
-    for sig in 0:n-1
-        u = inv_signature(cib, sig)
-        nper, attr = succession(rule, cib, u)
-        if nper > 1
-            cycle_count += 1
-        else
-            asig = signature(cib, attr)
-            tally[asig] = get(tally, asig, 0) + 1
+    if n <= Int(typemax(Int32)) - 1
+        return _generic_basins(rule, cib, Int32)
+    end
+    return _generic_basins(rule, cib, Int64)
+end
+
+function _generic_basins(rule::SuccessionRule, cib::CIB,
+                         ::Type{S}) where {S<:Union{Int32,Int64}}
+    n = max_signature(cib) + 1
+    succ = Vector{S}(undef, n)
+    nt = Threads.nthreads()
+    chunk = cld(n, nt)
+    @sync for t in 1:nt
+        lo = (t - 1) * chunk
+        hi = min(t * chunk, n) - 1
+        lo > hi && continue
+        Threads.@spawn for sig in lo:hi          # disjoint ranges → race-free
+            u = inv_signature(cib, sig)
+            v = succession_step(rule, cib, u)
+            @inbounds succ[sig + 1] = S(signature(cib, v))
         end
     end
-    fp_sigs = sort!(collect(keys(tally)))
+    fp_sigs, sizes, cycle_count = _resolve_and_tally(succ, n)
     fixed_points = [inv_signature(cib, s) for s in fp_sigs]
-    sizes = [tally[s] for s in fp_sigs]
     return (fixed_points, sizes, cycle_count)
 end
 

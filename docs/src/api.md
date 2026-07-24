@@ -38,6 +38,7 @@ routine works with it through a generic path.
 SuccessionRule
 GlobalSuccession
 SequentialSuccession
+CrossImpactBalances.fixed_point_margin
 ```
 
 ## Dynamics
