@@ -44,33 +44,7 @@ SequentialSuccession
 
 ```@docs
 succession_step
+succession
 find_consistent
 find_basins
-```
-
-## Threshold-gated fluctuation analysis
-
-```@docs
-sim_anneal
-build_graph
-merge_scenarios
-```
-
-## In-place editing
-
-Tweak an already-loaded model's cross-impact matrix without re-parsing the
-`.scw` file. Both the matrix and its stored transpose are updated together, so
-every analysis routine stays correct.
-
-```@docs
-set_impact!
-get_impact
-```
-
-## Utilities
-
-```@docs
-set_thresholds!
-rand_scenario
-CIB
 ```
