@@ -48,6 +48,13 @@ function CrossImpactBalances.succession_step(rule::InertialSuccession,
     return v
 end
 
+# Opt into the fast `find_consistent` kernels. This rule's fixed points are
+# exactly the scenarios where no variant beats the current one by more than
+# `margin` — precisely the per-descriptor test the sweep and branch-and-bound
+# run — so declaring the margin routes it off the generic scan onto the fast
+# threaded paths. (Basins already run fast for any rule.)
+CrossImpactBalances.fixed_point_margin(rule::InertialSuccession) = rule.margin
+
 # ── Use it exactly like the built-in rule ────────────────────────────────────
 for rule in (GlobalSuccession(), InertialSuccession(1), InertialSuccession(3))
     kern = find_consistent(cib; rule=rule)

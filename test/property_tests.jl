@@ -228,6 +228,41 @@ function seq_basins_oracle(cib::CIB)
     return fp, [tally[k] for k in fp], cyc
 end
 
+# A test-only *threshold* (inertial) rule: a descriptor moves only when some
+# variant beats the current one by more than `m`. It declares a
+# fixed_point_margin, so find_consistent must route it through the fast
+# threaded sweep / branch-and-bound — validated below against a from-scratch
+# brute-force scan. `m == 0` must reproduce global succession exactly.
+struct Threshold <: SuccessionRule
+    m::Int
+end
+function CrossImpactBalances.succession_step(rule::Threshold, cib::CIB, u::Vector{Int})
+    ib = impact_balance(cib, u)
+    v = copy(u)
+    for i in 1:cib.ndesc
+        off = cib.desc_offsets[i]
+        cur = ib[off + u[i] + 1]
+        best = u[i]
+        bestval = cur
+        for j in 0:cib.nvariants[i]-1
+            if ib[off + j + 1] > bestval && ib[off + j + 1] - cur > rule.m
+                bestval = ib[off + j + 1]
+                best = j
+            end
+        end
+        v[i] = best
+    end
+    return v
+end
+CrossImpactBalances.fixed_point_margin(rule::Threshold) = rule.m
+
+# Brute-force fixed points of the threshold rule: every scenario equal to its
+# own step. Shares no code with the sweep / branch-and-bound under test.
+threshold_fixed_points(cib, m) =
+    sort!([sig for sig in 0:max_signature(cib)
+           if succession_step(Threshold(m), cib, inv_signature(cib, sig)) ==
+              inv_signature(cib, sig)])
+
 @testset "Property: pluggable succession rules" begin
     rng = MersenneTwister(20260722)
     cases = CIB[]
@@ -289,11 +324,53 @@ end
         @test differs
     end
 
-    @testset "search-strategy kwargs reject non-global rules" begin
+    @testset "search-strategy kwargs rejected for rules without a margin" begin
+        # SequentialSuccession is not a threshold rule (fixed_point_margin is
+        # nothing), so it has no fast sweep / branch-and-bound and :bnb / :sweep
+        # must be refused.
         cib = cases[1]
         @test_throws ArgumentError find_consistent(cib; rule=SequentialSuccession(),
                                                    algorithm=:bnb)
         @test_throws ArgumentError find_consistent(cib; rule=SequentialSuccession(),
                                                    algorithm=:sweep)
     end
+end
+
+@testset "Property: threshold rules use the fast sweep / branch-and-bound" begin
+    rng = MersenneTwister(20260724)
+    saw_strict_superset = false
+    for _ in 1:25
+        ndesc = rand(rng, 2:5)
+        nvariants = [rand(rng, 1:4) for _ in 1:ndesc]
+        while prod(nvariants) > 2000
+            nvariants[argmax(nvariants)] -= 1
+        end
+        cib = make_cib(nvariants, rand_cim(rng, nvariants))
+        nash = threshold_fixed_points(cib, 0)
+
+        # Threshold(0) is exactly global consistency, via the fast path.
+        @test nash == [signature(cib, u) for u in find_consistent(cib)]
+
+        for m in (0, 1, 2, 5)
+            want = threshold_fixed_points(cib, m)
+            rule = Threshold(m)
+            # All three fast strategies find exactly the brute-force fixed
+            # points, in ascending-signature order.
+            for alg in (:auto, :sweep, :bnb)
+                got = [signature(cib, u) for u in
+                       find_consistent(cib; rule=rule, algorithm=alg)]
+                @test got == want
+            end
+            # A tiny node budget trips branch-and-bound → sweep fallback, and
+            # the margin-parameterised sweep must deliver the identical kernel.
+            got_fb = [signature(cib, u) for u in
+                      find_consistent(cib; rule=rule, algorithm=:bnb, bnb_node_budget=1)]
+            @test got_fb == want
+            # A larger margin only ever makes more scenarios consistent.
+            @test issubset(Set(nash), Set(want))
+            length(want) > length(nash) && (saw_strict_superset = true)
+        end
+    end
+    # The margin genuinely makes extra (non-Nash) scenarios sticky somewhere.
+    @test saw_strict_superset
 end
