@@ -50,19 +50,109 @@ picks one from the space size.
 The package has no dependencies outside the Julia standard library — in fact,
 no dependencies at all.
 
+## Python interface
+
+A Pythonic wrapper lives in [`python/`](python/README.md). It embeds this Julia
+engine **in-process** via [`juliacall`](https://github.com/JuliaPy/PythonCall.jl),
+so a parsed model stays resident — you can batch-run many `.scw` files and even
+tweak individual cross-impact values in place without re-parsing.
+
+```bash
+pip install -e "python/[pandas]"          # from the repo root
+```
+
+```python
+from crossimpactbalances import Model, run_models, sweep_impact
+
+m = Model.load("test/sample_files/CIB_global.scw")
+m.consistent_scenarios()                  # [{'WTRD': 'FT', 'WSEC': 'Rlx', ...}, ...]
+
+# Edit an expert judgement and re-run — no re-parse of the .scw.
+m.set_impact(source=("WTRD", "FT"), target=("WSEC", "Alrt"), value=3)
+m.consistent_scenarios()
+
+# Or sweep one impact / batch over many model files.
+sweep_impact(m, ("WTRD", "FT"), ("WSEC", "Alrt"), [-3, 0, 3, 6])
+run_models("test/sample_files", analysis="basins")
+```
+
+Set `PYTHON_JULIACALL_THREADS=auto` before first use for multi-threaded
+exhaustive/basin analysis. The two new engine primitives that back in-place
+editing — `set_impact!` and `get_impact` — are also exported for Julia callers.
+See [`python/README.md`](python/README.md) and
+[`examples/python/run_many.py`](examples/python/run_many.py).
+
+### Two backends (including a source-free one)
+
+The same `Model` API runs on either backend, chosen by `Model.load(...,
+backend=...)` or the `CIB_BACKEND` env var:
+
+- **`juliacall`** — runs the Julia source package in-process (above). Best for
+  developing in this repo.
+- **`native`** — a compiled `libcib` shared library (machine code + bundled
+  Julia runtime) driven via `ctypes`, built with PackageCompiler from
+  [`capi/`](capi/README.md). It ships **no Julia source** and needs no Julia
+  install, so it's the way to distribute the engine as a black box. Build it
+  with `julia --project=build build/build_library.jl`; see
+  [`python/README.md`](python/README.md) for bundling it into a wheel.
+
+## Desktop app
+
+A point-and-click version for non-programmers lives in [`app/`](app): browse to
+a `.scw` file, then **Find Consistent Scenarios** or **Find Basins**, view the
+results (with basin sizes) and export the full basin analysis as CSV. It runs
+locally in your browser and has no external dependencies. Run it from source
+with `julia --project=app -t auto app/run.jl`, or build a standalone Windows
+installer (`.msi`) — no Julia needed on the target machine — via the pipeline
+in [`build/`](build/README.md).
+
 ## What's included
 
 | Function | Purpose |
 |----------|---------|
 | `load_scw`, `load_solutions` | Parse ScenarioWizard `.scw` and `.sl` files |
 | `signature`, `inv_signature`, `max_signature` | Bijection between scenarios and integers |
-| `impact_balance` | Score every variant against a scenario |
-| `succession_step` | One step of deterministic global succession |
-| `find_consistent` | Find every fixed point by exhaustive search (`algorithm=:auto`/`:bnb`/`:sweep`) |
-| `find_basins` | Two-phase basin-of-attraction analysis (Julia-only addition) |
+| `impact_balance`, `own_impact_balance`, `cross_impact_balance`, `inner_product` | CIB scoring primitives |
+| `SuccessionRule`, `GlobalSuccession`, `SequentialSuccession` | Pluggable succession dynamics (see [Pluggable succession rules](#pluggable-succession-rules)) |
+| `succession_step`, `succession` | Deterministic succession dynamics under a chosen rule |
+| `find_consistent` | Find all fixed points (Monte-Carlo, or `exhaustive=true` with `algorithm=:auto`/`:bnb`/`:sweep`); honours `rule=` |
+| `find_basins` | Two-phase basin-of-attraction analysis (Julia-only addition); honours `rule=` |
+| `inner_product_matrix` | Pairwise similarity of kernel scenarios |
+| `set_thresholds!`, `rand_scenario` | API helpers matching the Python reference |
+| `set_impact!`, `get_impact` | Edit / read a single cross-impact value in place (keeps `cim`/`cim_t` in sync) |
 
-Ten exported names, no dependencies. Every one of them is either an entry
-point or is called from inside the package.
+## Pluggable succession rules
+
+The succession *dynamics* — the deterministic map from a scenario to its
+successor — is an extension point. `GlobalSuccession` (the classical
+ScenarioWizard/CIBSA rule) is the default and carries the fast threaded
+sweep, branch-and-bound, and two-phase basin implementations. To add a new
+rule, subtype `SuccessionRule` and define one method:
+
+```julia
+struct MyRule <: SuccessionRule end
+
+function CrossImpactBalances.succession_step(::MyRule, cib::CIB, u::Vector{Int})
+    # return the successor scenario (0-based variant indices)
+end
+```
+
+That's the entire contract. Every analysis routine then works with it:
+
+```julia
+find_consistent(cib; rule=MyRule(), exhaustive=true)
+find_basins(cib; rule=MyRule())
+succession(MyRule(), cib, u)
+```
+
+A custom rule runs through a generic, single-threaded scan (a correctness
+baseline); a rule that needs the fast paths can additionally specialise the
+internal `_exhaustive_kernel(rule, cib; ...)` and `_basins(rule, cib)`
+methods on its own type. `SequentialSuccession` (Gauss–Seidel-style updates)
+ships as a second built-in rule, and
+[`examples/04_custom_succession_rule.jl`](examples/04_custom_succession_rule.jl)
+is a worked example. The `algorithm=:sweep/:bnb` search-strategy switch
+applies only to `GlobalSuccession`.
 
 ## Performance
 

@@ -6,7 +6,10 @@ methodology in Weimer-Jehle (2006), ported from the Python
 [sei-international/cibsa](https://github.com/sei-international/cibsa) library
 with a two-phase basin-of-attraction analysis, a threaded incremental
 exhaustive sweep, and an exact branch-and-bound search that prunes
-provably-inconsistent regions of the scenario space.
+provably-inconsistent regions of the scenario space. The succession dynamics
+is pluggable via [`SuccessionRule`](@ref): [`GlobalSuccession`](@ref) (the
+default, carrying the fast paths) and any user-defined rule drop into the
+same analysis routines through multiple dispatch.
 
 # Reference
 Weimer-Jehle, W. (2006). Cross-impact balances: A system-theoretical approach
@@ -251,15 +254,72 @@ function impact_balance(cib::CIB, u::Vector{Int})
     return ib
 end
 
+
+# ─── Succession rules (pluggable dynamics) ──────────────────────────────────
+
+"""
+    SuccessionRule
+
+Abstract supertype for a *succession dynamics* — the deterministic map that
+sends a scenario to its successor. A consistent scenario is a fixed point of
+this map; a basin of attraction is the set of scenarios that flow to a given
+fixed point under repeated application.
+
+Swapping in a new dynamics is the whole extension interface. Define
+
+    struct MyRule <: SuccessionRule end
+
+and a single method
+
+    succession_step(rule::MyRule, cib::CIB, u::Vector{Int}) -> Vector{Int}
+
+and every analysis routine — [`succession`](@ref), [`find_consistent`](@ref)
+and [`find_basins`](@ref) — works with it immediately through a generic,
+rule-agnostic path. The built-in [`GlobalSuccession`](@ref) additionally
+carries hand-optimised exhaustive-search and basin implementations; a new
+rule may opt into the same speed by specialising the internal
+`_exhaustive_kernel(rule, cib; ...)` and `_basins(rule, cib)` methods on its
+own type, but that is optional — correctness never depends on it.
+"""
+abstract type SuccessionRule end
+
+"""
+    GlobalSuccession()
+
+Global (simultaneous) succession: in one step, every descriptor is moved to
+the variant with the highest impact score given the *current* scenario. Ties
+favour the current variant, then the lowest index. This is the classical
+ScenarioWizard / CIBSA dynamics and the package default; it carries the fast
+threaded sweep, branch-and-bound, and two-phase basin implementations.
+"""
+struct GlobalSuccession <: SuccessionRule end
+
+"""
+    SequentialSuccession()
+
+Sequential (successive / Gauss–Seidel) succession: descriptors are updated one
+at a time in descriptor order, each using the impact balance of the scenario
+*as already partially updated within the same step*. An alternative CIB
+dynamics, included mainly to demonstrate that the analysis routines are
+rule-agnostic — it plugs into [`find_consistent`](@ref) and
+[`find_basins`](@ref) through the generic path with no engine changes.
+"""
+struct SequentialSuccession <: SuccessionRule end
+
 # ─── Succession ─────────────────────────────────────────────────────────────
 
 """
     succession_step(cib, u) -> Vector{Int}
+    succession_step(rule, cib, u) -> Vector{Int}
 
-One step of global succession: for each descriptor, pick the variant with the
-highest impact score. Ties favor the current variant, then lowest index.
+One step of succession under `rule` (default [`GlobalSuccession`](@ref)).
+For global succession, each descriptor independently picks the variant with
+the highest impact score given the current scenario; ties favour the current
+variant, then the lowest index.
 """
-function succession_step(cib::CIB, u::Vector{Int})
+succession_step(cib::CIB, u::Vector{Int}) = succession_step(GlobalSuccession(), cib, u)
+
+function succession_step(::GlobalSuccession, cib::CIB, u::Vector{Int})
     ib = impact_balance(cib, u)
     v = copy(u)
     start = 1  # 1-based index into ib
@@ -289,9 +349,76 @@ operator — by searching the full scenario space with all available threads
 (start Julia with `julia -t auto`).
 
 `algorithm` selects the strategy:
+function succession_step(::SequentialSuccession, cib::CIB, u::Vector{Int})
+    v = copy(u)
+    @inbounds for i in 1:cib.ndesc
+        ib = impact_balance(cib, v)     # recomputed from the partially-updated v
+        off = cib.desc_offsets[i]
+        nv = cib.nvariants[i]
+        max_val = ib[off + v[i] + 1]    # current variant's score (favour on ties)
+        for j in 0:nv-1
+            if ib[off + j + 1] > max_val
+                max_val = ib[off + j + 1]
+                v[i] = j
+            end
+        end
+    end
+    return v
+end
+
+"""
+    succession(cib, u) -> (cycle_length, attractor)
+    succession(rule, cib, u) -> (cycle_length, attractor)
+
+Follow succession under `rule` (default [`GlobalSuccession`](@ref)) from
+scenario `u` until convergence to a fixed point or detection of a cycle.
+Returns (cycle_length, final_scenario). cycle_length=1 means a consistent
+scenario (fixed point).
+
+Cycle detection uses an O(1)-per-step hashtable, so total work is linear in
+the trajectory length.
+"""
+succession(cib::CIB, u::Vector{Int}) = succession(GlobalSuccession(), cib, u)
+
+function succession(rule::SuccessionRule, cib::CIB, u::Vector{Int})
+    start_sig = signature(cib, u)
+    history_sig = Int[start_sig]
+    seen = Dict{Int,Int}()  # signature -> 1-based position in history_sig
+    seen[start_sig] = 1
+    v = copy(u)
+    while true
+        v = succession_step(rule, cib, v)
+        v_sig = signature(cib, v)
+        if haskey(seen, v_sig)
+            cycle_len = length(history_sig) - seen[v_sig] + 1
+            return (cycle_len, v)
+        end
+        push!(history_sig, v_sig)
+        seen[v_sig] = length(history_sig)
+    end
+end
+
+# ─── Find consistent scenarios ──────────────────────────────────────────────
+
+"""
+    find_consistent(cib; rule=GlobalSuccession(), ignore_cycles=true,
+                    exhaustive=false, algorithm=:auto,
+                    rng=Random.default_rng()) -> Vector{Vector{Int}}
+
+Find all consistent scenarios (fixed points of the succession map) by running
+succession under `rule` from every (or sampled) starting point.
+
+`rule` selects the succession *dynamics* ([`SuccessionRule`](@ref); default
+[`GlobalSuccession`](@ref)). Any rule works through a generic scan; the
+default additionally uses the fast strategies below.
+
+When `exhaustive=true`, the full scenario space is searched and every fixed
+point is found, using all available threads (start Julia with `julia -t auto`).
+`algorithm` selects the strategy (only consulted when `exhaustive=true`, and
+only supported for [`GlobalSuccession`](@ref)):
 - `:sweep` — enumerate every scenario with the incremental odometer sweep.
 - `:bnb`   — branch-and-bound: assign descriptors depth-first and prune
-  subtrees that provably contain no fixed point (see [`_bnb_bounds`](@ref)).
+  subtrees that provably contain no fixed point.
   Exact — returns the identical kernel — and typically visits a small
   fraction of the space on strongly-coupled matrices.
 - `:auto`  (default) — the sweep for small spaces (< 10^5 scenarios),
@@ -317,6 +444,50 @@ function find_consistent(cib::CIB; algorithm::Symbol=:auto,
     !isnothing(kern) && return kern
     # Budget tripped: pruning too weak on this matrix — fall back.
     return _find_consistent_exhaustive(cib)
+end
+
+"""
+    _exhaustive_kernel(rule, cib; ignore_cycles, algorithm, bnb_node_budget)
+
+Exhaustive fixed-point search under `rule`. Dispatched on the rule type:
+[`GlobalSuccession`](@ref) gets the fast sweep / branch-and-bound path; any
+other rule gets a generic ascending-signature scan.
+"""
+function _exhaustive_kernel(::GlobalSuccession, cib::CIB; ignore_cycles::Bool=true,
+                            algorithm::Symbol=:auto,
+                            bnb_node_budget::Union{Nothing,Int}=nothing)
+    algorithm in (:auto, :bnb, :sweep) ||
+        throw(ArgumentError("algorithm must be :auto, :bnb or :sweep, got $(repr(algorithm))"))
+    n = max_signature(cib) + 1
+    if algorithm == :sweep || (algorithm == :auto && n < 100_000)
+        return _find_consistent_exhaustive(cib; ignore_cycles=ignore_cycles)
+    end
+    sufmin, sufmax = _bnb_bounds(cib)
+    budget = something(bnb_node_budget,
+                       algorithm == :bnb ? typemax(Int) : n ÷ 16)
+    kern, _ = _bnb_fixed_points(cib, sufmin, sufmax; node_budget=budget)
+    !isnothing(kern) && return kern
+    # Budget tripped: pruning too weak on this matrix — fall back.
+    return _find_consistent_exhaustive(cib; ignore_cycles=ignore_cycles)
+end
+
+# Generic fallback: works for any rule. Enumerate the whole space in
+# ascending-signature order and keep the scenarios that are their own
+# successor. Single-threaded and O(n) — a correctness baseline that a new
+# rule can override with a faster specialisation if warranted.
+function _exhaustive_kernel(rule::SuccessionRule, cib::CIB; ignore_cycles::Bool=true,
+                            algorithm::Symbol=:auto,
+                            bnb_node_budget::Union{Nothing,Int}=nothing)
+    algorithm === :auto || throw(ArgumentError(
+        "algorithm=$(repr(algorithm)) is only available for GlobalSuccession; " *
+        "custom succession rules use the generic scan (algorithm=:auto)"))
+    n = max_signature(cib) + 1
+    kern = Vector{Vector{Int}}()
+    for sig in 0:n-1
+        u = inv_signature(cib, sig)
+        succession_step(rule, cib, u) == u && push!(kern, u)
+    end
+    return kern
 end
 
 """
@@ -647,18 +818,19 @@ function _bnb_fixed_points(cib::CIB, sufmin::Matrix{Int}, sufmax::Matrix{Int};
 end
 
 """
-    find_basins(cib) -> (fixed_points, basin_sizes, cycle_count)
+    find_basins(cib; rule=GlobalSuccession()) -> (fixed_points, basin_sizes, cycle_count)
 
-Exhaustive basin-of-attraction analysis. Follows the succession chain from
-every scenario in the space, counting how many starting points converge to
-each fixed point.
+Exhaustive basin-of-attraction analysis under `rule` (default
+[`GlobalSuccession`](@ref)). Follows the succession chain from every scenario
+in the space, counting how many starting points converge to each fixed point.
 
-Runs in two phases: a threaded sweep fills a flat successor table (every
-scenario's succession step, computed once via an incrementally maintained
-impact balance), then a sequential resolution pass walks the table with
-path compression so each scenario is resolved exactly once. Memory is
-~8n bytes for the two flat tables (Int32 entries when the space fits,
-Int64 otherwise), independent of the thread count.
+For [`GlobalSuccession`](@ref) this runs in two phases: a threaded sweep fills
+a flat successor table (every scenario's succession step, computed once via an
+incrementally maintained impact balance), then a sequential resolution pass
+walks the table with path compression so each scenario is resolved exactly
+once. Memory is ~8n bytes for the two flat tables (Int32 entries when the
+space fits, Int64 otherwise), independent of the thread count. Any other rule
+uses a generic per-scenario walk with the same result semantics.
 
 Returns:
 - `fixed_points`: Vector of fixed-point scenarios (0-based variant indices),
@@ -667,13 +839,42 @@ Returns:
 - `cycle_count`:  number of scenarios that fall into non-fixed-point cycles
   (including scenarios whose chain merely leads into a cycle)
 """
-function find_basins(cib::CIB)
+function find_basins(cib::CIB; rule::SuccessionRule=GlobalSuccession())
+    return _basins(rule, cib)
+end
+
+function _basins(::GlobalSuccession, cib::CIB)
     n = max_signature(cib) + 1
     T = _score_type(cib)
     if n <= Int(typemax(Int32)) - 1
         return _find_basins(cib, Int32, Matrix{T}(cib.cim_t))
     end
     return _find_basins(cib, Int64, Matrix{T}(cib.cim_t))
+end
+
+# Generic fallback: works for any rule. Walk succession from every scenario,
+# tally which fixed point each lands on, and count starts that fall into
+# non-fixed-point cycles. Mirrors the fast path's semantics (into-cycle
+# starts are counted, not assigned to any basin) and its ascending-signature
+# ordering. Single-threaded — a correctness baseline a new rule can override.
+function _basins(rule::SuccessionRule, cib::CIB)
+    n = max_signature(cib) + 1
+    tally = Dict{Int,Int}()      # fixed-point signature -> basin size
+    cycle_count = 0
+    for sig in 0:n-1
+        u = inv_signature(cib, sig)
+        nper, attr = succession(rule, cib, u)
+        if nper > 1
+            cycle_count += 1
+        else
+            asig = signature(cib, attr)
+            tally[asig] = get(tally, asig, 0) + 1
+        end
+    end
+    fp_sigs = sort!(collect(keys(tally)))
+    fixed_points = [inv_signature(cib, s) for s in fp_sigs]
+    sizes = [tally[s] for s in fp_sigs]
+    return (fixed_points, sizes, cycle_count)
 end
 
 function _find_basins(cib::CIB, ::Type{S}, cimT::Matrix{T}) where {S<:Union{Int32,Int64}, T<:Signed}
@@ -706,6 +907,18 @@ function _successor_table!(succ::Vector{S}, cib::CIB, cimT::Matrix{T}) where {S,
     nchunks = max(1, min(n, 16 * Threads.nthreads()))
     chunk_size = cld(n, nchunks)
     nchunks = cld(n, chunk_size)
+    if S === Int32 && T === Int16 && cib.ndim > 0
+        # SIMD fast path: variant-major tiled argmax (identical output).
+        lay = _vm_layout(cib.nvariants, cib.desc_offsets, orders, cimT)
+        @sync for c in 1:nchunks
+            first_sig = (c - 1) * chunk_size
+            last_sig = min(c * chunk_size, n) - 1
+            Threads.@spawn _successor_chunk_vm!(succ, lay, first_sig, last_sig,
+                                                cib.nvariants, cib.desc_offsets,
+                                                cib.ndesc, cib.ndim)
+        end
+        return succ
+    end
     @sync for c in 1:nchunks
         first_sig = (c - 1) * chunk_size
         last_sig = min(c * chunk_size, n) - 1
@@ -747,10 +960,9 @@ function _successor_chunk!(succ::Vector{S}, cimT::Matrix{T},
             max_val = ib[off + wi + 1]   # current variant seeds the max
             for j in 0:nvariants[i]-1
                 score = ib[off + j + 1]
-                if score > max_val       # strict >: ties keep current/lower index
-                    max_val = score
-                    wi = j
-                end
+                better = score > max_val         # strict >: ties keep current/lower index
+                max_val = ifelse(better, score, max_val)
+                wi = ifelse(better, j, wi)        # branchless select (no misprediction)
             end
             w_sig += orders[i] * wi
         end
@@ -783,57 +995,273 @@ function _successor_chunk!(succ::Vector{S}, cimT::Matrix{T},
     return succ
 end
 
+# ─── SIMD successor chunk (Int16 scores, Int32 signatures) ──────────────────
+#
+# The scalar argmax above is the table build's hot spot (~60% of its time): a
+# data-dependent scan of 3-4 variants per descriptor that cannot vectorize.
+# This path restructures the impact-balance vector into *variant-major* order —
+# grouping descriptors by radix so that "variant j of every descriptor in the
+# group" is one contiguous plane — and then argmaxes 16 descriptors at once
+# with 256-bit integer SIMD. Semantics are identical to the scalar path (the
+# per-state successor table is byte-for-byte the same); only the evaluation
+# order changes.
+
 """
-    _resolve_and_tally(succ, n) -> (fp_sigs, sizes, cycle_count)
+    _vm_layout(nvariants, offsets, orders, cimT) -> NamedTuple
 
-Resolve every scenario to its attractor by walking the successor table.
-`res` values: 0 = unvisited, -2 = on the chain currently being walked,
--1 = falls into (or leads into) a non-fixed-point cycle, k > 0 = converges
-to the fixed point with signature k - 1. The in-progress marker makes cycle
-detection O(1) per step; on any resolution the entire walked chain is
-back-filled, so total work is O(n). The walk is sequential (the table is
-shared mutable state); the final tally pass is threaded.
+Build the variant-major layout for [`_successor_chunk_vm!`](@ref). Descriptors
+are grouped by radix; within a group the balance slots are reordered so plane
+`j` holds "variant `j` of each member descriptor" contiguously, and each group
+is split into 16-lane tiles. Returns:
+
+- `cimt_vm` — `cimT` with its slot axis permuted to variant-major (columns,
+  indexed by the odometer's descriptor-major `rows`, are untouched);
+- per-tile arrays `tile_r/tile_m/tile_base/tile_k0/tile_cur0` (radix, group
+  size = plane stride, group base slot, lane offset, current-variant buffer
+  offset);
+- `ordbuf` — 16 `Int32` mixed-radix place values per tile, zero in pad lanes
+  (pad lanes therefore contribute nothing to the signature);
+- `curpos_of` — where each descriptor's current variant lives in the per-worker
+  current-variant buffer (`ncur` entries).
 """
-function _resolve_and_tally(succ::Vector{S}, n::Int) where {S}
-    res = zeros(S, n)
-    history = Int[]
-    marker = S(-2)
-
-    @inbounds for start in 0:n-1
-        res[start + 1] != 0 && continue
-        empty!(history)
-        cur = start
-        res[cur + 1] = marker
-        push!(history, cur)
-
-        while true
-            nxt = Int(succ[cur + 1])
-            r = res[nxt + 1]
-            if r == marker
-                # Hit our own chain: either the last element is a fixed
-                # point (succ maps it to itself) or we closed a true cycle.
-                # Chains *leading into* a cycle count as cycle scenarios too.
-                val = nxt == cur ? S(cur + 1) : S(-1)
-                for h in history
-                    res[h + 1] = val
-                end
-                break
-            elseif r != 0
-                for h in history        # already resolved: backfill chain
-                    res[h + 1] = r
-                end
-                break
+function _vm_layout(nvariants::Vector{Int}, offsets::Vector{Int},
+                    orders::Vector{Int}, cimT::Matrix{Int16})
+    ndesc = length(nvariants)
+    ndim = size(cimT, 1)
+    radixes = sort!(unique(nvariants))
+    dm_of_vm = Vector{Int}(undef, ndim)      # variant-major slot -> descriptor-major slot
+    curpos_of = zeros(Int, ndesc)
+    tile_r = Int[]; tile_m = Int[]; tile_base = Int[]; tile_k0 = Int[]; tile_cur0 = Int[]
+    ordbuf = Int32[]
+    base = 0
+    for r in radixes
+        members = [i for i in 1:ndesc if nvariants[i] == r]
+        m = length(members)
+        for j in 0:r-1, (k, i) in enumerate(members)
+            dm_of_vm[base + j*m + k] = offsets[i] + j + 1
+        end
+        for k0 in 0:16:m-1
+            lanes = min(16, m - k0)
+            push!(tile_r, r); push!(tile_m, m); push!(tile_base, base); push!(tile_k0, k0)
+            push!(tile_cur0, length(tile_r) * 16 - 15)     # 16 cur lanes per tile
+            for l in 1:16
+                push!(ordbuf, l <= lanes ? Int32(orders[members[k0 + l]]) : Int32(0))
             end
-            res[nxt + 1] = marker
-            push!(history, nxt)
-            cur = nxt
+            for l in 1:lanes
+                curpos_of[members[k0 + l]] = (length(tile_r) - 1) * 16 + l
+            end
+        end
+        base += r * m
+    end
+    return (cimt_vm = cimT[dm_of_vm, :], ntiles = length(tile_r),
+            tile_r = tile_r, tile_m = tile_m, tile_base = tile_base,
+            tile_k0 = tile_k0, tile_cur0 = tile_cur0, ordbuf = ordbuf,
+            curpos_of = curpos_of, ncur = length(tile_r) * 16)
+end
+
+"""
+    _successor_chunk_vm!(succ, lay, first_sig, last_sig, nvariants, offsets,
+                         ndesc, ndim)
+
+Variant-major successor chunk: identical output to [`_successor_chunk!`](@ref)
+(same incremental odometer, same strict-`>`/current-wins tie-break), with the
+per-descriptor argmax vectorized across each 16-lane tile. Per variant plane
+the winner rule is a single blend:
+
+    wins = (score > max) | (lane's current variant == j  &  score == max)
+
+which reproduces the scalar tie-break exactly: the current variant beats an
+equal incumbent (the `==` arm fires only on the lane's own current plane), all
+other variants need strict `>`, and lower indices win otherwise because planes
+are scanned in ascending order. Pad lanes are harmless: their loads stay within
+the 16-slot padding of `ibv` and their place values in `ordbuf` are zero. The
+signature is then one SIMD widening multiply + horizontal sum per tile.
+"""
+function _successor_chunk_vm!(succ::Vector{Int32}, lay, first_sig::Int, last_sig::Int,
+                              nvariants::Vector{Int}, offsets::Vector{Int},
+                              ndesc::Int, ndim::Int)
+    cimt_vm = lay.cimt_vm
+    v    = Vector{Int}(undef, ndesc)
+    rows = Vector{Int}(undef, ndesc)
+    ibv  = zeros(Int16, ndim + 16)           # +16: tile loads may overhang the last group
+    cur  = zeros(Int16, lay.ncur)
+
+    s = first_sig
+    @inbounds for i in 1:ndesc
+        nv = nvariants[i]
+        v[i] = s % nv
+        rows[i] = offsets[i] + v[i] + 1
+        cur[lay.curpos_of[i]] = Int16(v[i])
+        s = s ÷ nv
+    end
+    @inbounds for i in 1:ndesc
+        r = rows[i]
+        @simd for j in 1:ndim
+            ibv[j] += cimt_vm[j, r]
         end
     end
 
-    # ── Threaded tally (read-only over res) ──
+    V = Vec{16,Int16}
+    W = Vec{16,Int32}
+    @inbounds for sig in first_sig:last_sig
+        # ── Successor signature: tiled SIMD argmax over the variant planes ──
+        w_sig = 0
+        for t in 1:lay.ntiles
+            r = lay.tile_r[t]; m = lay.tile_m[t]
+            off0 = lay.tile_base[t] + lay.tile_k0[t] + 1
+            cv = vload(V, cur, lay.tile_cur0[t])
+            mx = vload(V, ibv, off0)                     # plane 0 seeds (lowest index)
+            best = V(Int16(0))
+            for j in 1:r-1
+                pj = vload(V, ibv, off0 + j*m)
+                jv = V(Int16(j))
+                b = (pj > mx) | ((cv == jv) & (pj == mx))
+                mx = vifelse(b, pj, mx)
+                best = vifelse(b, jv, best)
+            end
+            w_sig += Int(sum(convert(W, best) * vload(W, lay.ordbuf, (t-1)*16 + 1)))
+        end
+        succ[sig + 1] = Int32(w_sig)
+
+        # ── Odometer increment with fused row-delta ibv update ──
+        if sig < last_sig
+            for i in 1:ndesc
+                nv = nvariants[i]
+                nv == 1 && continue      # radix-1: value stays 0, carry onward
+                rold = rows[i]
+                if v[i] + 1 < nv
+                    vi = v[i] + 1
+                    v[i] = vi
+                    rnew = rold + 1
+                    rows[i] = rnew
+                    cur[lay.curpos_of[i]] = Int16(vi)
+                    @simd for j in 1:ndim
+                        ibv[j] += cimt_vm[j, rnew] - cimt_vm[j, rold]
+                    end
+                    break
+                end
+                v[i] = 0                 # roll over; carry to next digit
+                rnew = offsets[i] + 1
+                rows[i] = rnew
+                cur[lay.curpos_of[i]] = Int16(0)
+                @simd for j in 1:ndim
+                    ibv[j] += cimt_vm[j, rnew] - cimt_vm[j, rold]
+                end
+            end
+        end
+    end
+    return succ
+end
+
+"""
+    _fp_id!(reg_lock, fp_sig_by_id, id_by_fp_sig, sig) -> id
+
+Locked get-or-assign of a dense 1-based id for the fixed point with signature
+`sig`. Called once per fixed point discovered (≈ `nfp` times total across all
+workers), so the lock is essentially uncontended. Concurrent discoverers of the
+same fixed point serialize here and receive the same id.
+"""
+@noinline function _fp_id!(reg_lock::ReentrantLock, fp_sig_by_id::Vector{Int},
+                           id_by_fp_sig::Dict{Int,Int}, sig::Int)
+    lock(reg_lock)
+    try
+        id = get(id_by_fp_sig, sig, 0)
+        if id == 0
+            push!(fp_sig_by_id, sig)
+            id = length(fp_sig_by_id)
+            id_by_fp_sig[sig] = id
+        end
+        return id
+    finally
+        unlock(reg_lock)
+    end
+end
+
+"""
+    _resolve_chunk!(res, succ, lo, hi, reg_lock, fp_sig_by_id, id_by_fp_sig)
+
+Resolve the starts in `lo:hi` into the shared `res`, following successor chains.
+Cycle detection is **thread-private** (a per-worker `history` + backward scan),
+so `res` only ever holds *final* labels — 0 = unvisited, -1 = cycle, k > 0 =
+converges to the fixed point with dense id `k`. There is no shared in-progress
+marker, so a worker that walks into another worker's not-yet-resolved chain just
+re-walks it (redundant, never a false cycle) and reaches the same attractor;
+every state's attractor is deterministic, so concurrent writes to the same slot
+store the same value — a benign race. Fixed-point ids come from the locked
+registry ([`_fp_id!`](@ref)), hit ≈ `nfp` times.
+"""
+function _resolve_chunk!(res::Vector{S}, succ::Vector{S}, lo::Int, hi::Int,
+                         reg_lock::ReentrantLock, fp_sig_by_id::Vector{Int},
+                         id_by_fp_sig::Dict{Int,Int}) where {S}
+    history = Int[]
+    @inbounds for start in lo:hi
+        res[start + 1] != 0 && continue
+        empty!(history)
+        cur = start
+        label = zero(S)
+        while true
+            r = res[cur + 1]
+            if r != 0                        # already resolved: inherit (fp id or -1)
+                label = r
+                break
+            end
+            onchain = false                  # already on our own chain? -> ≥2-cycle
+            for k in length(history):-1:1
+                if history[k] == cur
+                    onchain = true
+                    break
+                end
+            end
+            if onchain
+                label = S(-1)                # whole chain (incl. pre-cycle tail) is cycle
+                break
+            end
+            push!(history, cur)
+            nxt = Int(succ[cur + 1])
+            if nxt == cur                    # fixed point (counts itself: it's in history)
+                label = S(_fp_id!(reg_lock, fp_sig_by_id, id_by_fp_sig, cur))
+                break
+            end
+            cur = nxt
+        end
+        for h in history
+            res[h + 1] = label
+        end
+    end
+    return nothing
+end
+
+"""
+    _resolve_and_tally(succ, n) -> (fp_sigs, sizes, cycle_count)
+
+Resolve every scenario to its attractor by walking the successor table, then
+tally basin sizes and the cycle count. The walk is threaded over disjoint start
+ranges ([`_resolve_chunk!`](@ref)); it is race-safe because `res` holds only
+final labels and every attractor is deterministic. Each fixed point gets a dense
+id the first time it is reached (via a locked registry); the tally then indexes
+a dense per-fixed-point counter (fixed points are few), so it costs an array
+increment per scenario rather than a hash lookup. Output fixed points are sorted
+by signature, so the result is identical at any thread count.
+"""
+function _resolve_and_tally(succ::Vector{S}, n::Int) where {S}
+    res = zeros(S, n)
+    reg_lock = ReentrantLock()
+    fp_sig_by_id = Int[]             # dense id (1-based) -> fixed-point signature
+    id_by_fp_sig = Dict{Int,Int}()   # fixed-point signature -> dense id
+
     nt = Threads.nthreads()
+    chunk = cld(n, nt)
+    @sync for t in 1:nt
+        lo = (t - 1) * chunk
+        hi = min(t * chunk, n) - 1
+        Threads.@spawn _resolve_chunk!(res, succ, lo, hi, reg_lock,
+                                       fp_sig_by_id, id_by_fp_sig)
+    end
+
+    # ── Threaded tally: res holds a dense fixed-point id (>0) or -1 (cycle) ──
+    nfp = length(fp_sig_by_id)
     tally_chunk = cld(n, nt)
-    local_counts = [Dict{Int,Int}() for _ in 1:nt]
+    local_counts = [zeros(Int, nfp) for _ in 1:nt]
     local_cyc = zeros(Int, nt)
     @sync for t in 1:nt
         lo = (t - 1) * tally_chunk
@@ -846,21 +1274,21 @@ function _resolve_and_tally(succ::Vector{S}, n::Int) where {S}
                 if c == -1
                     cyc += 1
                 else
-                    counts[c - 1] = get(counts, c - 1, 0) + 1
+                    counts[c] += 1              # c is a dense id in 1:nfp
                 end
             end
             local_cyc[t] = cyc
         end
     end
 
-    merged = Dict{Int,Int}()
+    total = zeros(Int, nfp)
     for counts in local_counts
-        for (fp, cnt) in counts
-            merged[fp] = get(merged, fp, 0) + cnt
+        @inbounds for k in 1:nfp
+            total[k] += counts[k]
         end
     end
-    fp_sigs = sort!(collect(keys(merged)))
-    return fp_sigs, [merged[fp] for fp in fp_sigs], sum(local_cyc)
+    perm = sortperm(fp_sig_by_id)
+    return fp_sig_by_id[perm], total[perm], sum(local_cyc)
 end
 
 end # module

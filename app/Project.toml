@@ -1,0 +1,17 @@
+name = "CIBApp"
+uuid = "9e3bf898-e4e6-4c29-9bd9-5d8dbbaeb391"
+authors = ["Iain Morrow"]
+version = "0.1.0"
+description = "Local desktop UI for Cross-Impact Balance scenario analysis."
+
+[deps]
+CrossImpactBalances = "afc69b00-438b-45c4-b5e2-26f87645c9e3"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+
+# CrossImpactBalances is resolved from the parent directory via `Pkg.develop`
+# (see app/README.md and the build workflow). A path is not pinned here with a
+# [sources] table because that table is a Julia 1.11+ feature and this package
+# supports Julia 1.10.
+
+[compat]
+julia = "1.10"
