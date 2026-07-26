@@ -1,20 +1,10 @@
 """
     CrossImpactBalances
 
-Cross-Impact Balance (CIB) scenario analysis. A Julia implementation of the
-methodology in Weimer-Jehle (2006), ported from the Python
-[sei-international/cibsa](https://github.com/sei-international/cibsa) library
-with a two-phase basin-of-attraction analysis, a threaded incremental
-exhaustive sweep, and an exact branch-and-bound search that prunes
-provably-inconsistent regions of the scenario space. The succession dynamics
-is pluggable via [`SuccessionRule`](@ref): [`GlobalSuccession`](@ref) (the
-default, carrying the fast paths) and any user-defined rule drop into the
-same analysis routines through multiple dispatch.
+Cross-Impact Balance (CIB) scenario analysis. A Julia implementation of the methodology in Weimer-Jehle (2006), ported from the Python [sei-international/cibsa](https://github.com/sei-international/cibsa) library with a two-phase basin-of-attraction analysis, a threaded incremental exhaustive sweep, and an exact branch-and-bound search that prunes provably-inconsistent regions of the scenario space. The succession dynamics can be changed through []`SuccessionRule`](@ref). There is a default called 'GlobalSuccession`](@ref) which follows the standard ScenarioWizard rule.
 
 # Reference
-Weimer-Jehle, W. (2006). Cross-impact balances: A system-theoretical approach
-to cross-impact analysis. *Technological Forecasting and Social Change*,
-73(4), 334–361.
+Weimer-Jehle, W. (2006). Cross-impact balances: A system-theoretical approach to cross-impact analysis. *Technological Forecasting and Social Change*, 73(4), 334–361.
 """
 module CrossImpactBalances
 
@@ -22,7 +12,7 @@ using SIMD: Vec, vload, vifelse
 
 export CIB, load_scw, load_solutions,
        impact_balance,
-       SuccessionRule, GlobalSuccession, SequentialSuccession,
+       SuccessionRule, StandardSuccession, 
        succession_step, succession,
        find_consistent, find_basins,
        signature, inv_signature, max_signature
@@ -35,34 +25,29 @@ Cross-impact balance analysis object.
 Fields:
 - `descriptors`: ordered list of descriptor names
 - `variants`: dict mapping descriptor name to list of variant names
-- `nvariants`: number of variants per descriptor
-- `cim`: the cross-impact matrix (n × n), n = sum of all variants. Row `r`
-  holds the impacts contributed by variant `r` onto every other variant.
-- `cim_t`: the transpose of `cim` — `cim_t[j, r] == cim[r, j]`. Stored
-  alongside `cim` so that "sum a fixed-row vector across many `j`" hot
-  loops (impact_balance, find_basins) can iterate contiguously through
-  column-major storage, which unlocks SIMD. Construction cost is one
-  `permutedims` at load time.
-- `ndim`: total number of variants (size of CIM)
-- `ndesc`: number of descriptors
-- `kernel`: list of consistent scenarios (each a Vector{Int}, 0-based variant indices)
-- `desc_offsets`: cumulative 0-based variant offsets per descriptor
+- `numberOfVariants`: number of variants per descriptor (can be different for each descriptor)
+- `cim`: the cross-impact matrix (n × n), n = sum of all variants. Row `r` holds the impacts contributed by variant `r` onto every other variant.
+- `cim_t`: the transpose of `cim` — `cim_t[j, r] == cim[r, j]`. Stored alongside `cim` so that "sum a fixed-row vector across many `j`" hot loops (impact_balance, find_basins) can iterate contiguously through column-major storage, which unlocks SIMD. Construction cost is one `permutedims` at load time.
+- `numberOfDimensions`: total number of variants (size of CIM)
+- `numberOfDescriptors`: number of descriptors
+- `consistentScenarios`: list of consistent scenarios (each a Vector{Int}, 0-based variant indices)
+- `desc_offsets`: cumulative 0-based variant offsets per descriptor, shows where in the CIM each descriptor's variants start
 
-`CIB` is immutable in its field bindings. `kernel` is a `Vector` whose
-contents may be mutated in place.
+`CIB` is immutable in its field bindings. `kernel` is a `Vector` whose contents may be mutated in place.
 """
 struct CIB
     descriptors::Vector{String}
     variants::Dict{String, Vector{String}}
-    nvariants::Vector{Int}
+    numberOfVariants::Vector{Int}
     cim::Matrix{Int}
     cim_t::Matrix{Int}
-    ndim::Int
-    ndesc::Int
-    kernel::Vector{Vector{Int}}
+    numberOfDimensions::Int
+    numberOfDescriptors::Int
+    consistentScenarios::Vector{Vector{Int}}
     desc_offsets::Vector{Int}
 end
 
+#region "files parsers"
 # ─── .scw file parser ───────────────────────────────────────────────────────
 
 """
@@ -71,10 +56,7 @@ end
 Parse a ScenarioWizard .scw file and optionally a .sl solutions file.
 Returns a fully populated CIB object.
 
-Unless a `kernel` or an `sl_file` is supplied, the kernel is computed by
-[`find_consistent`](@ref), which always searches the full scenario space and
-uses every available thread (start Julia with `julia -t auto`). `algorithm`
-is forwarded to select the search strategy.
+Unless a `kernel` or an `sl_file` is supplied, the kernel is computed by [`find_consistent`](@ref), which always searches the full scenario space and uses every available thread (start Julia with `julia -t auto`). `algorithm` is forwarded to select the search strategy.
 """
 function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
                   kernel::Union{Vector{Vector{Int}},Nothing}=nothing,
@@ -161,11 +143,11 @@ function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
               Vector{Vector{Int}}(), desc_offsets)
 
     if !isnothing(kernel)
-        append!(cib.kernel, kernel)
+        append!(cib.consistentScenarios, kernel)
     elseif !isnothing(sl_file)
-        append!(cib.kernel, load_solutions(cib, sl_file))
+        append!(cib.consistentScenarios, load_solutions(cib, sl_file))
     else
-        append!(cib.kernel, find_consistent(cib; algorithm=algorithm))
+        append!(cib.consistentScenarios, find_consistent(cib; algorithm=algorithm))
     end
 
     return cib
@@ -195,20 +177,21 @@ function load_solutions(cib::CIB, sl_file::String)
     end
     return kern
 end
+#endregion
 
-# ─── Signature (unique integer ID for a scenario) ──────────────────────────
+#region "─── Signature (unique integer ID for a scenario) ──────────────────────────"
 
 """
     signature(cib, u) -> Int
 
-Compute a unique integer signature for scenario `u` (0-based variant indices).
+Compute a unique, sequential, integer signature for scenario `u` (0-based variant indices). Used for the mixed radix step through of scenarios
 """
-function signature(cib::CIB, u::Vector{Int})
+function signature(cib::CIB, scenarios::Vector{Int})
     sig = 0
     order = 1
-    for (ui, nv) in zip(u, cib.nvariants)
-        sig += order * ui
-        order *= nv
+    for (scenarioNumber, variantNumber) in zip(scenarios, cib.numberOfVariants)
+        sig += order * scenarioNumber
+        order *= variantNumber
     end
     return sig
 end
@@ -218,13 +201,13 @@ end
 
 Convert a signature back to a scenario (0-based variant indices).
 """
-function inv_signature(cib::CIB, s::Int)
-    u = Int[]
-    for nv in cib.nvariants
-        push!(u, s % nv)
-        s = s ÷ nv
+function inv_signature(cib::CIB, signature::Int)
+    scenario = Int[]
+    for variantNumber in cib.numberOfVariants
+        push!(scenario, signature % variantNumber)
+        signature = signature ÷ variantNumber
     end
-    return u
+    return scenario
 end
 
 """
@@ -233,43 +216,46 @@ end
 The maximum signature value (= total scenarios - 1).
 """
 function max_signature(cib::CIB)
-    return signature(cib, [nv - 1 for nv in cib.nvariants])
+    return signature(cib, [nv - 1 for nv in cib.numberOfVariants])
 end
+#endregion
 
-# ─── Impact balance ─────────────────────────────────────────────────────────
+#region "Calculate Impact balance"
 
 """
     impact_balance(cib, u) -> Vector{Int}
 
 Compute the impact balance vector for scenario `u`.
-Returns a vector of length ndim (one score per variant across all descriptors).
+
+    Returns a vector of length ndim (one score per variant across all descriptors).
 """
-function impact_balance(cib::CIB, u::Vector{Int})
-    ib = zeros(Int, cib.ndim)
-    nd = cib.ndim
-    cim_t = cib.cim_t                      # row r of cim lives at column r of cim_t
+function impact_balance(cib::CIB, scenarios::Vector{Int})
+    noOfDimensions = cib.numberOfDimensions                       
+    impactBalance = zeros(Int, noOfDimensions)               #create an empty array for the IB results
+    cim_t = cib.cim_t                      # row r of cim lives at column r of cim_t, transpose the matrix so we can use SIMD
     offsets = cib.desc_offsets
-    @inbounds for (i, ui) in enumerate(u)
-        r = offsets[i] + ui + 1
-        @simd for j in 1:nd
-            ib[j] += cim_t[j, r]           # contiguous column read → AVX-512
+    @inbounds for (i, scenario) in enumerate(scenarios)  #don't need bounds checking, for speed
+        r = offsets[i] + scenario + 1
+        @simd for j in 1:noOfDimensions
+            impactBalance[j] += cim_t[j, r]           # contiguous column read → AVX
         end
     end
-    return ib
+    return impactBalance
 end
 
+#endregion
 
-# ─── Succession rules (pluggable dynamics) ──────────────────────────────────
+#region ─── Succession 
 
 """
     SuccessionRule
 
-Abstract supertype for a *succession dynamics* — the deterministic map that
-sends a scenario to its successor. A consistent scenario is a fixed point of
-this map; a basin of attraction is the set of scenarios that flow to a given
-fixed point under repeated application.
+Succession is one of the two core concepts of CIB - "how do we move from one scenario to the next". The other core concept is consistency - "is this scenario better than others".
+Note that these concepts are separate in that the question of whether there is a better scenario is separate from the question of how to get there.
 
-Swapping in a new dynamics is the whole extension interface. Define
+To allow flexibility in how succession is calculated, we define here an abstract supertype called [`SuccessionRule`](@ref). 
+
+To add in a new rule, define
 
     struct MyRule <: SuccessionRule end
 
@@ -277,179 +263,97 @@ and a single method
 
     succession_step(rule::MyRule, cib::CIB, u::Vector{Int}) -> Vector{Int}
 
-and every analysis routine — [`succession`](@ref), [`find_consistent`](@ref)
-and [`find_basins`](@ref) — works with it immediately through a generic,
-rule-agnostic path. [`find_basins`](@ref) is already fast for any rule (it
-fills a successor table and reuses the shared path-compressed resolver). A
-*threshold* rule — one whose fixed points are a separable, impact-balance-only
-per-descriptor condition — can additionally opt [`find_consistent`](@ref) into
-the fast threaded sweep and branch-and-bound by defining
-[`fixed_point_margin`](@ref); otherwise `find_consistent` uses a generic scan.
-Both are optional — correctness never depends on them.
+and every analysis routine — [`succession`](@ref), [`find_consistent`](@ref) and [`find_basins`](@ref) — works with it immediately. The only assumption is that SuccessionRule depends only on the current scenario, not the path to get there (in technical terms, it's a Markov process).
+
 """
 abstract type SuccessionRule end
 
 """
-    GlobalSuccession()
-
-Global (simultaneous) succession: in one step, every descriptor is moved to
-the variant with the highest impact score given the *current* scenario. Ties
-favour the current variant, then the lowest index. This is the classical
-ScenarioWizard / CIBSA dynamics and the package default; it carries the fast
-threaded sweep, branch-and-bound, and two-phase basin implementations.
+The standard succession approach: in one step, every descriptor is moved to the variant with the highest impact score given the *current* scenario. Ties favour the current variant, then the lowest index.
 """
-struct GlobalSuccession <: SuccessionRule end
+struct StandardSuccession <: SuccessionRule end
 
 """
-    SequentialSuccession()
-
-Sequential (successive / Gauss–Seidel) succession: descriptors are updated one
-at a time in descriptor order, each using the impact balance of the scenario
-*as already partially updated within the same step*. An alternative CIB
-dynamics, included mainly to demonstrate that the analysis routines are
-rule-agnostic — it plugs into [`find_consistent`](@ref) and
-[`find_basins`](@ref) through the generic path with no engine changes.
+Sequential (successive / Gauss–Seidel) succession: descriptors are updated one at a time in descriptor order, each using the impact balance of the scenario *as already partially updated within the same step*.
 """
 struct SequentialSuccession <: SuccessionRule end
-
-"""
-    fixed_point_margin(rule) -> Union{Nothing,Int}
-
-Fast-path opt-in for a *threshold* succession rule. Return an integer margin
-`m ≥ 0` when this rule's fixed points are exactly the scenarios in which, for
-every descriptor, no competing variant's impact score exceeds the current
-variant's by more than `m` — i.e. the fixed-point test is separable per
-descriptor and a function of the impact balance alone. Return `nothing` (the
-default) for any rule without that structure.
-
-Declaring a margin lets [`find_consistent`](@ref) reach the fast threaded
-sweep and branch-and-bound (the margin parameterises their per-descriptor
-fixed-point test) instead of the generic per-scenario scan. The two must
-agree, so a margin is a *promise* about the rule's fixed points worth
-validating in tests. [`GlobalSuccession`](@ref) is the `m = 0` case: a
-competitor strictly beating the current variant unseats it.
-
-Note this concerns *fixed points* only, not the full dynamics — a rule may be
-a threshold rule for consistency yet have basins that still need its own
-[`succession_step`](@ref) (e.g. sequential/Gauss–Seidel updates).
-"""
-fixed_point_margin(::SuccessionRule) = nothing
-fixed_point_margin(::GlobalSuccession) = 0
-
-# ─── Succession ─────────────────────────────────────────────────────────────
 
 """
     succession_step(cib, u) -> Vector{Int}
     succession_step(rule, cib, u) -> Vector{Int}
 
-One step of succession under `rule` (default [`GlobalSuccession`](@ref)).
-For global succession, each descriptor independently picks the variant with
-the highest impact score given the current scenario; ties favour the current
-variant, then the lowest index.
+One step of succession under `rule`.
 """
-succession_step(cib::CIB, u::Vector{Int}) = succession_step(GlobalSuccession(), cib, u)
-
-function succession_step(::GlobalSuccession, cib::CIB, u::Vector{Int})
-    ib = impact_balance(cib, u)
-    v = copy(u)
+function succession_step(::StandardSuccession, cib::CIB, scenario::Vector{Int})
+    impactBalance = impact_balance(cib, scenario)
+    successor = copy(scenario)
     start = 1  # 1-based index into ib
-    for i in 1:cib.ndesc
-        nv = cib.nvariants[i]
-        stop = start + nv - 1
-        ib_desc = @view ib[start:stop]
-        max_val = ib_desc[u[i] + 1]  # current variant's score (+1 for 1-based)
-        for j in 0:nv-1
+    for i in 1:cib.numberOfDescriptors
+        noOfVariants = cib.numberOfVariants[i]
+        stop = start + noOfVariants - 1
+        ib_desc = @view impactBalance[start:stop]
+        max_val = ib_desc[scenario[i] + 1]  # current variant's score (+1 for 1-based)
+        for j in 0:noOfVariants-1
             if ib_desc[j + 1] > max_val  # strict >, so ties keep current/lower index
                 max_val = ib_desc[j + 1]
-                v[i] = j
+                successor[i] = j
             end
         end
         start = stop + 1
     end
-    return v
+    return successor
 end
 
-function succession_step(::SequentialSuccession, cib::CIB, u::Vector{Int})
-    v = copy(u)
-    @inbounds for i in 1:cib.ndesc
-        ib = impact_balance(cib, v)     # recomputed from the partially-updated v
-        off = cib.desc_offsets[i]
-        nv = cib.nvariants[i]
-        max_val = ib[off + v[i] + 1]    # current variant's score (favour on ties)
-        for j in 0:nv-1
-            if ib[off + j + 1] > max_val
-                max_val = ib[off + j + 1]
-                v[i] = j
+function succession_step(::SequentialSuccession, cib::CIB, scenario::Vector{Int})
+    successor = copy(scenario)
+    @inbounds for i in 1:cib.numberOfDescriptors
+        impactBalance = impact_balance(cib, successor)     # recomputed from the partially-updated v
+        offset = cib.desc_offsets[i]
+        noOfvariants = cib.numberOfVariants[i]
+        max_val = impactBalance[offset + successor[i] + 1]    # current variant's score (favour on ties)
+        for j in 0:noOfvariants-1
+            if impactBalance[offset + j + 1] > max_val
+                max_val = impactBalance[offset + j + 1]
+                successor[i] = j
             end
         end
     end
-    return v
+    return successor
 end
 
+#endregion
+
+#region "─── Find consistent scenarios ──────────────────────────────────────────────"
+
 """
-    succession(cib, u) -> (cycle_length, attractor)
-    succession(rule, cib, u) -> (cycle_length, attractor)
+    fixed_point_margin(rule) -> Union{Nothing,Int}
 
-Follow succession under `rule` (default [`GlobalSuccession`](@ref)) from
-scenario `u` until convergence to a fixed point or detection of a cycle.
-Returns (cycle_length, final_scenario). cycle_length=1 means a consistent
-scenario (fixed point).
-
-Cycle detection uses an O(1)-per-step hashtable, so total work is linear in
-the trajectory length.
+a standard fixed point or consistent scenario is one where the scenario cannot be improved by choosing a different variant.
+by setting the fixed_point_margin, you can change this to "cannot be improved... by at least the margin". This reflects the fact that social systems have some intertia or reistance to change and so may not shift for a relatively small improvement.
+fixed_point_margin=0 gives the standard behaviour
 """
-succession(cib::CIB, u::Vector{Int}) = succession(GlobalSuccession(), cib, u)
-
-function succession(rule::SuccessionRule, cib::CIB, u::Vector{Int})
-    start_sig = signature(cib, u)
-    history_sig = Int[start_sig]
-    seen = Dict{Int,Int}()  # signature -> 1-based position in history_sig
-    seen[start_sig] = 1
-    v = copy(u)
-    while true
-        v = succession_step(rule, cib, v)
-        v_sig = signature(cib, v)
-        if haskey(seen, v_sig)
-            cycle_len = length(history_sig) - seen[v_sig] + 1
-            return (cycle_len, v)
-        end
-        push!(history_sig, v_sig)
-        seen[v_sig] = length(history_sig)
-    end
-end
-
-# ─── Find consistent scenarios ──────────────────────────────────────────────
+fixed_point_margin(::SuccessionRule) = nothing
+fixed_point_margin(::StandardSuccession) = 0
 
 """
     find_consistent(cib; rule=GlobalSuccession(), algorithm=:auto,
                     bnb_node_budget=nothing) -> Vector{Vector{Int}}
 
-Find every consistent scenario — every fixed point of the succession map under
-`rule` — by exhaustively searching the whole scenario space with all available
-threads (start Julia with `julia -t auto`).
+Find every consistent scenario — every fixed point of the succession map.
 
-`rule` selects the succession *dynamics* ([`SuccessionRule`](@ref); default
-[`GlobalSuccession`](@ref)). A rule that declares a [`fixed_point_margin`](@ref)
-— including the default `GlobalSuccession` (`m = 0`) and any threshold/inertial
-rule — uses the fast sweep / branch-and-bound kernel; any other rule uses a
-generic ascending-signature scan.
+`rule` selects the succession *dynamics* ([`SuccessionRule`](@ref); default [`GlobalSuccession`](@ref)).
 
-`algorithm` selects the search strategy (only for rules with a
-[`fixed_point_margin`](@ref)):
+`algorithm` selects the search strategy (only for rules with a [`fixed_point_margin`](@ref)):
 - `:sweep` — enumerate every scenario with the incremental odometer sweep.
-- `:bnb`   — branch-and-bound: assign descriptors depth-first and prune
-  subtrees that provably contain no fixed point.
-  Exact — returns the identical kernel — and typically visits a small
-  fraction of the space on strongly-coupled matrices.
-- `:auto`  (default) — the sweep for small spaces (< 10^5 scenarios),
-  otherwise branch-and-bound with a node budget of `n ÷ 16`; if pruning is
-  too weak to pay off, the budget trips and the sweep runs instead.
+- `:bnb`   — branch-and-bound: assign descriptors depth-first and prune subtrees that provably contain no fixed point. Exact — returns the identical kernel — and typically visits a small fraction of the space on strongly-coupled matrices.
+- `:auto`  (default) — the sweep for small spaces (< 10^5 scenarios), otherwise branch-and-bound with a node budget of `n ÷ 16`; if pruning is too weak to pay off, the budget trips and the sweep runs instead.
 
 The returned kernel is ordered by ascending signature.
 """
-function find_consistent(cib::CIB; rule::SuccessionRule=GlobalSuccession(),
+function find_consistent(cib::CIB; rule::SuccessionRule=StandardSuccession(),
                          algorithm::Symbol=:auto,
                          bnb_node_budget::Union{Nothing,Int}=nothing)
+
     return _exhaustive_kernel(rule, cib; algorithm=algorithm,
                               bnb_node_budget=bnb_node_budget)
 end
@@ -457,12 +361,7 @@ end
 """
     _exhaustive_kernel(rule, cib; algorithm, bnb_node_budget)
 
-Exhaustive fixed-point search under `rule`. A rule that declares a
-[`fixed_point_margin`](@ref) gets the fast threaded sweep / branch-and-bound —
-the margin parameterises the per-descriptor fixed-point test, so both paths
-serve global succession (`m = 0`), inertial/threshold rules (`m > 0`) and any
-other rule with the same separable structure. A rule with no margin falls back
-to a generic ascending-signature scan that tests `succession_step(rule, u) == u`.
+Exhaustive fixed-point search under `rule`. A rule that declares a [`fixed_point_margin`](@ref) gets the fast threaded sweep / branch-and-bound — the margin parameterises the per-descriptor fixed-point test, so both paths serve global succession (`m = 0`), inertial/threshold rules (`m > 0`) and any other rule with the same separable structure. A rule with no margin falls back to a generic ascending-signature scan that tests `succession_step(rule, u) == u`.
 """
 function _exhaustive_kernel(rule::SuccessionRule, cib::CIB; algorithm::Symbol=:auto,
                             bnb_node_budget::Union{Nothing,Int}=nothing)
@@ -471,6 +370,7 @@ function _exhaustive_kernel(rule::SuccessionRule, cib::CIB; algorithm::Symbol=:a
         # Generic fallback: enumerate the whole space in ascending-signature
         # order and keep the scenarios that are their own successor. Single-
         # threaded O(n) correctness baseline for a rule with no separable path.
+        # does NOT fire for the standard succession rule since that has margin ===0
         algorithm === :auto || throw(ArgumentError(
             "algorithm=$(repr(algorithm)) needs a rule with a fixed_point_margin; " *
             "this rule uses the generic scan (algorithm=:auto)"))
@@ -486,7 +386,7 @@ function _exhaustive_kernel(rule::SuccessionRule, cib::CIB; algorithm::Symbol=:a
         throw(ArgumentError("algorithm must be :auto, :bnb or :sweep, got $(repr(algorithm))"))
     n = max_signature(cib) + 1
     if algorithm == :sweep || (algorithm == :auto && n < 100_000)
-        return _find_consistent_exhaustive(cib; margin=margin)
+        return _find_consistent_exhaustive(cib; margin=margin) #note this doesn't depend on the RULE
     end
     sufmin, sufmax = _bnb_bounds(cib)
     budget = something(bnb_node_budget,
@@ -507,46 +407,36 @@ only protection), otherwise `Int`. Realistic CIB matrices (entries ±3)
 are far inside the Int16 bound.
 """
 function _score_type(cib::CIB)
-    maxabs = cib.ndim == 0 ? 0 : Int(maximum(abs, cib.cim))
-    return 4 * (cib.ndesc + 1) * maxabs <= Int(typemax(Int16)) ? Int16 : Int
+    maxabs = cib.numberOfDimensions == 0 ? 0 : Int(maximum(abs, cib.cim))
+    return 4 * (cib.numberOfDescriptors + 1) * maxabs <= Int(typemax(Int16)) ? Int16 : Int
 end
+#TODO: should really be a property of the CIB not computed multiple times
 
 """
     _find_consistent_exhaustive(cib) -> Vector{Vector{Int}}
 
-Internal threaded exhaustive search. Splits the signature space into
-`16 × Threads.nthreads()` contiguous chunks scheduled as tasks (early-exit
-cost varies across the space, so fine-grained chunks load-balance better
-than one block per thread). Within a chunk, the impact-balance vector is
-maintained *incrementally*: a mixed-radix odometer advances the scenario,
-and each digit change updates the balance by the difference of two CIM
-rows (a `@simd` loop over the narrowed transpose from [`_score_type`](@ref)),
-so no per-scenario score recomputation happens at all. The fixed-point
-check is then a per-descriptor comparison over the balance vector with
-early exit.
+Splits the scenario space into contiguous chunks scheduled as tasks. Within a chunk, the impact-balance vector is maintained *incrementally*: a mixed-radix odometer advances the scenario, and each digit change updates the balance by the difference of two CIM rows (a `@simd` loop over the narrowed transpose from [`_score_type`](@ref)), so no per-scenario score recomputation happens at all. 
 
-The returned kernel is ordered by ascending signature. Only true fixed points
-(cycle length 1) are emitted, so non-fixed-point cycles never appear.
 """
 function _find_consistent_exhaustive(cib::CIB; margin::Int=0)
     T = _score_type(cib)
     return _sweep_fixed_points(cib, Matrix{T}(cib.cim_t); margin=margin)
 end
 
-function _sweep_fixed_points(cib::CIB, cimT::Matrix{T}; margin::Int=0) where {T<:Signed}
+function _sweep_fixed_points(cib::CIB, cimT::Matrix{T}; margin::Int=0) where {T<:Signed} #score has to have +- so T must be Signed
     n = max_signature(cib) + 1
     nchunks = max(1, min(n, 16 * Threads.nthreads()))
     chunk_size = cld(n, nchunks)
     nchunks = cld(n, chunk_size)
 
     results = [Vector{Vector{Int}}() for _ in 1:nchunks]
-    @sync for c in 1:nchunks
+    @sync for c in 1:nchunks #run all chunks and wait for them all to finish before proceeding
         out = results[c]
         first_sig = (c - 1) * chunk_size
         last_sig = min(c * chunk_size, n) - 1
         Threads.@spawn _sweep_chunk!(out, cimT, first_sig, last_sig,
-                                     cib.nvariants, cib.desc_offsets,
-                                     cib.ndesc, cib.ndim, margin)
+                                     cib.numberOfVariants, cib.desc_offsets,
+                                     cib.numberOfDescriptors, cib.numberOfDimensions, margin)
     end
 
     # Chunks cover ascending contiguous signature ranges; merging in chunk
@@ -589,14 +479,14 @@ function _sweep_chunk!(out::Vector{Vector{Int}}, cimT::Matrix{T},
             off = offsets[i]
             curm = ib[off + v[i] + 1] + margin   # unseated only by a variant beating this
             for j in 1:nvariants[i]
-                if ib[off + j] > curm   # strict >: ties / within-margin keep the current variant
+                if ib[off + j] > curm   # strict >: ties / within-margin keep the current variant. 
                     fixed = false
-                    break
+                    break #we've found a descriptor where there's a variant that is better. so we already know this isn't a consistent scenario
                 end
             end
             fixed || break
         end
-        fixed && push!(out, copy(v))
+        fixed && push!(out, copy(v)) #if this is a fixed point, store it
 
         # ── Odometer increment with fused row-delta ib update ──
         if sig < last_sig
@@ -625,262 +515,26 @@ function _sweep_chunk!(out::Vector{Vector{Int}}, cimT::Matrix{T},
     return out
 end
 
-# ─── Branch-and-bound exhaustive search ─────────────────────────────────────
+#endregion
+
+#region "basins"
+"""
+Exhaustive basin-of-attraction analysis under `rule` (default [`GlobalSuccession`](@ref)). Follows the succession chain from every scenario in the space, counting how many starting points converge to each fixed point/ consistent scenario.
+
+This runs in two phases: a threaded sweep fills a flat successor table (every scenario's succession step, computed once via an incrementally maintained impact balance), then a sequential resolution pass walks the table with path compression so each scenario is resolved exactly once. Memory is ~8n bytes for the two flat tables (Int32 entries when the space fits, Int64 otherwise), independent of the thread count.
+For example, the first phase works out that scenario A maps to B, B maps to C, and C maps to D which is a consistent scenario. Therefore, A, B, C and D are all in D's basin and the second phase works this out.
 
 """
-    _bnb_bounds(cib) -> (sufmin, sufmax)
 
-Suffix score bounds for branch-and-bound. `sufmin[k, c]` / `sufmax[k, c]`
-is the minimum / maximum total contribution descriptors `k..ndesc` can make
-to the impact score of flat variant column `c` over all choices of their
-variants. Row `ndesc + 1` is zero, so once descriptors `1..k` are assigned,
-`sufmin[k+1, c]`..`sufmax[k+1, c]` brackets what the still-free descriptors
-can add to column `c`.
-"""
-function _bnb_bounds(cib::CIB)
-    ndesc, ndim = cib.ndesc, cib.ndim
-    cim_t = cib.cim_t
-    sufmin = zeros(Int, ndesc + 1, ndim)
-    sufmax = zeros(Int, ndesc + 1, ndim)
-    @inbounds for k in ndesc:-1:1
-        off = cib.desc_offsets[k]
-        nv = cib.nvariants[k]
-        for c in 1:ndim
-            mn = typemax(Int)
-            mx = typemin(Int)
-            for s in 0:nv-1
-                val = Int(cim_t[c, off + s + 1])   # = cim[row of variant s, c]
-                mn = ifelse(val < mn, val, mn)
-                mx = ifelse(val > mx, val, mx)
-            end
-            sufmin[k, c] = sufmin[k + 1, c] + mn
-            sufmax[k, c] = sufmax[k + 1, c] + mx
-        end
-    end
-    return sufmin, sufmax
-end
-
-# Per-task DFS state. `p` is the running prefix impact balance (exact
-# contribution of the assigned descriptors to every column); `v` the current
-# partial assignment. `total`/`abort`/`budget` are shared across tasks.
-struct _BnBState
-    cim_t::Matrix{Int}
-    sufmin::Matrix{Int}
-    sufmax::Matrix{Int}
-    nvariants::Vector{Int}
-    offsets::Vector{Int}
-    ndesc::Int
-    ndim::Int
-    v::Vector{Int}
-    p::Vector{Int}
-    out::Vector{Vector{Int}}
-    nodes::Base.RefValue{Int}
-    total::Threads.Atomic{Int}
-    abort::Threads.Atomic{Bool}
-    budget::Int
-    margin::Int
-end
-
-"""
-    _bnb_pruned(st, k) -> Bool
-
-With descriptors `1..k` assigned, decide whether the current subtree can be
-discarded: true iff some assigned descriptor `j` has a competitor variant
-whose *worst-case* completed score still exceeds the chosen variant's
-*best-case* completed score by more than the rule's `margin` — then every
-completion fails the fixed-point test at `j`. Ties (and gaps within the
-margin) never prune, matching the favour-current convention, and at
-`k == ndesc` the suffix bounds are zero, so this condition IS the exact
-margin fixed-point predicate on the full scenario (`margin = 0` recovers
-plain global consistency).
-"""
-function _bnb_pruned(st::_BnBState, k::Int)
-    p = st.p
-    sufmin = st.sufmin
-    sufmax = st.sufmax
-    kk = k + 1
-    @inbounds for j in 1:k
-        off = st.offsets[j]
-        cs = off + st.v[j] + 1
-        best_cur = p[cs] + sufmax[kk, cs] + st.margin
-        for c in off+1:off+st.nvariants[j]
-            if p[c] + sufmin[kk, c] > best_cur
-                return true
-            end
-        end
-    end
-    return false
-end
-
-# Charge one visited node against the shared budget (flushed every 256).
-# Returns false when the budget has tripped and the search must abort.
-function _bnb_charge!(st::_BnBState)
-    st.nodes[] += 1
-    if st.nodes[] >= 256
-        Threads.atomic_add!(st.total, st.nodes[])
-        st.nodes[] = 0
-        if st.total[] > st.budget || st.abort[]
-            st.abort[] = true
-            return false
-        end
-    end
-    return true
-end
-
-# Depth-first over variants of descriptor k. Returns false on abort.
-function _bnb_node!(st::_BnBState, k::Int)
-    nv = st.nvariants[k]
-    off = st.offsets[k]
-    p = st.p
-    cim_t = st.cim_t
-    ndim = st.ndim
-    @inbounds for s in 0:nv-1
-        col = off + s + 1
-        @simd for j in 1:ndim          # push chosen row onto the prefix
-            p[j] += cim_t[j, col]
-        end
-        st.v[k] = s
-        ok = _bnb_charge!(st)
-        if ok && !_bnb_pruned(st, k)
-            if k == st.ndesc
-                push!(st.out, copy(st.v))
-            else
-                ok = _bnb_node!(st, k + 1)
-            end
-        end
-        @simd for j in 1:ndim          # pop
-            p[j] -= cim_t[j, col]
-        end
-        ok || return false
-    end
-    return true
-end
-
-"""
-    _bnb_fixed_points(cib, sufmin, sufmax; node_budget)
-        -> (Union{Nothing, Vector{Vector{Int}}}, nodes_visited)
-
-Threaded branch-and-bound search for all fixed points. Subtrees are fanned
-out as tasks over the assignments of the first `L` descriptors (chosen so
-the task count comfortably exceeds the thread count). The first element is
-`nothing` if the visited-node budget trips (pruning too weak to beat the
-sweep), else the complete kernel sorted by ascending signature; the second
-is the number of tree nodes visited (partial scenarios expanded).
-"""
-function _bnb_fixed_points(cib::CIB, sufmin::Matrix{Int}, sufmax::Matrix{Int};
-                           node_budget::Int, margin::Int=0)
-    ndesc = cib.ndesc
-    nvariants = cib.nvariants
-    offsets = cib.desc_offsets
-    ndim = cib.ndim
-    cim_t = cib.cim_t
-
-    # Prefix depth: enough top-level assignments to keep every thread busy.
-    L = 0
-    nprefix = 1
-    while L < ndesc && nprefix < 4 * Threads.nthreads()
-        L += 1
-        nprefix *= nvariants[L]
-    end
-
-    total = Threads.Atomic{Int}(0)
-    abort = Threads.Atomic{Bool}(false)
-    outs = [Vector{Vector{Int}}() for _ in 1:nprefix]
-
-    @sync for pid in 0:nprefix-1
-        out = outs[pid + 1]
-        Threads.@spawn begin
-            st = _BnBState(cim_t, sufmin, sufmax, nvariants, offsets,
-                           ndesc, ndim, zeros(Int, ndesc), zeros(Int, ndim),
-                           out, Ref(0), total, abort, node_budget, margin)
-            # Build the prefix, checking the prune at every level so a
-            # subtree dead at depth i < L is skipped without descending.
-            s = pid
-            alive = true
-            @inbounds for i in 1:L
-                st.v[i] = s % nvariants[i]
-                s = s ÷ nvariants[i]
-                col = offsets[i] + st.v[i] + 1
-                @simd for j in 1:ndim
-                    st.p[j] += cim_t[j, col]
-                end
-                alive = _bnb_charge!(st) && !_bnb_pruned(st, i)
-                alive || break
-            end
-            if alive
-                if L == ndesc
-                    push!(out, copy(st.v))   # surviving depth-ndesc prune == fixed point
-                else
-                    _bnb_node!(st, L + 1)
-                end
-            end
-            Threads.atomic_add!(total, st.nodes[])   # flush residual node count
-        end
-    end
-
-    abort[] && return (nothing, total[])
-    kern = Vector{Vector{Int}}()
-    for out in outs
-        append!(kern, out)
-    end
-    sort!(kern; by = u -> signature(cib, u))
-    return (kern, total[])
-end
-
-"""
-    find_basins(cib; rule=GlobalSuccession()) -> (fixed_points, basin_sizes, cycle_count)
-
-Exhaustive basin-of-attraction analysis under `rule` (default
-[`GlobalSuccession`](@ref)). Follows the succession chain from every scenario
-in the space, counting how many starting points converge to each fixed point.
-
-For [`GlobalSuccession`](@ref) this runs in two phases: a threaded sweep fills
-a flat successor table (every scenario's succession step, computed once via an
-incrementally maintained impact balance), then a sequential resolution pass
-walks the table with path compression so each scenario is resolved exactly
-once. Memory is ~8n bytes for the two flat tables (Int32 entries when the
-space fits, Int64 otherwise), independent of the thread count. Any other rule
-fills the same successor table one step at a time (still threaded, disjoint
-writes) and reuses the identical resolver — so the result semantics are
-identical to the fast path, only the table fill differs.
-
-Returns:
-- `fixed_points`: Vector of fixed-point scenarios (0-based variant indices),
-  ordered by ascending signature
-- `basin_sizes`:  corresponding basin sizes (same order as `fixed_points`)
-- `cycle_count`:  number of scenarios that fall into non-fixed-point cycles
-  (including scenarios whose chain merely leads into a cycle)
-"""
-function find_basins(cib::CIB; rule::SuccessionRule=GlobalSuccession())
-    return _basins(rule, cib)
-end
-
-function _basins(::GlobalSuccession, cib::CIB)
-    n = max_signature(cib) + 1
-    T = _score_type(cib)
-    if n <= Int(typemax(Int32)) - 1
-        return _find_basins(cib, Int32, Matrix{T}(cib.cim_t))
-    end
-    return _find_basins(cib, Int64, Matrix{T}(cib.cim_t))
-end
-
-# Generic fallback: works for any rule. The successor of a scenario depends only
-# on that scenario (the dynamics is memoryless), so the successor table can be
-# filled one step at a time with disjoint, threaded writes — then handed to the
-# very same path-compressed resolver the fast GlobalSuccession path uses. Only
-# the table *fill* is rule-specific; resolution is shared, so semantics (into-
-# cycle starts counted, not assigned to any basin) and ascending-signature
-# ordering are identical to the fast path by construction. A rule may still
-# override `_basins` with a faster fill of its own, but never needs to.
-function _basins(rule::SuccessionRule, cib::CIB)
+function find_basins(rule::SuccessionRule, cib::CIB)
     n = max_signature(cib) + 1
     if n <= Int(typemax(Int32)) - 1
-        return _generic_basins(rule, cib, Int32)
+        return _basins(rule, cib, Int32)
     end
-    return _generic_basins(rule, cib, Int64)
+    return _basins(rule, cib, Int64)
 end
 
-function _generic_basins(rule::SuccessionRule, cib::CIB,
+function _basins(rule::SuccessionRule, cib::CIB,
                          ::Type{S}) where {S<:Union{Int32,Int64}}
     n = max_signature(cib) + 1
     succ = Vector{S}(undef, n)
@@ -901,45 +555,34 @@ function _generic_basins(rule::SuccessionRule, cib::CIB,
     return (fixed_points, sizes, cycle_count)
 end
 
-function _find_basins(cib::CIB, ::Type{S}, cimT::Matrix{T}) where {S<:Union{Int32,Int64}, T<:Signed}
-    n = max_signature(cib) + 1
-    succ = Vector{S}(undef, n)
-    _successor_table!(succ, cib, cimT)
-    fp_sigs, sizes, cycle_count = _resolve_and_tally(succ, n)
-    kern = [inv_signature(cib, fp) for fp in fp_sigs]
-    return kern, sizes, cycle_count
-end
-
 """
     _successor_table!(succ, cib, cimT) -> succ
 
 Fill `succ[sig + 1]` with the succession-step signature of every scenario.
-Threaded over contiguous chunks (disjoint writes); each chunk advances a
-mixed-radix odometer and maintains the impact balance incrementally, then
-takes the per-descriptor argmax (ties favor the current variant, then the
-lowest index — identical to [`succession_step`](@ref)).
+Threaded over contiguous chunks (disjoint writes); each chunk advances a mixed-radix odometer and maintains the impact balance incrementally, then takes the per-descriptor argmax (ties favor the current variant, then the lowest index — identical to [`succession_step`](@ref)).
 """
+
 function _successor_table!(succ::Vector{S}, cib::CIB, cimT::Matrix{T}) where {S,T}
     n = max_signature(cib) + 1
-    orders = Vector{Int}(undef, cib.ndesc)   # mixed-radix place values
+    orders = Vector{Int}(undef, cib.numberOfDescriptors)   # mixed-radix place values
     o = 1
-    for i in 1:cib.ndesc
+    for i in 1:cib.numberOfDescriptors
         orders[i] = o
-        o *= cib.nvariants[i]
+        o *= cib.numberOfVariants[i]
     end
 
     nchunks = max(1, min(n, 16 * Threads.nthreads()))
     chunk_size = cld(n, nchunks)
     nchunks = cld(n, chunk_size)
-    if S === Int32 && T === Int16 && cib.ndim > 0
+    if S === Int32 && T === Int16 && cib.numberOfDimensions > 0
         # SIMD fast path: variant-major tiled argmax (identical output).
-        lay = _vm_layout(cib.nvariants, cib.desc_offsets, orders, cimT)
+        lay = _vm_layout(cib.numberOfVariants, cib.desc_offsets, orders, cimT)
         @sync for c in 1:nchunks
             first_sig = (c - 1) * chunk_size
             last_sig = min(c * chunk_size, n) - 1
             Threads.@spawn _successor_chunk_vm!(succ, lay, first_sig, last_sig,
-                                                cib.nvariants, cib.desc_offsets,
-                                                cib.ndesc, cib.ndim)
+                                                cib.numberOfVariants, cib.desc_offsets,
+                                                cib.numberOfDescriptors, cib.numberOfDimensions)
         end
         return succ
     end
@@ -947,8 +590,8 @@ function _successor_table!(succ::Vector{S}, cib::CIB, cimT::Matrix{T}) where {S,
         first_sig = (c - 1) * chunk_size
         last_sig = min(c * chunk_size, n) - 1
         Threads.@spawn _successor_chunk!(succ, cimT, first_sig, last_sig,
-                                         cib.nvariants, cib.desc_offsets,
-                                         orders, cib.ndesc, cib.ndim)
+                                         cib.numberOfVariants, cib.desc_offsets,
+                                         orders, cib.numberOfDescriptors, cib.numberOfDimensions)
     end
     return succ
 end
@@ -1314,5 +957,204 @@ function _resolve_and_tally(succ::Vector{S}, n::Int) where {S}
     perm = sortperm(fp_sig_by_id)
     return fp_sig_by_id[perm], total[perm], sum(local_cyc)
 end
+
+#region "IN DEVELOPMENT: ─── Branch-and-bound exhaustive search ─────────────────────────────────────"
+
+"""
+    _bnb_bounds(cib) -> (sufmin, sufmax)
+
+Suffix score bounds for branch-and-bound. `sufmin[k, c]` / `sufmax[k, c]` is the minimum / maximum total contribution descriptors `k..ndesc` can make to the impact score of flat variant column `c` over all choices of their variants. Row `ndesc + 1` is zero, so once descriptors `1..k` are assigned, `sufmin[k+1, c]`..`sufmax[k+1, c]` brackets what the still-free descriptors can add to column `c`.
+"""
+function _bnb_bounds(cib::CIB)
+    ndesc, ndim = cib.numberOfDescriptors, cib.numberOfDimensions
+    cim_t = cib.cim_t
+    sufmin = zeros(Int, ndesc + 1, ndim)
+    sufmax = zeros(Int, ndesc + 1, ndim)
+    @inbounds for k in ndesc:-1:1
+        off = cib.desc_offsets[k]
+        nv = cib.numberOfVariants[k]
+        for c in 1:ndim
+            mn = typemax(Int)
+            mx = typemin(Int)
+            for s in 0:nv-1
+                val = Int(cim_t[c, off + s + 1])   # = cim[row of variant s, c]
+                mn = ifelse(val < mn, val, mn)
+                mx = ifelse(val > mx, val, mx)
+            end
+            sufmin[k, c] = sufmin[k + 1, c] + mn
+            sufmax[k, c] = sufmax[k + 1, c] + mx
+        end
+    end
+    return sufmin, sufmax
+end
+
+# Per-task DFS state. `p` is the running prefix impact balance (exact
+# contribution of the assigned descriptors to every column); `v` the current
+# partial assignment. `total`/`abort`/`budget` are shared across tasks.
+struct _BnBState
+    cim_t::Matrix{Int}
+    sufmin::Matrix{Int}
+    sufmax::Matrix{Int}
+    nvariants::Vector{Int}
+    offsets::Vector{Int}
+    ndesc::Int
+    ndim::Int
+    v::Vector{Int}
+    p::Vector{Int}
+    out::Vector{Vector{Int}}
+    nodes::Base.RefValue{Int}
+    total::Threads.Atomic{Int}
+    abort::Threads.Atomic{Bool}
+    budget::Int
+    margin::Int
+end
+
+"""
+    _bnb_pruned(st, k) -> Bool
+
+With descriptors `1..k` assigned, decide whether the current subtree can be
+discarded: true iff some assigned descriptor `j` has a competitor variant
+whose *worst-case* completed score still exceeds the chosen variant's
+*best-case* completed score by more than the rule's `margin` — then every
+completion fails the fixed-point test at `j`. Ties (and gaps within the
+margin) never prune, matching the favour-current convention, and at
+`k == ndesc` the suffix bounds are zero, so this condition IS the exact
+margin fixed-point predicate on the full scenario (`margin = 0` recovers
+plain global consistency).
+"""
+function _bnb_pruned(st::_BnBState, k::Int)
+    p = st.p
+    sufmin = st.sufmin
+    sufmax = st.sufmax
+    kk = k + 1
+    @inbounds for j in 1:k
+        off = st.offsets[j]
+        cs = off + st.v[j] + 1
+        best_cur = p[cs] + sufmax[kk, cs] + st.margin
+        for c in off+1:off+st.nvariants[j]
+            if p[c] + sufmin[kk, c] > best_cur
+                return true
+            end
+        end
+    end
+    return false
+end
+
+# Charge one visited node against the shared budget (flushed every 256).
+# Returns false when the budget has tripped and the search must abort.
+function _bnb_charge!(st::_BnBState)
+    st.nodes[] += 1
+    if st.nodes[] >= 256
+        Threads.atomic_add!(st.total, st.nodes[])
+        st.nodes[] = 0
+        if st.total[] > st.budget || st.abort[]
+            st.abort[] = true
+            return false
+        end
+    end
+    return true
+end
+
+# Depth-first over variants of descriptor k. Returns false on abort.
+function _bnb_node!(st::_BnBState, k::Int)
+    nv = st.nvariants[k]
+    off = st.offsets[k]
+    p = st.p
+    cim_t = st.cim_t
+    ndim = st.ndim
+    @inbounds for s in 0:nv-1
+        col = off + s + 1
+        @simd for j in 1:ndim          # push chosen row onto the prefix
+            p[j] += cim_t[j, col]
+        end
+        st.v[k] = s
+        ok = _bnb_charge!(st)
+        if ok && !_bnb_pruned(st, k)
+            if k == st.ndesc
+                push!(st.out, copy(st.v))
+            else
+                ok = _bnb_node!(st, k + 1)
+            end
+        end
+        @simd for j in 1:ndim          # pop
+            p[j] -= cim_t[j, col]
+        end
+        ok || return false
+    end
+    return true
+end
+
+"""
+    _bnb_fixed_points(cib, sufmin, sufmax; node_budget)
+        -> (Union{Nothing, Vector{Vector{Int}}}, nodes_visited)
+
+Threaded branch-and-bound search for all fixed points. Subtrees are fanned
+out as tasks over the assignments of the first `L` descriptors (chosen so
+the task count comfortably exceeds the thread count). The first element is
+`nothing` if the visited-node budget trips (pruning too weak to beat the
+sweep), else the complete kernel sorted by ascending signature; the second
+is the number of tree nodes visited (partial scenarios expanded).
+"""
+function _bnb_fixed_points(cib::CIB, sufmin::Matrix{Int}, sufmax::Matrix{Int};
+                           node_budget::Int, margin::Int=0)
+    ndesc = cib.numberOfDescriptors
+    nvariants = cib.numberOfVariants
+    offsets = cib.desc_offsets
+    ndim = cib.numberOfDimensions
+    cim_t = cib.cim_t
+
+    # Prefix depth: enough top-level assignments to keep every thread busy.
+    L = 0
+    nprefix = 1
+    while L < ndesc && nprefix < 4 * Threads.nthreads()
+        L += 1
+        nprefix *= nvariants[L]
+    end
+
+    total = Threads.Atomic{Int}(0)
+    abort = Threads.Atomic{Bool}(false)
+    outs = [Vector{Vector{Int}}() for _ in 1:nprefix]
+
+    @sync for pid in 0:nprefix-1
+        out = outs[pid + 1]
+        Threads.@spawn begin
+            st = _BnBState(cim_t, sufmin, sufmax, nvariants, offsets,
+                           ndesc, ndim, zeros(Int, ndesc), zeros(Int, ndim),
+                           out, Ref(0), total, abort, node_budget, margin)
+            # Build the prefix, checking the prune at every level so a
+            # subtree dead at depth i < L is skipped without descending.
+            s = pid
+            alive = true
+            @inbounds for i in 1:L
+                st.v[i] = s % nvariants[i]
+                s = s ÷ nvariants[i]
+                col = offsets[i] + st.v[i] + 1
+                @simd for j in 1:ndim
+                    st.p[j] += cim_t[j, col]
+                end
+                alive = _bnb_charge!(st) && !_bnb_pruned(st, i)
+                alive || break
+            end
+            if alive
+                if L == ndesc
+                    push!(out, copy(st.v))   # surviving depth-ndesc prune == fixed point
+                else
+                    _bnb_node!(st, L + 1)
+                end
+            end
+            Threads.atomic_add!(total, st.nodes[])   # flush residual node count
+        end
+    end
+
+    abort[] && return (nothing, total[])
+    kern = Vector{Vector{Int}}()
+    for out in outs
+        append!(kern, out)
+    end
+    sort!(kern; by = u -> signature(cib, u))
+    return (kern, total[])
+end
+
+#endregion
 
 end # module
