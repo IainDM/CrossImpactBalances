@@ -39,6 +39,57 @@ end
         @test cib.cim[10, 6] == 0
     end
 
+    # These two have no callers inside the engine — only the Python wrapper,
+    # the C API and external Julia callers use them — so nothing else in this
+    # suite would notice if they disappeared. They were in fact lost once, in
+    # a bad merge, and stayed missing for several commits. This testset exists
+    # so that cannot happen silently again.
+    @testset "set_impact! / get_impact (in-place matrix editing)" begin
+        cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"))
+
+        # Name form and 0-based index form must address the same cell.
+        @test get_impact(cib, "WTRD", "FT", "WSEC", "Alrt") == get_impact(cib, 0, 0, 1, 2)
+
+        original = get_impact(cib, "WTRD", "FT", "WSEC", "Alrt")
+        @test set_impact!(cib, "WTRD", "FT", "WSEC", "Alrt", original + 7) == original
+        @test get_impact(cib, "WTRD", "FT", "WSEC", "Alrt") == original + 7
+        @test get_impact(cib, 0, 0, 1, 2) == original + 7
+
+        # The transpose must stay in step with cim, or the scoring loops (which
+        # read cim_t) would silently disagree with the matrix.
+        s = CrossImpactBalances._table_index(cib, "WTRD", "FT")
+        t = CrossImpactBalances._table_index(cib, "WSEC", "Alrt")
+        @test cib.cim[s, t] == cib.cim_t[t, s] == original + 7
+
+        # An edit must change the analysis, not merely the stored matrix.
+        # Render scenarios by variant name so the assertions stay readable.
+        set_impact!(cib, "WTRD", "FT", "WSEC", "Alrt", original)     # back to pristine
+        as_names(u) = join([cib.variants[d][u[i] + 1]
+                            for (i, d) in enumerate(cib.descriptors)], "/")
+        baseline = [as_names(u) for u in find_consistent(cib)]
+        @test "FT/Mod/ModGr" in baseline
+
+        # Make FT push overwhelmingly towards Alrt. That must break exactly the
+        # one consistent scenario pairing WTRD=FT with WSEC=Mod — there, WSEC
+        # would now rather move to Alrt, so it is no longer a fixed point. The
+        # scenarios whose WTRD is not FT never feel the change, because the
+        # impact only applies when FT is the variant actually in play.
+        set_impact!(cib, "WTRD", "FT", "WSEC", "Alrt", 500)
+        edited = [as_names(u) for u in find_consistent(cib)]
+        @test "FT/Mod/ModGr" ∉ edited
+        @test edited == filter(!=("FT/Mod/ModGr"), baseline)
+
+        # Restoring the original value must restore the original kernel exactly.
+        set_impact!(cib, "WTRD", "FT", "WSEC", "Alrt", original)
+        @test [as_names(u) for u in find_consistent(cib)] == baseline
+
+        # Bad names and out-of-range indices are rejected, not silently mapped.
+        @test_throws ArgumentError get_impact(cib, "NoSuchDesc", "FT", "WSEC", "Alrt")
+        @test_throws ArgumentError get_impact(cib, "WTRD", "NoSuchVariant", "WSEC", "Alrt")
+        @test_throws ArgumentError get_impact(cib, 99, 0, 1, 2)
+        @test_throws ArgumentError get_impact(cib, 0, 99, 1, 2)
+    end
+
     @testset "Load .sl solutions" begin
         cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"),
                        sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))
