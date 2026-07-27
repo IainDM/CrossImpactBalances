@@ -23,9 +23,9 @@ end
         cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"),
                        sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))
 
-        @test cib.ndesc == 3
-        @test cib.nvariants == [3, 3, 4]
-        @test cib.ndim == 10
+        @test cib.numberOfDescriptors == 3
+        @test cib.numberOfVariants == [3, 3, 4]
+        @test cib.numberOfDimensions == 10
         @test length(cib.descriptors) == 3
         @test cib.descriptors == ["WTRD", "WSEC", "WECO"]
         @test cib.variants["WTRD"] == ["FT", "Ntl", "Mix"]
@@ -44,11 +44,11 @@ end
                        sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))
 
         # .sl file: "2 3 2", "3 1 3", "2 2 2", "1 2 3" -> 0-based
-        @test length(cib.kernel) == 4
-        @test cib.kernel[1] == [1, 2, 1]
-        @test cib.kernel[2] == [2, 0, 2]
-        @test cib.kernel[3] == [1, 1, 1]
-        @test cib.kernel[4] == [0, 1, 2]
+        @test length(cib.consistentScenarios) == 4
+        @test cib.consistentScenarios[1] == [1, 2, 1]
+        @test cib.consistentScenarios[2] == [2, 0, 2]
+        @test cib.consistentScenarios[3] == [1, 1, 1]
+        @test cib.consistentScenarios[4] == [0, 1, 2]
     end
 
     @testset "Signatures" begin
@@ -62,7 +62,7 @@ end
         @test signature(cib, [0, 1, 2]) == 21
 
         # Round-trip
-        for u in cib.kernel
+        for u in cib.consistentScenarios
             s = signature(cib, u)
             @test inv_signature(cib, s) == u
         end
@@ -84,7 +84,7 @@ end
                        sl_file=joinpath(SAMPLE_DIR, "CIB_global.sl"))
 
         # All kernel scenarios must be fixed points of succession
-        for u in cib.kernel
+        for u in cib.consistentScenarios
             v = succession_step(cib, u)
             @test v == u
         end
@@ -121,8 +121,8 @@ end
         cib_computed = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"))
 
         # Must find the same 4 consistent scenarios
-        loaded_sigs = sort([signature(cib_loaded, u) for u in cib_loaded.kernel])
-        computed_sigs = sort([signature(cib_computed, u) for u in cib_computed.kernel])
+        loaded_sigs = sort([signature(cib_loaded, u) for u in cib_loaded.consistentScenarios])
+        computed_sigs = sort([signature(cib_computed, u) for u in cib_computed.consistentScenarios])
         @test loaded_sigs == computed_sigs
         @test loaded_sigs == [13, 16, 20, 21]
     end
@@ -130,11 +130,11 @@ end
     @testset "Exhaustive search (small)" begin
         cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"))
 
-        sigs = sort([signature(cib, u) for u in cib.kernel])
+        sigs = sort([signature(cib, u) for u in cib.consistentScenarios])
         @test sigs == [13, 16, 20, 21]
 
         # Every result must be a true fixed point
-        for u in cib.kernel
+        for u in cib.consistentScenarios
             @test CrossImpactBalances.succession_step(cib, u) == u
         end
     end
@@ -177,9 +177,9 @@ end
 
         # Exhaustive: must find the 2 fixed points verified by Python
         cib = load_scw(scw)
-        sigs = sort([signature(cib, u) for u in cib.kernel])
+        sigs = sort([signature(cib, u) for u in cib.consistentScenarios])
         @test sigs == [13785, 13839]
-        for u in cib.kernel
+        for u in cib.consistentScenarios
             @test succession_step(cib, u) == u
         end
 
@@ -208,11 +208,11 @@ end
             cib_loaded   = load_scw(scw; sl_file=sl)
             cib_computed = load_scw(scw)
 
-            sigs_loaded   = sort([signature(cib_loaded, u) for u in cib_loaded.kernel])
-            sigs_computed = sort([signature(cib_computed, u) for u in cib_computed.kernel])
+            sigs_loaded   = sort([signature(cib_loaded, u) for u in cib_loaded.consistentScenarios])
+            sigs_computed = sort([signature(cib_computed, u) for u in cib_computed.consistentScenarios])
             @test sigs_loaded == sigs_computed
             # Every fixed point reported must actually be a fixed point
-            for u in cib_computed.kernel
+            for u in cib_computed.consistentScenarios
                 @test CrossImpactBalances.succession_step(cib_computed, u) == u
             end
         end
@@ -239,9 +239,9 @@ end
     @testset "load_scw with explicit kernel keyword" begin
         explicit = [[1, 2, 1], [0, 1, 2]]
         cib = load_scw(joinpath(SAMPLE_DIR, "CIB_global.scw"); kernel=explicit)
-        @test cib.kernel == explicit
+        @test cib.consistentScenarios == explicit
         # The kernel keyword overrides find_consistent: only the two we passed.
-        @test length(cib.kernel) == 2
+        @test length(cib.consistentScenarios) == 2
     end
 
     include("property_tests.jl")

@@ -1,19 +1,17 @@
 """
     CrossImpactBalances
 
-Cross-Impact Balance (CIB) scenario analysis. A Julia implementation of the methodology in Weimer-Jehle (2006), ported from the Python [sei-international/cibsa](https://github.com/sei-international/cibsa) library with a two-phase basin-of-attraction analysis, a threaded incremental exhaustive sweep, and an exact branch-and-bound search that prunes provably-inconsistent regions of the scenario space. The succession dynamics can be changed through []`SuccessionRule`](@ref). There is a default called 'GlobalSuccession`](@ref) which follows the standard ScenarioWizard rule.
+Cross-Impact Balance (CIB) scenario analysis. A Julia implementation of the methodology in Weimer-Jehle (2006), ported from the Python [sei-international/cibsa](https://github.com/sei-international/cibsa) library with a two-phase basin-of-attraction analysis, a threaded incremental exhaustive sweep, and an exact branch-and-bound search that prunes provably-inconsistent regions of the scenario space. The succession dynamics can be changed through [`SuccessionRule`](@ref). There is a default called [`GlobalSuccession`](@ref) which follows the standard ScenarioWizard rule.
 
 # Reference
 Weimer-Jehle, W. (2006). Cross-impact balances: A system-theoretical approach to cross-impact analysis. *Technological Forecasting and Social Change*, 73(4), 334–361.
 """
 module CrossImpactBalances
 
-using SIMD: Vec, vload, vifelse
-
 export CIB, load_scw, load_solutions,
        impact_balance,
-       SuccessionRule, StandardSuccession, 
-       succession_step, succession,
+       SuccessionRule, GlobalSuccession, SequentialSuccession,
+       succession_step,
        find_consistent, find_basins,
        signature, inv_signature, max_signature
 
@@ -263,7 +261,7 @@ and a single method
 
     succession_step(rule::MyRule, cib::CIB, u::Vector{Int}) -> Vector{Int}
 
-and every analysis routine — [`succession`](@ref), [`find_consistent`](@ref) and [`find_basins`](@ref) — works with it immediately. The only assumption is that SuccessionRule depends only on the current scenario, not the path to get there (in technical terms, it's a Markov process).
+and every analysis routine — [`find_consistent`](@ref) and [`find_basins`](@ref) — works with it immediately. The only assumption is that SuccessionRule depends only on the current scenario, not the path to get there (in technical terms, it's a Markov process).
 
 """
 abstract type SuccessionRule end
@@ -271,10 +269,12 @@ abstract type SuccessionRule end
 """
 The standard succession approach: in one step, every descriptor is moved to the variant with the highest impact score given the *current* scenario. Ties favour the current variant, then the lowest index.
 """
-struct StandardSuccession <: SuccessionRule end
+struct GlobalSuccession <: SuccessionRule end
 
 """
 Sequential (successive / Gauss–Seidel) succession: descriptors are updated one at a time in descriptor order, each using the impact balance of the scenario *as already partially updated within the same step*.
+
+Although its *trajectories* differ from [`GlobalSuccession`](@ref) (the successor of a non-fixed scenario depends on the update order), its *fixed points* are identical: at a scenario where no variant strictly beats the current one in `impact_balance(u)`, no descriptor ever fires, so the intermediate states never leave `u` — and conversely the first descriptor with a strict improver fires while the intermediate state is still `u`. It therefore declares [`fixed_point_margin`](@ref)` = 0` and shares the fast `find_consistent` searches. `find_basins` still uses the generic per-scenario path, because basins depend on the trajectories, not just the fixed points.
 """
 struct SequentialSuccession <: SuccessionRule end
 
@@ -284,7 +284,7 @@ struct SequentialSuccession <: SuccessionRule end
 
 One step of succession under `rule`.
 """
-function succession_step(::StandardSuccession, cib::CIB, scenario::Vector{Int})
+function succession_step(::GlobalSuccession, cib::CIB, scenario::Vector{Int})
     impactBalance = impact_balance(cib, scenario)
     successor = copy(scenario)
     start = 1  # 1-based index into ib
@@ -321,6 +321,10 @@ function succession_step(::SequentialSuccession, cib::CIB, scenario::Vector{Int}
     return successor
 end
 
+# Convenience: no rule given means the standard global rule.
+succession_step(cib::CIB, scenario::Vector{Int}) =
+    succession_step(GlobalSuccession(), cib, scenario)
+
 #endregion
 
 #region "─── Find consistent scenarios ──────────────────────────────────────────────"
@@ -333,7 +337,12 @@ by setting the fixed_point_margin, you can change this to "cannot be improved...
 fixed_point_margin=0 gives the standard behaviour
 """
 fixed_point_margin(::SuccessionRule) = nothing
-fixed_point_margin(::StandardSuccession) = 0
+fixed_point_margin(::GlobalSuccession) = 0
+# Sequential succession's fixed points coincide with global's (see the
+# SequentialSuccession docstring for the induction argument), so it may claim
+# the margin-0 fast searches. Verified against a from-scratch oracle in
+# test/property_tests.jl.
+fixed_point_margin(::SequentialSuccession) = 0
 
 """
     find_consistent(cib; rule=GlobalSuccession(), algorithm=:auto,
@@ -350,7 +359,7 @@ Find every consistent scenario — every fixed point of the succession map.
 
 The returned kernel is ordered by ascending signature.
 """
-function find_consistent(cib::CIB; rule::SuccessionRule=StandardSuccession(),
+function find_consistent(cib::CIB; rule::SuccessionRule=GlobalSuccession(),
                          algorithm::Symbol=:auto,
                          bnb_node_budget::Union{Nothing,Int}=nothing)
 
@@ -519,22 +528,53 @@ end
 
 #region "basins"
 """
+    find_basins(cib; rule=GlobalSuccession()) -> (fixed_points, basin_sizes, cycle_count)
+
 Exhaustive basin-of-attraction analysis under `rule` (default [`GlobalSuccession`](@ref)). Follows the succession chain from every scenario in the space, counting how many starting points converge to each fixed point/ consistent scenario.
 
-This runs in two phases: a threaded sweep fills a flat successor table (every scenario's succession step, computed once via an incrementally maintained impact balance), then a sequential resolution pass walks the table with path compression so each scenario is resolved exactly once. Memory is ~8n bytes for the two flat tables (Int32 entries when the space fits, Int64 otherwise), independent of the thread count.
+This runs in two phases: a threaded sweep fills a flat successor table (every scenario's succession step), then a resolution pass walks the table with path compression so each scenario is resolved exactly once. Memory is ~8n bytes for the two flat tables (Int32 entries when the space fits, Int64 otherwise), independent of the thread count.
 For example, the first phase works out that scenario A maps to B, B maps to C, and C maps to D which is a consistent scenario. Therefore, A, B, C and D are all in D's basin and the second phase works this out.
 
+The default [`GlobalSuccession`](@ref) rule takes a fast path: the successor table is filled by a mixed-radix odometer that maintains the impact balance incrementally (one row delta per scenario, no allocation) instead of calling [`succession_step`](@ref) per scenario. Any other rule uses the generic per-scenario path — identical output, just slower.
 """
-
-function find_basins(rule::SuccessionRule, cib::CIB)
-    n = max_signature(cib) + 1
-    if n <= Int(typemax(Int32)) - 1
-        return _basins(rule, cib, Int32)
-    end
-    return _basins(rule, cib, Int64)
+function find_basins(cib::CIB; rule::SuccessionRule=GlobalSuccession())
+    return _basins(rule, cib)
 end
 
-function _basins(rule::SuccessionRule, cib::CIB,
+# Fast path: global succession only. The odometer chunk re-derives the rule's
+# argmax semantics internally, which is exactly why this specialization cannot
+# serve an arbitrary rule.
+function _basins(::GlobalSuccession, cib::CIB)
+    n = max_signature(cib) + 1
+    T = _score_type(cib)
+    if n <= Int(typemax(Int32)) - 1
+        return _fast_basins(cib, Int32, Matrix{T}(cib.cim_t))
+    end
+    return _fast_basins(cib, Int64, Matrix{T}(cib.cim_t))
+end
+
+function _fast_basins(cib::CIB, ::Type{S},
+                      cimT::Matrix{T}) where {S<:Union{Int32,Int64}, T<:Signed}
+    n = max_signature(cib) + 1
+    succ = Vector{S}(undef, n)
+    _successor_table!(succ, cib, cimT)
+    fp_sigs, sizes, cycle_count = _resolve_and_tally(succ, n)
+    fixed_points = [inv_signature(cib, s) for s in fp_sigs]
+    return (fixed_points, sizes, cycle_count)
+end
+
+# Generic path: works for any rule, because it only ever calls the rule's own
+# succession_step. Allocates a few vectors per scenario, so it is much slower
+# than the odometer path — a correctness baseline, not a hot loop.
+function _basins(rule::SuccessionRule, cib::CIB)
+    n = max_signature(cib) + 1
+    if n <= Int(typemax(Int32)) - 1
+        return _generic_basins(rule, cib, Int32)
+    end
+    return _generic_basins(rule, cib, Int64)
+end
+
+function _generic_basins(rule::SuccessionRule, cib::CIB,
                          ::Type{S}) where {S<:Union{Int32,Int64}}
     n = max_signature(cib) + 1
     succ = Vector{S}(undef, n)
@@ -574,18 +614,6 @@ function _successor_table!(succ::Vector{S}, cib::CIB, cimT::Matrix{T}) where {S,
     nchunks = max(1, min(n, 16 * Threads.nthreads()))
     chunk_size = cld(n, nchunks)
     nchunks = cld(n, chunk_size)
-    if S === Int32 && T === Int16 && cib.numberOfDimensions > 0
-        # SIMD fast path: variant-major tiled argmax (identical output).
-        lay = _vm_layout(cib.numberOfVariants, cib.desc_offsets, orders, cimT)
-        @sync for c in 1:nchunks
-            first_sig = (c - 1) * chunk_size
-            last_sig = min(c * chunk_size, n) - 1
-            Threads.@spawn _successor_chunk_vm!(succ, lay, first_sig, last_sig,
-                                                cib.numberOfVariants, cib.desc_offsets,
-                                                cib.numberOfDescriptors, cib.numberOfDimensions)
-        end
-        return succ
-    end
     @sync for c in 1:nchunks
         first_sig = (c - 1) * chunk_size
         last_sig = min(c * chunk_size, n) - 1
@@ -655,164 +683,6 @@ function _successor_chunk!(succ::Vector{S}, cimT::Matrix{T},
                 rows[i] = rnew
                 @simd for j in 1:ndim
                     ib[j] += cimT[j, rnew] - cimT[j, rold]
-                end
-            end
-        end
-    end
-    return succ
-end
-
-# ─── SIMD successor chunk (Int16 scores, Int32 signatures) ──────────────────
-#
-# The scalar argmax above is the table build's hot spot (~60% of its time): a
-# data-dependent scan of 3-4 variants per descriptor that cannot vectorize.
-# This path restructures the impact-balance vector into *variant-major* order —
-# grouping descriptors by radix so that "variant j of every descriptor in the
-# group" is one contiguous plane — and then argmaxes 16 descriptors at once
-# with 256-bit integer SIMD. Semantics are identical to the scalar path (the
-# per-state successor table is byte-for-byte the same); only the evaluation
-# order changes.
-
-"""
-    _vm_layout(nvariants, offsets, orders, cimT) -> NamedTuple
-
-Build the variant-major layout for [`_successor_chunk_vm!`](@ref). Descriptors
-are grouped by radix; within a group the balance slots are reordered so plane
-`j` holds "variant `j` of each member descriptor" contiguously, and each group
-is split into 16-lane tiles. Returns:
-
-- `cimt_vm` — `cimT` with its slot axis permuted to variant-major (columns,
-  indexed by the odometer's descriptor-major `rows`, are untouched);
-- per-tile arrays `tile_r/tile_m/tile_base/tile_k0/tile_cur0` (radix, group
-  size = plane stride, group base slot, lane offset, current-variant buffer
-  offset);
-- `ordbuf` — 16 `Int32` mixed-radix place values per tile, zero in pad lanes
-  (pad lanes therefore contribute nothing to the signature);
-- `curpos_of` — where each descriptor's current variant lives in the per-worker
-  current-variant buffer (`ncur` entries).
-"""
-function _vm_layout(nvariants::Vector{Int}, offsets::Vector{Int},
-                    orders::Vector{Int}, cimT::Matrix{Int16})
-    ndesc = length(nvariants)
-    ndim = size(cimT, 1)
-    radixes = sort!(unique(nvariants))
-    dm_of_vm = Vector{Int}(undef, ndim)      # variant-major slot -> descriptor-major slot
-    curpos_of = zeros(Int, ndesc)
-    tile_r = Int[]; tile_m = Int[]; tile_base = Int[]; tile_k0 = Int[]; tile_cur0 = Int[]
-    ordbuf = Int32[]
-    base = 0
-    for r in radixes
-        members = [i for i in 1:ndesc if nvariants[i] == r]
-        m = length(members)
-        for j in 0:r-1, (k, i) in enumerate(members)
-            dm_of_vm[base + j*m + k] = offsets[i] + j + 1
-        end
-        for k0 in 0:16:m-1
-            lanes = min(16, m - k0)
-            push!(tile_r, r); push!(tile_m, m); push!(tile_base, base); push!(tile_k0, k0)
-            push!(tile_cur0, length(tile_r) * 16 - 15)     # 16 cur lanes per tile
-            for l in 1:16
-                push!(ordbuf, l <= lanes ? Int32(orders[members[k0 + l]]) : Int32(0))
-            end
-            for l in 1:lanes
-                curpos_of[members[k0 + l]] = (length(tile_r) - 1) * 16 + l
-            end
-        end
-        base += r * m
-    end
-    return (cimt_vm = cimT[dm_of_vm, :], ntiles = length(tile_r),
-            tile_r = tile_r, tile_m = tile_m, tile_base = tile_base,
-            tile_k0 = tile_k0, tile_cur0 = tile_cur0, ordbuf = ordbuf,
-            curpos_of = curpos_of, ncur = length(tile_r) * 16)
-end
-
-"""
-    _successor_chunk_vm!(succ, lay, first_sig, last_sig, nvariants, offsets,
-                         ndesc, ndim)
-
-Variant-major successor chunk: identical output to [`_successor_chunk!`](@ref)
-(same incremental odometer, same strict-`>`/current-wins tie-break), with the
-per-descriptor argmax vectorized across each 16-lane tile. Per variant plane
-the winner rule is a single blend:
-
-    wins = (score > max) | (lane's current variant == j  &  score == max)
-
-which reproduces the scalar tie-break exactly: the current variant beats an
-equal incumbent (the `==` arm fires only on the lane's own current plane), all
-other variants need strict `>`, and lower indices win otherwise because planes
-are scanned in ascending order. Pad lanes are harmless: their loads stay within
-the 16-slot padding of `ibv` and their place values in `ordbuf` are zero. The
-signature is then one SIMD widening multiply + horizontal sum per tile.
-"""
-function _successor_chunk_vm!(succ::Vector{Int32}, lay, first_sig::Int, last_sig::Int,
-                              nvariants::Vector{Int}, offsets::Vector{Int},
-                              ndesc::Int, ndim::Int)
-    cimt_vm = lay.cimt_vm
-    v    = Vector{Int}(undef, ndesc)
-    rows = Vector{Int}(undef, ndesc)
-    ibv  = zeros(Int16, ndim + 16)           # +16: tile loads may overhang the last group
-    cur  = zeros(Int16, lay.ncur)
-
-    s = first_sig
-    @inbounds for i in 1:ndesc
-        nv = nvariants[i]
-        v[i] = s % nv
-        rows[i] = offsets[i] + v[i] + 1
-        cur[lay.curpos_of[i]] = Int16(v[i])
-        s = s ÷ nv
-    end
-    @inbounds for i in 1:ndesc
-        r = rows[i]
-        @simd for j in 1:ndim
-            ibv[j] += cimt_vm[j, r]
-        end
-    end
-
-    V = Vec{16,Int16}
-    W = Vec{16,Int32}
-    @inbounds for sig in first_sig:last_sig
-        # ── Successor signature: tiled SIMD argmax over the variant planes ──
-        w_sig = 0
-        for t in 1:lay.ntiles
-            r = lay.tile_r[t]; m = lay.tile_m[t]
-            off0 = lay.tile_base[t] + lay.tile_k0[t] + 1
-            cv = vload(V, cur, lay.tile_cur0[t])
-            mx = vload(V, ibv, off0)                     # plane 0 seeds (lowest index)
-            best = V(Int16(0))
-            for j in 1:r-1
-                pj = vload(V, ibv, off0 + j*m)
-                jv = V(Int16(j))
-                b = (pj > mx) | ((cv == jv) & (pj == mx))
-                mx = vifelse(b, pj, mx)
-                best = vifelse(b, jv, best)
-            end
-            w_sig += Int(sum(convert(W, best) * vload(W, lay.ordbuf, (t-1)*16 + 1)))
-        end
-        succ[sig + 1] = Int32(w_sig)
-
-        # ── Odometer increment with fused row-delta ibv update ──
-        if sig < last_sig
-            for i in 1:ndesc
-                nv = nvariants[i]
-                nv == 1 && continue      # radix-1: value stays 0, carry onward
-                rold = rows[i]
-                if v[i] + 1 < nv
-                    vi = v[i] + 1
-                    v[i] = vi
-                    rnew = rold + 1
-                    rows[i] = rnew
-                    cur[lay.curpos_of[i]] = Int16(vi)
-                    @simd for j in 1:ndim
-                        ibv[j] += cimt_vm[j, rnew] - cimt_vm[j, rold]
-                    end
-                    break
-                end
-                v[i] = 0                 # roll over; carry to next digit
-                rnew = offsets[i] + 1
-                rows[i] = rnew
-                cur[lay.curpos_of[i]] = Int16(0)
-                @simd for j in 1:ndim
-                    ibv[j] += cimt_vm[j, rnew] - cimt_vm[j, rold]
                 end
             end
         end

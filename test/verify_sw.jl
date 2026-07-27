@@ -42,21 +42,21 @@ for name in files
     if !isfile(sl)
         println("  $name: no _sw.sl — skipping"); continue
     end
-    cib = load_scw(scw; sl_file = sl)            # cib.kernel = SW solutions (0-based)
-    sigs = sort([signature(cib, u) for u in cib.kernel])
-    verified = all(succession_step(cib, u) == u for u in cib.kernel)
+    cib = load_scw(scw; sl_file = sl)            # cib.consistentScenarios = SW solutions (0-based)
+    sigs = sort([signature(cib, u) for u in cib.consistentScenarios])
+    verified = all(succession_step(cib, u) == u for u in cib.consistentScenarios)
     t, note = SW_TIME[name]
 
     push!(records, Pair{String,Any}[
         "file" => name, "tool" => "scenariowizard",
-        "kernel_size" => length(cib.kernel),
+        "kernel_size" => length(cib.consistentScenarios),
         "kernel_sigs" => sigs,
         "verified_fixed_points" => verified,
         "time_s_approx" => t,
         "time_note" => note,
     ])
     flag = verified ? "OK" : "*** NOT ALL FIXED POINTS ***"
-    println("  $name: count=$(length(cib.kernel))  verified=$verified [$flag]")
+    println("  $name: count=$(length(cib.consistentScenarios))  verified=$verified [$flag]")
     println("    sigs=$sigs")
 end
 

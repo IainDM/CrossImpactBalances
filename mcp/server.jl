@@ -190,9 +190,9 @@ function format_results(cib, fps, basins, cycle_count, total)
     println(buf)
 
     # Problem size
-    println(buf, "Descriptors: $(cib.ndesc)")
+    println(buf, "Descriptors: $(cib.numberOfDescriptors)")
     print(buf, "Variants per descriptor: [")
-    print(buf, join(cib.nvariants, ", "))
+    print(buf, join(cib.numberOfVariants, ", "))
     println(buf, "]")
     println(buf, "Total scenario space: $total")
     println(buf)

@@ -19,9 +19,9 @@ end
 println()
 
 println("Total scenario space size: ", max_signature(cib) + 1)
-println("Consistent scenarios (fixed points): ", length(cib.kernel))
+println("Consistent scenarios (fixed points): ", length(cib.consistentScenarios))
 
-for (k, u) in enumerate(cib.kernel)
+for (k, u) in enumerate(cib.consistentScenarios)
     println()
     println("  #$k  (signature $(signature(cib, u)))")
     for (i, desc) in enumerate(cib.descriptors)

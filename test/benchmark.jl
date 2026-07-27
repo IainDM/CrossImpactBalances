@@ -51,14 +51,14 @@ for (name, expected) in sort(collect(EXPECTED), by=x->x[2]["total_scenarios"])
         jl_time_find = times_find[2]  # median
 
         # Sort kernel by signature for deterministic ordering
-        sort!(cib.kernel, by=u->signature(cib, u))
-        kernel_sigs = [signature(cib, u) for u in cib.kernel]
+        sort!(cib.consistentScenarios, by=u->signature(cib, u))
+        kernel_sigs = [signature(cib, u) for u in cib.consistentScenarios]
 
         # ── Verify agreement ──
-        @test length(cib.kernel) == n_kernel_expected
+        @test length(cib.consistentScenarios) == n_kernel_expected
         @test kernel_sigs == expected_sigs
 
-        println("  Consistent scenarios: $(length(cib.kernel))")
+        println("  Consistent scenarios: $(length(cib.consistentScenarios))")
         println("  Kernel sigs: $kernel_sigs")
 
         # ── Report timing ──

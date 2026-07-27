@@ -45,7 +45,6 @@ CrossImpactBalances.fixed_point_margin
 
 ```@docs
 succession_step
-succession
 find_consistent
 find_basins
 ```

@@ -82,7 +82,7 @@ Parse descriptor=variant pairs and resolve to 0-based variant indices.
 Returns a Vector{Int} of length ndesc, or throws on invalid names.
 """
 function resolve_scenario(cib, pairs::Vector{SubString{String}})
-    scenario = fill(-1, cib.ndesc)
+    scenario = fill(-1, cib.numberOfDescriptors)
     for pair in pairs
         idx = findfirst('=', pair)
         isnothing(idx) && error("Invalid pair (missing '='): $pair")
@@ -120,9 +120,9 @@ function format_scenario(cib, u)
 end
 
 function format_model_header(buf, cib)
-    println(buf, "Descriptors: $(cib.ndesc)")
+    println(buf, "Descriptors: $(cib.numberOfDescriptors)")
     print(buf, "Variants per descriptor: [")
-    print(buf, join(cib.nvariants, ", "))
+    print(buf, join(cib.numberOfVariants, ", "))
     println(buf, "]")
     total = max_signature(cib) + 1
     println(buf, "Total scenario space: $total")
@@ -234,7 +234,7 @@ function format_impact_balance(cib, scenario, ib)
     idx = 1
     is_fixed = true
     for (j, desc) in enumerate(cib.descriptors)
-        nv = cib.nvariants[j]
+        nv = cib.numberOfVariants[j]
         scores = ib[idx:idx + nv - 1]
         max_score = maximum(scores)
         selected_score = scores[scenario[j] + 1]

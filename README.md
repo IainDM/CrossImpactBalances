@@ -112,14 +112,11 @@ in [`build/`](build/README.md).
 |----------|---------|
 | `load_scw`, `load_solutions` | Parse ScenarioWizard `.scw` and `.sl` files |
 | `signature`, `inv_signature`, `max_signature` | Bijection between scenarios and integers |
-| `impact_balance`, `own_impact_balance`, `cross_impact_balance`, `inner_product` | CIB scoring primitives |
+| `impact_balance` | Score every variant against a scenario |
 | `SuccessionRule`, `GlobalSuccession`, `SequentialSuccession` | Pluggable succession dynamics (see [Pluggable succession rules](#pluggable-succession-rules)) |
-| `succession_step`, `succession` | Deterministic succession dynamics under a chosen rule |
-| `find_consistent` | Find all fixed points (Monte-Carlo, or `exhaustive=true` with `algorithm=:auto`/`:bnb`/`:sweep`); honours `rule=` |
+| `succession_step` | One deterministic succession step under a chosen rule |
+| `find_consistent` | Find every fixed point by exhaustive search (`algorithm=:auto`/`:bnb`/`:sweep`); honours `rule=` |
 | `find_basins` | Two-phase basin-of-attraction analysis (Julia-only addition); honours `rule=` |
-| `inner_product_matrix` | Pairwise similarity of kernel scenarios |
-| `set_thresholds!`, `rand_scenario` | API helpers matching the Python reference |
-| `set_impact!`, `get_impact` | Edit / read a single cross-impact value in place (keeps `cim`/`cim_t` in sync) |
 
 ## Pluggable succession rules
 
@@ -140,19 +137,25 @@ end
 That's the entire contract. Every analysis routine then works with it:
 
 ```julia
-find_consistent(cib; rule=MyRule(), exhaustive=true)
+find_consistent(cib; rule=MyRule())
 find_basins(cib; rule=MyRule())
-succession(MyRule(), cib, u)
+succession_step(MyRule(), cib, u)
 ```
 
-A custom rule runs through a generic, single-threaded scan (a correctness
-baseline); a rule that needs the fast paths can additionally specialise the
-internal `_exhaustive_kernel(rule, cib; ...)` and `_basins(rule, cib)`
-methods on its own type. `SequentialSuccession` (Gauss–Seidel-style updates)
+A custom rule runs through a generic path that calls `succession_step` once
+per scenario (a correctness baseline — threaded, but slower than the
+odometer fast path the default rule gets). A rule whose fixed points can be
+expressed as "no variant beats the current one by more than a margin" can
+declare `CrossImpactBalances.fixed_point_margin(rule)` and inherit the fast
+sweep and branch-and-bound searches for free.
+`SequentialSuccession` (Gauss–Seidel-style updates)
 ships as a second built-in rule, and
 [`examples/04_custom_succession_rule.jl`](examples/04_custom_succession_rule.jl)
 is a worked example. The `algorithm=:sweep/:bnb` search-strategy switch
-applies only to `GlobalSuccession`.
+applies only to rules with a `fixed_point_margin` — both built-in rules
+declare one (`GlobalSuccession` trivially; `SequentialSuccession` because
+its fixed points provably coincide with global's, even though its
+trajectories differ).
 
 ## Performance
 

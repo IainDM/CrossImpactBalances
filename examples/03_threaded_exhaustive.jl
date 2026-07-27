@@ -18,8 +18,8 @@ t0 = time_ns()
 cib = load_scw(SAMPLE)
 elapsed = (time_ns() - t0) / 1e9
 println("Exhaustive find_consistent: $(round(elapsed, digits=3))s")
-println("Fixed points found: $(length(cib.kernel))")
-for u in cib.kernel
+println("Fixed points found: $(length(cib.consistentScenarios))")
+for u in cib.consistentScenarios
     println("  sig=$(signature(cib, u))")
 end
 println()
