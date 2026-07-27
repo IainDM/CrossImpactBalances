@@ -30,9 +30,9 @@ function CrossImpactBalances.succession_step(rule::InertialSuccession,
                                              cib::CIB, u::Vector{Int})
     ib = impact_balance(cib, u)
     v = copy(u)
-    for i in 1:cib.ndesc
+    for i in 1:cib.numberOfDescriptors
         off = cib.desc_offsets[i]
-        nv = cib.nvariants[i]
+        nv = cib.numberOfVariants[i]
         cur = ib[off + u[i] + 1]
         best = u[i]
         bestval = cur

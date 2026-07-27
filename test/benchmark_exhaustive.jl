@@ -29,14 +29,14 @@ t0 = time_ns()
 cib_ex = load_scw(scw_path)
 t_ex = (time_ns() - t0) / 1e9
 
-sort!(cib_ex.kernel, by=u->signature(cib_ex, u))
-ex_sigs = [signature(cib_ex, u) for u in cib_ex.kernel]
+sort!(cib_ex.consistentScenarios, by=u->signature(cib_ex, u))
+ex_sigs = [signature(cib_ex, u) for u in cib_ex.consistentScenarios]
 
 # Verify every result is a true fixed point
-all_valid = all(u -> CrossImpactBalances.succession_step(cib_ex, u) == u, cib_ex.kernel)
+all_valid = all(u -> CrossImpactBalances.succession_step(cib_ex, u) == u, cib_ex.consistentScenarios)
 
 println("  Time:    $(round(t_ex, digits=2))s")
-println("  Found:   $(length(cib_ex.kernel)) fixed points (DEFINITIVE)")
+println("  Found:   $(length(cib_ex.consistentScenarios)) fixed points (DEFINITIVE)")
 println("  Sigs:    $ex_sigs")
 println("  Valid:   $all_valid")
 println("  Rate:    $(round(60_466_176 / t_ex, digits=0)) scenarios/sec")

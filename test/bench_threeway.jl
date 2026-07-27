@@ -55,7 +55,7 @@ for name in FILES
     total = max_signature(cib) + 1
     ntr   = total > 1_000_000 ? 2 : 3
 
-    println("\n=== $name  ($total scenarios, $(cib.ndesc) descriptors) ===")
+    println("\n=== $name  ($total scenarios, $(cib.numberOfDescriptors) descriptors) ===")
 
     parse_s = timed(() -> preload(path); n = ntr)
 

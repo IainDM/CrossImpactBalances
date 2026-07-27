@@ -40,7 +40,7 @@ println("="^70)
     t0 = time_ns()
     cib_warmup = load_scw(scw_path)
     t_warmup = (time_ns() - t0) / 1e9
-    println("  Warmup: $(round(t_warmup, digits=3))s, $(length(cib_warmup.kernel)) consistent")
+    println("  Warmup: $(round(t_warmup, digits=3))s, $(length(cib_warmup.consistentScenarios)) consistent")
 
     # ── Benchmark: find_consistent (3 runs, take median) ──
     println("\nBenchmark runs (3 trials)...")
@@ -51,19 +51,19 @@ println("="^70)
         cib = load_scw(scw_path)
         elapsed = (time_ns() - t0) / 1e9
         push!(times_find, elapsed)
-        println("  Trial $trial: $(round(elapsed, digits=4))s, $(length(cib.kernel)) consistent")
+        println("  Trial $trial: $(round(elapsed, digits=4))s, $(length(cib.consistentScenarios)) consistent")
     end
     sort!(times_find)
     jl_time_find = times_find[2]  # median
 
     # Sort kernel
-    sort!(cib.kernel, by=u->signature(cib, u))
-    jl_sigs = [signature(cib, u) for u in cib.kernel]
+    sort!(cib.consistentScenarios, by=u->signature(cib, u))
+    jl_sigs = [signature(cib, u) for u in cib.consistentScenarios]
 
     # ── Verify Julia's kernel: every entry is a true fixed point ──
-    println("\nVerifying Julia kernel ($(length(cib.kernel)) scenarios)...")
+    println("\nVerifying Julia kernel ($(length(cib.consistentScenarios)) scenarios)...")
     @testset "Julia fixed points" begin
-        for u in cib.kernel
+        for u in cib.consistentScenarios
             v = CrossImpactBalances.succession_step(cib, u)
             @test v == u
         end
@@ -88,7 +88,7 @@ println("="^70)
     println("  Overlap:       $(length(overlap)) scenarios")
 
     # Both should find at least one fixed point
-    @test length(cib.kernel) >= 1
+    @test length(cib.consistentScenarios) >= 1
     @test length(py_kernel) >= 1
 
     # ── Timing report ──

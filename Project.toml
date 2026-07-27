@@ -4,11 +4,7 @@ authors = ["Iain Morrow"]
 version = "0.2.0"
 description = "Cross-Impact Balance scenario analysis in Julia — a faster reimplementation of sei-international/cibsa."
 
-[deps]
-SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
-
 [compat]
-SIMD = "3.4"
 julia = "1.10"
 
 [extras]

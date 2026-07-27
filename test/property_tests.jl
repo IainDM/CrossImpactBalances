@@ -181,14 +181,15 @@ CrossImpactBalances.succession_step(::RefGlobal, cib::CIB, u::Vector{Int}) =
 
 # Independent brute-force oracle for SEQUENTIAL succession — written from
 # scratch (Gauss–Seidel: update descriptors one at a time using the impact
-# balance of the partially-updated scenario), used to validate that a rule
-# with genuinely different dynamics flows correctly through the generic path.
+# balance of the partially-updated scenario). Validates both halves of the
+# rule's contract: its margin-0 claim (kernel == the fast searches' output)
+# and its genuinely different dynamics (basins via the generic path).
 function seq_step_oracle(cib::CIB, u::Vector{Int})
     v = copy(u)
-    for i in 1:cib.ndesc
+    for i in 1:cib.numberOfDescriptors
         ib = impact_balance(cib, v)
         off = cib.desc_offsets[i]
-        nv = cib.nvariants[i]
+        nv = cib.numberOfVariants[i]
         best = v[i]
         bestval = ib[off + v[i] + 1]
         for j in 0:nv-1
@@ -239,12 +240,12 @@ end
 function CrossImpactBalances.succession_step(rule::Threshold, cib::CIB, u::Vector{Int})
     ib = impact_balance(cib, u)
     v = copy(u)
-    for i in 1:cib.ndesc
+    for i in 1:cib.numberOfDescriptors
         off = cib.desc_offsets[i]
         cur = ib[off + u[i] + 1]
         best = u[i]
         bestval = cur
-        for j in 0:cib.nvariants[i]-1
+        for j in 0:cib.numberOfVariants[i]-1
             if ib[off + j + 1] > bestval && ib[off + j + 1] - cur > rule.m
                 bestval = ib[off + j + 1]
                 best = j
@@ -293,14 +294,20 @@ threshold_fixed_points(cib, m) =
     @testset "SequentialSuccession vs independent oracle" begin
         differs = false
         for cib in cases
-            # Kernel: generic scan finds exactly the sequential fixed points.
+            # Kernel: sequential fixed points coincide with global ones (the
+            # induction argument in the SequentialSuccession docstring), so the
+            # rule declares fixed_point_margin = 0 and every fast strategy must
+            # find exactly the oracle's fixed points, in ascending order.
             want_k = sort!([signature(cib, inv_signature(cib, s))
                             for s in 0:max_signature(cib)
                             if seq_step_oracle(cib, inv_signature(cib, s)) ==
                                inv_signature(cib, s)])
-            got_k = [signature(cib, u) for u in
-                     find_consistent(cib; rule=SequentialSuccession())]
-            @test got_k == want_k
+            for alg in (:auto, :sweep, :bnb)
+                got_k = [signature(cib, u) for u in
+                         find_consistent(cib; rule=SequentialSuccession(),
+                                         algorithm=alg)]
+                @test got_k == want_k
+            end
 
             # Basins: generic walk matches the from-scratch sequential oracle.
             of, os, oc = seq_basins_oracle(cib)
@@ -325,13 +332,15 @@ threshold_fixed_points(cib, m) =
     end
 
     @testset "search-strategy kwargs rejected for rules without a margin" begin
-        # SequentialSuccession is not a threshold rule (fixed_point_margin is
-        # nothing), so it has no fast sweep / branch-and-bound and :bnb / :sweep
-        # must be refused.
+        # RefGlobal declares no fixed_point_margin (it returns nothing), so it
+        # has no fast sweep / branch-and-bound and :bnb / :sweep must be
+        # refused. (SequentialSuccession no longer serves here: its fixed
+        # points provably coincide with global's, so it declares margin 0 and
+        # accepts the fast strategies.)
         cib = cases[1]
-        @test_throws ArgumentError find_consistent(cib; rule=SequentialSuccession(),
+        @test_throws ArgumentError find_consistent(cib; rule=RefGlobal(),
                                                    algorithm=:bnb)
-        @test_throws ArgumentError find_consistent(cib; rule=SequentialSuccession(),
+        @test_throws ArgumentError find_consistent(cib; rule=RefGlobal(),
                                                    algorithm=:sweep)
     end
 end
