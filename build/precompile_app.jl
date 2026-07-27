@@ -11,11 +11,12 @@ for f in ("CIB_global.scw", "bench_typical.scw")
     path = joinpath(SAMPLES, f)
     isfile(path) || continue
     cib = load_scw(path; kernel = Vector{Vector{Int}}())
-    find_consistent(cib; exhaustive = true)          # sweep (auto for small spaces)
-    # Force the branch-and-bound strategy too: spaces ≥ 10^5 scenarios take it
-    # via :auto, and without this line it would be JIT-compiled on the user's
-    # first click instead of baked into the image.
-    find_consistent(cib; exhaustive = true, algorithm = :bnb)
+    find_consistent(cib)                              # whatever :auto picks — the user's path
+    # Force BOTH search strategies as well, so neither is left to be JIT-compiled
+    # on the user's first click. :auto only picks one of them for a given model
+    # size, so relying on the call above would bake in only that one.
+    find_consistent(cib; algorithm = :sweep)
+    find_consistent(cib; algorithm = :bnb)
     find_basins(cib)                                  # two-phase basins
 end
 

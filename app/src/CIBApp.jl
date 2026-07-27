@@ -71,7 +71,7 @@ csv_row(fields) = join(map(csv_field, fields), ',')
 # ─── Analysis ────────────────────────────────────────────────────────────────
 # Variant names of a scenario (0-based indices) as human-readable strings.
 function variant_names(cib, u)
-    return String[cib.variants[cib.descriptors[i]][u[i] + 1] for i in 1:cib.ndesc]
+    return String[cib.variants[cib.descriptors[i]][u[i] + 1] for i in 1:cib.numberOfDescriptors]
 end
 
 # Load a CIB from raw .scw text without triggering any automatic search

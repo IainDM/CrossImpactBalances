@@ -9,7 +9,11 @@ julia = "1.10"
 
 [extras]
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
+# Sockets is not used by the package itself — test/smoke_consumers.jl loads the
+# desktop app (app/src/CIBApp.jl) from source to check it still works against
+# the engine's API, and the app's HTTP server is built on Sockets.
 [targets]
-test = ["Test", "Random"]
+test = ["Test", "Random", "Sockets"]

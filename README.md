@@ -31,7 +31,7 @@ using CrossImpactBalances
 cib = load_scw("test/sample_files/CIB_global.scw")
 
 # Find all consistent scenarios (fixed points of the succession operator)
-for u in cib.kernel
+for u in cib.consistentScenarios
     println("Scenario signature ", signature(cib, u))
     for (i, desc) in enumerate(cib.descriptors)
         println("  ", desc, " = ", cib.variants[desc][u[i] + 1])

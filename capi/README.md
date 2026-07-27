@@ -50,7 +50,7 @@ arrays of 0-based variant indices.
 | Function | JSON in → out |
 |----------|---------------|
 | `cib_load(path)` | → `{handle, descriptors, variants, n_descriptors, n_scenarios}` |
-| `cib_consistent(h, opts)` | `{exhaustive?, algorithm?, ignore_cycles?, rule?, seed?}` → `{scenarios}` |
+| `cib_consistent(h, opts)` | `{rule?, algorithm?}` → `{scenarios}` |
 | `cib_basins(h, opts)` | `{rule?}` → `{fixed_points, basin_sizes, cycle_count, total}` |
 | `cib_impact_balance(h, scenario)` | `[i,…]` → `{ib}` |
 | `cib_succession(h, req)` | `{scenario, rule?, max_steps?}` → `{steps, cycle_length}` |
@@ -64,3 +64,9 @@ arrays of 0-based variant indices.
 
 Errors never cross the boundary as exceptions: a failed call returns
 `{"ok": false, "error": "…"}`.
+
+`cib_consistent` previously also accepted `exhaustive`, `ignore_cycles` and
+`seed`. Those are gone along with the simulated annealing and Monte-Carlo
+sampling they configured: the search now always covers the whole scenario
+space and is fully deterministic, so there is nothing to seed and no partial
+search to opt out of. Unknown keys are ignored, so old callers keep working.

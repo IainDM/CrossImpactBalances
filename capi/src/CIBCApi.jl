@@ -22,11 +22,18 @@ Design
 Runtime lifecycle (from the compiled library): call the generated
 `init_julia(argc, argv)` once before any `cib_*` call, and `shutdown_julia`
 at the end. Pass `-t auto` (or `-tN`) in `argv` to enable threads.
+
+Removed options
+---------------
+`cib_consistent` once accepted `seed`, `ignore_cycles` and `exhaustive`. All
+three are gone, along with the simulated annealing and Monte-Carlo sampling
+they configured. The engine now always enumerates the whole scenario space and
+is fully deterministic, so there is no randomness to seed and no partial search
+to opt out of. Callers passing those keys will simply have them ignored.
 """
 module CIBCApi
 
 using CrossImpactBalances
-using Random
 
 include("json.jl")   # parse_json_value, json_serialize, ... (dependency-free)
 
@@ -114,7 +121,7 @@ Base.@ccallable function cib_load(path::Cstring)::Cstring
         _ok("handle" => Int(h),
             "descriptors" => cib.descriptors,
             "variants" => variants,
-            "n_descriptors" => cib.ndesc,
+            "n_descriptors" => cib.numberOfDescriptors,
             "n_scenarios" => max_signature(cib) + 1)
     end
 end
@@ -138,14 +145,12 @@ Base.@ccallable function cib_consistent(handle::Cint, opts::Cstring)::Cstring
     _protect() do
         cib = _get(handle)
         o = _parse(opts)
-        seed = _opt(o, "seed", nothing)
-        rng = seed === nothing ? Random.default_rng() : Xoshiro(Int(seed))
+        # Options are `{rule?, algorithm?}`. The search is always exhaustive and
+        # always deterministic, so there is nothing else to configure — see the
+        # note on the removed options in this module's docstring.
         kern = find_consistent(cib;
             rule = _rule(_opt(o, "rule", "global")),
-            ignore_cycles = Bool(_opt(o, "ignore_cycles", true)),
-            exhaustive = Bool(_opt(o, "exhaustive", false)),
-            algorithm = Symbol(_opt(o, "algorithm", "auto")),
-            rng = rng)
+            algorithm = Symbol(_opt(o, "algorithm", "auto")))
         _ok("scenarios" => kern)
     end
 end
