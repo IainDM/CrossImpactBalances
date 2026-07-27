@@ -8,7 +8,7 @@ Weimer-Jehle, W. (2006). Cross-impact balances: A system-theoretical approach to
 """
 module CrossImpactBalances
 
-# `export` lists the names visible after `using CrossImpactBalances` — like
+# `export` lists the names visible after `using CrossImpactBalances` — like 
 # Python's `__all__` or C#'s `public`. Everything else in the package is still
 # reachable as `CrossImpactBalances.name`, it just isn't brought into scope
 # automatically. Names starting with an underscore are internal helpers.
@@ -44,6 +44,9 @@ export CIB, load_scw, load_solutions,
 #
 # ── Julia notes for readers coming from Python or .NET ─────────────────────
 #
+# Why Julia? Because it's fast, in a nutshell. In tests we got a ~30x speedup vs Python
+# before any algorithmic speedups.
+
 # Features that recur throughout these files:
 #
 # * 1-based indexing: Julia arrays start at index 1 (like MATLAB/Fortran),

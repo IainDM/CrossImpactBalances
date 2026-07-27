@@ -1,20 +1,9 @@
-# ══ Basins of attraction: where does each scenario end up? ═════════════════
-#
-# find_consistent asks which scenarios are stable. This asks a bigger question:
-# start from EVERY scenario in the model, keep applying succession, and see
-# where you land. The number of starting points that drain into a given
-# consistent scenario is its basin — a measure of how much of the possibility
-# space that future attracts.
-#
-# A NOTE ON WORDING. This file says "fixed point" more than the rest of the
-# codebase, and deliberately. Here we are treating succession as a dynamical
-# system, and a chain can end in one of two ways: at a scenario that maps to
-# itself (a fixed point — which is exactly what the rest of the code calls a
-# consistent scenario), or in a repeating loop of two or more scenarios that
-# chase each other forever (a cycle). Cycles are not consistent scenarios and
-# are not anybody's basin, so they are counted separately. Keeping the
-# fixed-point/cycle contrast in view is why the dynamical term earns its place
-# in this file.
+""" ══ Basins of attraction: where does each scenario end up? ═════════════════
+
+find_consistent asks which scenarios are stable. This asks a bigger question: start from EVERY scenario in the model, keep applying succession, and see where you land. The number of starting points that drain into a given consistent scenario is its basin — a measure of how much of the possibility space that future attracts.
+
+A NOTE ON WORDING. This file says "fixed point" more than the rest of the codebase, and deliberately. Here we are treating succession as a dynamical system, and a chain can end in one of two ways: at a scenario that maps to itself (a fixed point — which is exactly what the rest of the code calls a consistent scenario), or in a repeating loop of two or more scenarios that chase each other forever (a cycle). Cycles are not consistent scenarios and are not anybody's basin, so they are counted separately.
+"""
 
 """
     find_basins(cib; rule=GlobalSuccession()) -> (fixed_points, basin_sizes, cycle_count)
@@ -32,7 +21,8 @@ function find_basins(cib::CIB; rule::SuccessionRule=GlobalSuccession())
     return _find_basins(rule, cib)
 end
 
-# Fast path, selected by dispatch when the rule is exactly GlobalSuccession. The odometer chunk re-derives that rule's argmax semantics internally,which is exactly why this specialisation cannot serve an arbitrary rule.
+#region "Fast path"
+# Fast path, selected by dispatch when the rule is exactly GlobalSuccession. This code is fine tuned to calculate that rule quickly
 function _find_basins(::GlobalSuccession, cib::CIB)
     numberOfScenarios = max_signature(cib) + 1
     scoreType = _score_type(cib)
@@ -50,11 +40,13 @@ function _fast_basins(cib::CIB, ::Type{SignatureInt},
     numberOfScenarios = max_signature(cib) + 1
     successorTable = Vector{SignatureInt}(undef, numberOfScenarios)
     _successor_table!(successorTable, cib, cimTranspose)
-    fixedPointSignatures, basinSizes, cycleCount = _resolve_and_tally(successorTable, numberOfScenarios)
-    fixedPoints = [inv_signature(cib, sig) for sig in fixedPointSignatures]
+    fixedPointSignatures, basinSizes, cycleCount = _resolve_and_tally(successorTable, numberOfScenarios) #grab the basin details
+    fixedPoints = [inv_signature(cib, sig) for sig in fixedPointSignatures] #reverse out the fixed points in terms of descriptors and variants rather than index
     return (fixedPoints, basinSizes, cycleCount)
 end
+#endregion
 
+#region "Generic path"
 # Generic path: works for any rule, because it only ever calls the rule's own succession_step. Allocates a few vectors per scenario, so it is much slower than the odometer path — a correctness baseline or for use when there is no alternative
 function _find_basins(rule::SuccessionRule, cib::CIB)
     numberOfScenarios = max_signature(cib) + 1
@@ -86,38 +78,33 @@ function _generic_basins(rule::SuccessionRule, cib::CIB,
     fixedPoints = [inv_signature(cib, sig) for sig in fixedPointSignatures]
     return (fixedPoints, basinSizes, cycleCount)
 end
+#endregion
 
-# ══ Phase 1: building the successor table ══════════════════════════════════
-#
-# The successor table is a single flat array holding, for every scenario in
-# the model, the number of the scenario it steps to:
-#
-#     successorTable[sig + 1] = the signature of sig's successor
-#
-# (The `+ 1` throughout is only Julia's 1-based indexing meeting our 0-based
-# scenario numbering. Scenario 0 lives in slot 1.)
-#
-# So it is a complete map of the dynamics — every arrow, precomputed. Phase 2
-# then walks those arrows to find where each scenario ends up, without ever
-# recomputing a score.
-#
-# The two functions below do the same job as calling [`succession_step`](@ref)
-# on every scenario in turn, and produce byte-identical results. They exist
-# because doing it the obvious way is far slower:
-#
-#   * succession_step allocates fresh vectors on each call (the scenario, its
-#     impact balance, the successor). Over hundreds of millions of scenarios
-#     that allocation dominates everything else.
-#
-#   * It also recomputes the impact balance from scratch each time, summing
-#     one matrix row per descriptor. But consecutive scenarios differ in only
-#     ONE descriptor, so almost all of that sum is unchanged from the previous
-#     scenario.
-#
-# The version below therefore walks the scenarios in signature order like an
-# odometer (see signatures.jl) and carries the impact balance along with it,
-# patching it by the difference between two matrix rows whenever a digit ticks
-# over. No allocation at all inside the loop.
+#region "Successor table"
+
+"""
+══ Phase 1: building the successor table ══════════════════════════════════
+
+The successor table is a single flat array holding, for every scenario in the model, the number of the scenario it steps to:
+
+     successorTable[sig + 1] = the signature of sig's successor
+
+(The `+ 1` throughout is only Julia's 1-based indexing meeting our 0-based scenario numbering. Scenario 0 lives in slot 1.)
+
+So it is a complete map of the dynamics — every arrow, precomputed.
+
+Phase 2 then walks those arrows to find where each scenario ends up, without ever recomputing a score.
+
+The two functions below do the same job as calling [`succession_step`](@ref) on every scenario in turn, and produce byte-identical results.
+They exist because doing it the obvious way is far slower:
+
+* succession_step allocates fresh vectors on each call (the scenario, its impact balance, the successor). Over hundreds of millions of scenarios that allocation dominates everything else.
+
+* It also recomputes the impact balance from scratch each time, summing one matrix row per descriptor. But consecutive scenarios differ in only ONE descriptor, so almost all of that sum is unchanged from the previous scenario.
+
+The version below therefore walks the scenarios in signature order like an odometer (see signatures.jl) and carries the impact balance along with it, changing it by the difference between two matrix rows whenever a digit ticks over. No allocation at all inside the loop.
+
+"""
 
 """
     _successor_table!(successorTable, cib, cimTranspose) -> successorTable
@@ -276,7 +263,9 @@ Locked get-or-assign of a dense 1-based id for the fixed point with signature `s
         unlock(registryLock)
     end
 end
+#endregion
 
+#region "Successors to consistent destination scenarios"
 """
     _resolve_chunk!(attractorLabels, successorTable, firstSignature, lastSignature,
                     registryLock, signatureForId, idForSignature)
@@ -396,3 +385,4 @@ function _resolve_and_tally(successorTable::Vector{SignatureInt},
     sortOrder = sortperm(signatureForId)
     return signatureForId[sortOrder], totalCounts[sortOrder], sum(perThreadCycleCounts)
 end
+#endregion
