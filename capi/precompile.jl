@@ -9,8 +9,9 @@ const SAMPLE = joinpath(@__DIR__, "..", "test", "sample_files", "CIB_global.scw"
 
 # --- Engine hot paths ---
 cib = load_scw(SAMPLE; kernel = Vector{Vector{Int}}())
-find_consistent(cib)
-find_consistent(cib; exhaustive = true)
+find_consistent(cib)                      # whatever :auto picks
+find_consistent(cib; algorithm = :sweep)  # bake both search strategies, so
+find_consistent(cib; algorithm = :bnb)    # neither is JIT-compiled on first use
 find_basins(cib)
 u = inv_signature(cib, 0)
 impact_balance(cib, u)

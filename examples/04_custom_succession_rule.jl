@@ -4,8 +4,8 @@ Plugging in a custom succession dynamics.
 The succession *rule* — the deterministic map that sends a scenario to its
 successor — is an extension point. To add a new one you subtype
 `SuccessionRule` and define a single method, `succession_step(rule, cib, u)`.
-Every analysis routine (`succession`, `find_consistent`, `find_basins`) then
-works with it immediately through a generic, rule-agnostic path; the built-in
+Both analysis routines (`find_consistent` and `find_basins`) then work with it
+immediately through a generic, rule-agnostic path; the built-in
 `GlobalSuccession` additionally carries the fast threaded implementations.
 
 Run from the repo root:
@@ -52,7 +52,12 @@ end
 # exactly the scenarios where no variant beats the current one by more than
 # `margin` — precisely the per-descriptor test the sweep and branch-and-bound
 # run — so declaring the margin routes it off the generic scan onto the fast
-# threaded paths. (Basins already run fast for any rule.)
+# threaded paths.
+#
+# This buys the faster `find_consistent` only. `find_basins` still takes the
+# generic per-scenario path for any rule other than `GlobalSuccession`, because
+# basins depend on the whole trajectory, not just on which scenarios are
+# consistent — and the trajectories genuinely differ between rules.
 CrossImpactBalances.fixed_point_margin(rule::InertialSuccession) = rule.margin
 
 # ── Use it exactly like the built-in rule ────────────────────────────────────

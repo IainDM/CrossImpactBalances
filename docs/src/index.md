@@ -32,7 +32,7 @@ using CrossImpactBalances
 cib = load_scw("path/to/CIB_global.scw")
 
 # Each consistent scenario
-for u in cib.kernel
+for u in cib.consistentScenarios
     println("sig=", signature(cib, u))
     for (i, desc) in enumerate(cib.descriptors)
         println("  ", desc, " = ", cib.variants[desc][u[i] + 1])

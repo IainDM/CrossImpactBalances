@@ -297,4 +297,8 @@ end
 
     include("property_tests.jl")
 
+    # Consumers outside src/ — the desktop app, the examples, the documented
+    # snippets. These break silently otherwise; see the file's header.
+    include("smoke_consumers.jl")
+
 end
