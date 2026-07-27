@@ -343,99 +343,6 @@ end
 
 #endregion
 
-#region "Reading and editing the cross-impact matrix"
-
-# Everything else in this file addresses the matrix by flat row/column number,
-# because that is what the hot loops need. These helpers are the human-facing
-# way in: they let a caller say "the impact of Trade=Free on Growth=High"
-# instead of "cim[4, 9]", and they are what the Python and C wrappers call.
-#
-# Nothing inside the engine uses them — they exist purely so that a model can
-# be inspected and edited from outside without re-parsing the .scw file, which
-# is what makes sensitivity sweeps (change one judgement, re-run) cheap.
-
-"""
-    _desc_index(cib, descriptor) -> Int
-
-Resolve a descriptor given by name (`AbstractString`) or 0-based index (`Integer`) to its 1-based position in `cib.descriptors`. Throws on an unknown name or an out-of-range index.
-"""
-# Two methods, one name: Julia picks between them on the TYPE of the second
-# argument (multiple dispatch), so the caller can pass either "Trade" or 0.
-function _desc_index(cib::CIB, descriptor::AbstractString)
-    position = findfirst(==(String(descriptor)), cib.descriptors)
-    isnothing(position) && throw(ArgumentError(
-        "Unknown descriptor: \"$descriptor\". Available: $(join(cib.descriptors, ", "))"))
-    return position
-end
-
-function _desc_index(cib::CIB, descriptor::Integer)
-    (0 <= descriptor < cib.numberOfDescriptors) || throw(ArgumentError(
-        "Descriptor index $descriptor out of range 0:$(cib.numberOfDescriptors - 1)"))
-    return Int(descriptor) + 1     # callers count descriptors from 0, arrays from 1
-end
-
-"""
-    _table_index(cib, descriptor, variant) -> Int
-
-Resolve a (descriptor, variant) pair to the 1-based flat row/column index into `cib.cim`. Both may be given by name (`AbstractString`) or by 0-based index (`Integer`).
-
-This is the same offset arithmetic the scoring loops do inline — descriptor `i`'s variants start at `desc_offsets[i]`, so variant `v` of that descriptor lives at `desc_offsets[i] + v + 1`.
-"""
-function _table_index(cib::CIB, descriptor, variant::AbstractString)
-    descriptorPosition = _desc_index(cib, descriptor)
-    descriptorName = cib.descriptors[descriptorPosition]
-    variantNames = cib.variants[descriptorName]
-    variantPosition = findfirst(==(String(variant)), variantNames)
-    isnothing(variantPosition) && throw(ArgumentError(
-        "Unknown variant \"$variant\" for descriptor \"$descriptorName\". " *
-        "Available: $(join(variantNames, ", "))"))
-    # findfirst already returns a 1-based position, so no +1 here.
-    return cib.desc_offsets[descriptorPosition] + variantPosition
-end
-
-function _table_index(cib::CIB, descriptor, variant::Integer)
-    descriptorPosition = _desc_index(cib, descriptor)
-    variantCount = cib.numberOfVariants[descriptorPosition]
-    (0 <= variant < variantCount) || throw(ArgumentError(
-        "Variant index $variant out of range 0:$(variantCount - 1) " *
-        "for descriptor \"$(cib.descriptors[descriptorPosition])\""))
-    return cib.desc_offsets[descriptorPosition] + Int(variant) + 1
-end
-
-"""
-    set_impact!(cib, src_desc, src_var, tgt_desc, tgt_var, value) -> Int
-
-Set the cross-impact contributed by the source variant (`src_desc`=`src_var`) onto the target variant (`tgt_desc`=`tgt_var`), i.e. `cim[source, target]`, and return the previous value.
-
-Descriptors and variants may be given by name (`AbstractString`) or by 0-based index (`Integer`). This updates **both** the cross-impact matrix `cim` and its stored transpose `cim_t`, so that every analysis routine — which may read either — sees a consistent matrix.
-
-Because the matrices are edited in place, the already-loaded model changes without any re-parse of the `.scw` file; the next [`find_consistent`](@ref) or [`find_basins`](@ref) call reflects the new value. That is what makes it cheap to sweep one expert judgement across a range and watch the consistent scenarios move.
-
-Note the `!` in the name: by Julia convention it warns that the argument is modified rather than copied.
-"""
-function set_impact!(cib::CIB, src_desc, src_var, tgt_desc, tgt_var, value::Integer)
-    sourceIndex = _table_index(cib, src_desc, src_var)
-    targetIndex = _table_index(cib, tgt_desc, tgt_var)
-    previousValue = cib.cim[sourceIndex, targetIndex]
-    newValue = Int(value)
-    cib.cim[sourceIndex, targetIndex]   = newValue
-    cib.cim_t[targetIndex, sourceIndex] = newValue   # keep the transpose in sync
-    return previousValue
-end
-
-"""
-    get_impact(cib, src_desc, src_var, tgt_desc, tgt_var) -> Int
-
-Return the current cross-impact `cim[source, target]` contributed by the source variant (`src_desc`=`src_var`) onto the target variant (`tgt_desc`=`tgt_var`). Descriptors and variants may be given by name or 0-based index. The read-only partner of [`set_impact!`](@ref).
-"""
-function get_impact(cib::CIB, src_desc, src_var, tgt_desc, tgt_var)
-    sourceIndex = _table_index(cib, src_desc, src_var)
-    targetIndex = _table_index(cib, tgt_desc, tgt_var)
-    return cib.cim[sourceIndex, targetIndex]
-end
-
-#endregion
-
 #region ─── Succession
 
 """
@@ -779,137 +686,90 @@ end
 
 #endregion
 
-
 #region "Branch-and-bound exhaustive search"
 
-# ═══ How branch-and-bound works ═══════════════════════════════════════════
-#
-# THE PROBLEM
-# -----------
-# The sweep above answers "which scenarios are consistent?" by building every
-# single scenario and testing it. That is honest but wasteful: a model with 10
-# descriptors of 3 variants each has 59,049 scenarios, and one with 20 such
-# descriptors has 3.5 billion. Usually only a handful are consistent.
-#
-# THE IDEA
-# --------
-# Instead of building whole scenarios, build them one descriptor at a time,
-# and throw away whole families of them at once.
-#
-# Picture a tree. At the top, nothing is decided. The first level picks a
-# variant for descriptor 1, the second level for descriptor 2, and so on; each
-# leaf at the bottom is one complete scenario. A "node" is a partly-filled-in
-# scenario, e.g. "Economy = Boom, Policy = Green, everything else undecided".
-#
-# The trick is that we can often prove a partial scenario is hopeless — that
-# NO way of filling in the remaining descriptors could ever be consistent. When
-# we can prove that, we discard the node and never visit anything beneath it.
-# Cutting a node at the point where 10 descriptors of 3 variants are still
-# undecided throws away 3^10 = 59,049 scenarios in a single test.
-#
-# HOW WE PROVE A NODE IS HOPELESS
-# -------------------------------
-# Remember what "consistent" means: for every descriptor, the variant the
-# scenario has chosen must score at least as well as its siblings (else that
-# descriptor would move, and it wouldn't be a fixed point).
-#
-# In a partial scenario we can't know a variant's final score, because the
-# undecided descriptors will still add to it. But we can BRACKET it. A
-# variant's final score is:
-#
-#     (what the already-decided descriptors contribute)   <- known exactly
-#   + (what the undecided descriptors will contribute)    <- unknown, but bounded
-#
-# The first part is tracked as we descend (`prefixBalance`). For the second we
-# precompute, once, the smallest and largest total the undecided descriptors
-# could possibly contribute (`_bnb_bounds` → `suffixMin` / `suffixMax`).
-#
-# Now compare a chosen variant with one of its siblings:
-#
-#   * chosen variant's BEST case  = its prefix + the most the rest could add
-#   * sibling's WORST case        = its prefix + the least the rest could add
-#
-# If the sibling's worst case still beats the chosen variant's best case, then
-# the sibling wins no matter how the undecided descriptors turn out. That
-# descriptor would always want to move. Every scenario below this node is
-# inconsistent — prune.
-#
-# A WORKED EXAMPLE
-# ----------------
-# Three descriptors: Economy (Boom/Bust), Policy (Green/Grey), Energy
-# (Renewable/Fossil). We have descended to the node
-#
-#     Economy = Boom, Policy = Green, Energy = still undecided
-#
-# and we are checking whether Policy is happy with Green. Between them, the
-# descriptors decided so far contribute to Policy's two variants:
-#
-#     Green: -4                      Grey: +5
-#
-# Energy is undecided; from the precomputed bounds, it will contribute:
-#
-#     to Green: between  0 and +1    to Grey: between +1 and +2
-#
-# So whatever Energy does:
-#
-#     Green ends up between -4 and -3   -> its BEST possible score is  -3
-#     Grey  ends up between +6 and +7   -> its WORST possible score is +6
-#
-# Grey's worst (+6) still beats Green's best (-3). So in every completion,
-# Policy abandons Green for Grey. Both scenarios under this node — (Boom,
-# Green, Renewable) and (Boom, Green, Fossil) — are inconsistent, and we
-# discard them without ever scoring them. In a 12-descriptor model the same
-# single test would have discarded tens of thousands.
-#
-# WHY THE ANSWER IS STILL EXACT
-# -----------------------------
-# Two things make this a shortcut rather than an approximation:
-#
-# 1. The bounds are conservative. We only ever prune when the sibling wins
-#    even in the most favourable case for the chosen variant, so a scenario
-#    that could be consistent is never discarded.
-#
-# 2. At the bottom of the tree, when every descriptor is decided, there is
-#    nothing left undecided, so the suffix bounds are all zero and both
-#    "brackets" collapse to the true score. The prune test becomes precisely
-#    the ordinary consistency test. That is why a leaf which survives the
-#    prune IS a fixed point and needs no further checking.
-#
-# The result is identical to the sweep's, right down to the ordering.
-#
-# WHY THERE IS A NODE BUDGET
-# --------------------------
-# Pruning only pays when the cross-impact matrix is strongly coupled, so that
-# descriptors decisively push each other around. If the impacts are weak or
-# evenly balanced, the brackets overlap almost everywhere, almost nothing gets
-# pruned, and we end up walking the whole tree — which is slower than the
-# sweep, because the sweep has the odometer trick and visits only the leaves
-# whereas the tree walk also visits every internal node.
-#
-# Measured on the sample models in test/sample_files (nodes visited, as a
-# percentage of the number of scenarios — lower is better):
-#
-#     CIB_nested         408,146,688 scenarios       33,395 nodes    0.01%
-#     CIB_natl_regional   22,674,816 scenarios       27,555 nodes    0.12%
-#     bench_50x50         60,466,176 scenarios    1,362,422 nodes    2.25%
-#     bench_typical           59,049 scenarios        8,037 nodes   13.6%
-#     bench_medium             1,024 scenarios        1,140 nodes  111%
-#     CIB_global                  36 scenarios           96 nodes  267%
-#
-# The big, strongly-coupled models are where the win is: CIB_nested finds its
-# 20 consistent scenarios after looking at one ten-thousandth of the space.
-# The last two lines are the failure mode — on tiny or weakly-coupled models
-# the walk costs MORE than checking every scenario, because of those internal
-# nodes.
-#
-# We can't tell which case we're in without trying, so the search is given a
-# budget of nodes it may visit. If it blows the budget, it abandons the
-# attempt and `_find_kernel` falls back to the sweep. This is also why
-# `:auto` doesn't even try branch-and-bound below 100,000 scenarios.
-#
-# ══════════════════════════════════════════════════════════════════════════
+"""═══ How branch-and-bound works ═══════════════════════════════════════════
+
+ THE PROBLEM
+ -----------
+The sweep above answers "which scenarios are consistent?" by building every single scenario and testing it. That is honest but wasteful: a model with 10 descriptors of 3 variants each has 59,049 scenarios, and one with 20 such descriptors has 3.5 billion. Usually only a handful are consistent.
+
+THE IDEA
+--------
+ Instead of building whole scenarios, build them one descriptor at a time, and throw away whole families of them at once.
+
+Picture a tree. At the top, nothing is decided. The first level picks a variant for descriptor 1, the second level for descriptor 2, and so on; each leaf at the bottom is one complete scenario. A "node" is a partly-filled-in scenario, e.g. "Economy = Boom, Policy = Green, everything else undecided".
+
+The trick is that we can often prove a partial scenario is hopeless — that NO way of filling in the remaining descriptors could ever be consistent. When we can prove that, we discard the node and never visit anything beneath it.
+Cutting a node at the point where 10 descriptors of 3 variants are stil undecided throws away 3^10 = 59,049 scenarios in a single test.
+
+HOW WE PROVE A NODE IS HOPELESS
+-------------------------------
+Remember what "consistent" means: for every descriptor, the variant the scenario has chosen must score at least as well as its siblings (else that descriptor would move, and it wouldn't be a fixed point).
+
+In a partial scenario we can't know a variant's final score, because the undecided descriptors will still add to it. But we can put limits on its score. A variant's final score is:
+
+     (what the already-decided descriptors contribute)   <- known exactly
+   + (what the undecided descriptors will contribute)    <- unknown, but bounded
+
+The first part is tracked as we descend (`prefixBalance`). For the second we precompute, once, the smallest and largest total the undecided descriptors could possibly contribute (`_bnb_bounds` → `suffixMin` / `suffixMax`).
+
+ Now compare a chosen variant with one of its siblings:
+
+   * chosen variant's BEST case  = its prefix + the most the rest could add
+   * sibling's WORST case        = its prefix + the least the rest could add
+
+If the sibling's worst case still beats the chosen variant's best case, then the sibling wins no matter how the undecided descriptors turn out. That descriptor would always want to move. Every scenario below the chosen variant is inconsistent so there's no need to look at any of them. 
+
+A WORKED EXAMPLE
+----------------
+Three descriptors: Economy (Boom/Bust), Policy (Green/Grey), Energy (Renewable/Fossil).
+We have descended to the node
+
+     Economy = Boom, Policy = Green, Energy = still undecided
+
+and we are checking whether Policy is happy with Green. Between them, the descriptors decided so far contribute to Policy's two variants:
+
+     Green: -4                      Grey: +5
+
+Energy is undecided; from the precomputed bounds, it will contribute:
+
+     to Green: between  0 and +1    to Grey: between +1 and +2
+
+ So whatever Energy does:
+
+     Green ends up between -4 and -3   -> its BEST possible score is  -3
+     Grey  ends up between +6 and +7   -> its WORST possible score is +6
+
+Grey's worst (+6) still beats Green's best (-3). So in every completion, Policy abandons Green for Grey. Both scenarios under this node — (Boom, Green, Renewable) and (Boom, Green, Fossil) — are inconsistent, and we discard them without ever scoring them. In a 12-descriptor model the same single test would have discarded tens of thousands.
+
+
+WHY THE ANSWER IS STILL EXACT
+-----------------------------
+Two things make this a shortcut rather than an approximation:
+
+1. The bounds are conservative. We only ever prune when the sibling wins even in the most favourable case for the chosen variant, so a scenario that could be consistent is never discarded.
+
+2. At the bottom of the tree, when every descriptor is decided, there is nothing left undecided, so the suffix bounds are all zero and both limits collapse to the true score. The prune test becomes precisely the ordinary consistency test. That is why a leaf which survives the prune IS a fixed point and needs no further checking.
+
+
+The result is identical to the sweep's.
+
+ WHY THERE IS A NODE BUDGET
+--------------------------
+Pruning only pays when the cross-impact matrix is strongly coupled, so that descriptors decisively push each other around.
+If the impacts are weak or evenly balanced, the brackets overlap almost everywhere, almost nothing gets pruned, and we end up walking the whole tree — which is slower than the sweep, because the sweep has the odometer trick and visits only the leaves whereas the tree walk also visits every internal node.
+
+testing on the sample files in the repository shows that the big, strongly-coupled models are where the win is: CIB_nested finds its 20 consistent scenarios after looking at one ten-thousandth of the space.
+
+In some cases - tiny or weakly-coupled models - this branch and bound takes more effort than it saves. So we say that it can run until it reaches a certain % of nodes and if it hasn't worked by then, it is abandonded for a full sweep using _find_kernel.
+
+══════════════════════════════════════════════════════════════════════════
+"""
 
 """
+TECHNICAL description of _bnb_bounds calculations
+
     _bnb_bounds(cib) -> (suffixMin, suffixMax)
 
 Precompute, for every variant column, how much the descriptors from `k` onwards could add to that column's score — at least (`suffixMin`) and at most (`suffixMax`). This is the "unknown but bounded" half of the bracket described in the section header, and it is computed once and reused by every node in the tree.
@@ -923,8 +783,8 @@ function _bnb_bounds(cib::CIB)
     cimTranspose = cib.cim_t
     suffixMin = zeros(Int, numberOfDescriptors + 1, numberOfDimensions)
     suffixMax = zeros(Int, numberOfDescriptors + 1, numberOfDimensions)
-    # Build the bounds back-to-front: descriptor k's bounds are its own
-    # best/worst row entry plus whatever descriptors k+1..end can add.
+
+    # Build the bounds back-to-front: descriptor k's bounds are its own best/worst row entry plus whatever descriptors k+1..end can add.
     # `ndesc:-1:1` is a range counting down (like range(n, 0, -1) in Python).
     @inbounds for descriptorIndex in numberOfDescriptors:-1:1
         offset = cib.desc_offsets[descriptorIndex]
@@ -945,19 +805,13 @@ function _bnb_bounds(cib::CIB)
     return suffixMin, suffixMax
 end
 
-# Everything one task needs while walking its part of the tree, bundled into a
-# struct so the recursion passes one argument instead of a dozen.
-#
-# `partialScenario` is the node we are currently at — the variants decided so
-# far. `prefixBalance` is what those decided descriptors contribute to every
-# variant's score: the "known exactly" half of the bracket in the section
-# header, kept up to date as we descend rather than recomputed at each node.
-#
-# The three fields after `foundFixedPoints` implement the node budget.
-# `nodesVisited` is this task's private counter (a `Ref` is a mutable
-# single-value box, needed because the struct itself is immutable), while
-# `totalNodes` and `abortFlag` are Atomics shared by every task — the Julia
-# equivalent of C#'s Interlocked operations.
+"""
+Everything one task needs while walking its part of the tree, bundled into a struct so the recursion passes one argument instead of a dozen.
+
+`partialScenario` is the node we are currently at — the variants decided so far. `prefixBalance` is what those decided descriptors contribute to every variant's score: the "known exactly" half of the bracket in the section header, kept up to date as we descend rather than recomputed at each node.
+
+The three fields after `foundFixedPoints` implement the node budget. `nodesVisited` is this task's private counter (a `Ref` is a mutable single-value box, needed because the struct itself is immutable), while `totalNodes` and `abortFlag` are Atomics shared by every task — the Julia equivalent of C#'s Interlocked operations.
+"""
 struct _BnBState
     cim_t::Matrix{Int}
     sufmin::Matrix{Int}
@@ -993,17 +847,11 @@ function _bnb_pruned(state::_BnBState, assignedCount::Int)
     @inbounds for descriptorIndex in 1:assignedCount
         offset = state.offsets[descriptorIndex]
         chosenColumn = offset + state.partialScenario[descriptorIndex] + 1
-        # Best case for the variant this branch chose: what the decided
-        # descriptors already give it, plus the most the undecided ones could
-        # add. A rival has to clear this (and the margin) to win outright.
+        # Best case for the variant this branch chose: what the decided descriptors already give it, plus the most the undecided ones could add. A rival has to clear this (and the margin) to win outright. 
         # In the worked example this is Green's -4 + 1 = -3.
         bestCaseChosen = prefixBalance[chosenColumn] + suffixMax[suffixRow, chosenColumn] + state.margin
         for column in offset+1:offset+state.nvariants[descriptorIndex]
-            # Worst case for a rival variant: its decided contribution plus the
-            # least the undecided descriptors could add — in the example,
-            # Grey's +5 + 1 = +6. If even that beats the chosen variant's best
-            # case, the rival wins however the rest turns out, so nothing below
-            # this node can be consistent.
+            # Worst case for a rival variant: its decided contribution plus the least the undecided descriptors could add — in the example, Grey's +5 + 1 = +6. If even that beats the chosen variant's best case, the rival wins however the rest turns out, so nothing below this node can be consistent.
             if prefixBalance[column] + suffixMin[suffixRow, column] > bestCaseChosen
                 return true
             end
@@ -1012,12 +860,11 @@ function _bnb_pruned(state::_BnBState, assignedCount::Int)
     return false
 end
 
-# Count one visited node against the budget (see "why there is a node budget"
-# in the section header). Every task keeps its own private tally and only adds
-# it to the shared total every 256 nodes, so the threads rarely have to touch
-# shared state — the exact count doesn't matter, only whether we are roughly
-# over budget. Returns false once the budget has been blown, which tells the
-# whole search to give up and let the caller fall back to the sweep.
+"""
+Count one visited node against the budget (see "why there is a node budget" in the section header). Every task keeps its own private tally and only adds
+# it to the shared total every 256 nodes, so the threads rarely have to touch shared state — the exact count doesn't matter, only whether we are roughly
+# over budget. Returns false once the budget has been blown, which tells the whole search to give up and let the caller fall back to the sweep.
+"""
 function _bnb_charge!(state::_BnBState)
     # `state.nodesVisited[]` — the [] reads/writes the value inside a Ref box.
     state.nodesVisited[] += 1
@@ -1032,17 +879,13 @@ function _bnb_charge!(state::_BnBState)
     return true
 end
 
-# Visit one level of the tree: try each variant of descriptor `depth` in turn,
-# and for each one either prune it or recurse into the descriptors below it.
-# This is the depth-first walk itself — "decide one more descriptor, see if the
-# result is already hopeless, and if not keep going".
-#
-# Only one scenario buffer exists per task, so each variant is pushed onto the
-# running prefix balance before descending and popped off afterwards, leaving
-# the state exactly as it was found. That is why there is no per-node
-# allocation despite the recursion.
-#
-# Returns false if the node budget ran out and the search is abandoning.
+"""
+Visit one level of the tree: try each variant of descriptor `depth` in turn, and for each one either prune it or recurse into the descriptors below it. This is the depth-first walk itself — "decide one more descriptor, see if the result is already hopeless, and if not keep going".
+
+Only one scenario buffer exists per task, so each variant is pushed onto the running prefix balance before descending and popped off afterwards, leaving the state exactly as it was found. That is why there is no per-node allocation despite the recursion.
+
+Returns false if the node budget ran out and the search is abandoning.
+"""
 function _bnb_node!(state::_BnBState, depth::Int)
     variantCount = state.nvariants[depth]
     offset = state.offsets[depth]
@@ -1171,13 +1014,11 @@ For example, the first phase works out that scenario A maps to B, B maps to C, a
 The default [`GlobalSuccession`](@ref) rule takes a fast path: the successor table is filled by a mixed-radix odometer that maintains the impact balance incrementally (one row delta per scenario, no allocation) instead of calling [`succession_step`](@ref) per scenario. Any other rule uses the generic per-scenario path — identical output, just slower.
 """
 function find_basins(cib::CIB; rule::SuccessionRule=GlobalSuccession())
-    return _basins(rule, cib)
+    return _find_basins(rule, cib)
 end
 
-# Fast path, selected by dispatch when the rule is exactly GlobalSuccession.
-# The odometer chunk re-derives that rule's argmax semantics internally,
-# which is exactly why this specialisation cannot serve an arbitrary rule.
-function _basins(::GlobalSuccession, cib::CIB)
+# Fast path, selected by dispatch when the rule is exactly GlobalSuccession. The odometer chunk re-derives that rule's argmax semantics internally,which is exactly why this specialisation cannot serve an arbitrary rule.
+function _find_basins(::GlobalSuccession, cib::CIB)
     numberOfScenarios = max_signature(cib) + 1
     scoreType = _score_type(cib)
     # Store table entries as Int32 when every signature fits — half the
@@ -1188,8 +1029,7 @@ function _basins(::GlobalSuccession, cib::CIB)
     return _fast_basins(cib, Int64, Matrix{scoreType}(cib.cim_t))
 end
 
-# `::Type{SignatureInt}` receives a TYPE as an argument value (Int32 or
-# Int64 above) — passing types around as ordinary values is normal in Julia.
+# `::Type{SignatureInt}` receives a TYPE as an argument value (Int32 or Int64 above) — passing types around as ordinary values is normal in Julia.
 function _fast_basins(cib::CIB, ::Type{SignatureInt},
                       cimTranspose::Matrix{ScoreInt}) where {SignatureInt<:Union{Int32,Int64}, ScoreInt<:Signed}
     numberOfScenarios = max_signature(cib) + 1
@@ -1200,10 +1040,8 @@ function _fast_basins(cib::CIB, ::Type{SignatureInt},
     return (fixedPoints, basinSizes, cycleCount)
 end
 
-# Generic path: works for any rule, because it only ever calls the rule's
-# own succession_step. Allocates a few vectors per scenario, so it is much
-# slower than the odometer path — a correctness baseline, not a hot loop.
-function _basins(rule::SuccessionRule, cib::CIB)
+# Generic path: works for any rule, because it only ever calls the rule's own succession_step. Allocates a few vectors per scenario, so it is much slower than the odometer path — a correctness baseline or for use when there is no alternative
+function _find_basins(rule::SuccessionRule, cib::CIB)
     numberOfScenarios = max_signature(cib) + 1
     if numberOfScenarios <= Int(typemax(Int32)) - 1
         return _generic_basins(rule, cib, Int32)
@@ -1221,8 +1059,7 @@ function _generic_basins(rule::SuccessionRule, cib::CIB,
         firstSignature = (threadIndex - 1) * chunkSize
         lastSignature = min(threadIndex * chunkSize, numberOfScenarios) - 1
         firstSignature > lastSignature && continue
-        # Each task writes a disjoint range of the table, so there is no
-        # data race even though they share the array.
+        # Each task writes a disjoint range of the table, so there is no data race even though they share the array.
         Threads.@spawn for currentSignature in firstSignature:lastSignature
             scenario = inv_signature(cib, currentSignature)
             successor = succession_step(rule, cib, scenario)
@@ -1268,9 +1105,7 @@ function _successor_table!(successorTable::Vector{SignatureInt}, cib::CIB,
     return successorTable
 end
 
-# The per-chunk worker for the successor table. Same odometer + incremental
-# impact balance as _sweep_chunk_all!, but instead of a yes/no consistency
-# test it records where every scenario steps to.
+# The per-chunk worker for the successor table. Same odometer + incremental impact balance as _sweep_chunk_all!, but instead of a yes/no consistency test it records where every scenario steps to.
 function _successor_chunk!(successorTable::Vector{SignatureInt}, cimTranspose::Matrix{ScoreInt},
                            firstSignature::Int, lastSignature::Int,
                            variantCounts::Vector{Int}, descriptorOffsets::Vector{Int},
@@ -1280,8 +1115,7 @@ function _successor_chunk!(successorTable::Vector{SignatureInt}, cimTranspose::M
     activeRows    = Vector{Int}(undef, numberOfDescriptors)
     impactBalance = zeros(ScoreInt, numberOfDimensions)
 
-    # Decode the starting signature and build the initial impact balance,
-    # exactly as in _sweep_chunk_all!.
+    # Decode the starting signature and build the initial impact balance, exactly as in _sweep_chunk_all!.
     remainder = firstSignature
     @inbounds for descriptorIndex in 1:numberOfDescriptors
         variantCount = variantCounts[descriptorIndex]
@@ -1297,8 +1131,7 @@ function _successor_chunk!(successorTable::Vector{SignatureInt}, cimTranspose::M
     end
 
     @inbounds for currentSignature in firstSignature:lastSignature
-        # ── Successor: every descriptor independently picks its best-scoring
-        #    variant, and the choices are assembled straight into a signature.
+        # ── Successor: every descriptor independently picks its best-scoring variant, and the choices are assembled straight into a signature.
         successorSignature = 0
         for descriptorIndex in 1:numberOfDescriptors
             offset = descriptorOffsets[descriptorIndex]
@@ -1492,5 +1325,99 @@ function _resolve_and_tally(successorTable::Vector{SignatureInt},
 end
 
 #endregion
+
+#region "Reading and editing the cross-impact matrix"
+
+# Everything else in this file addresses the matrix by flat row/column number,
+# because that is what the hot loops need. These helpers are the human-facing
+# way in: they let a caller say "the impact of Trade=Free on Growth=High"
+# instead of "cim[4, 9]", and they are what the Python and C wrappers call.
+#
+# Nothing inside the engine uses them — they exist purely so that a model can
+# be inspected and edited from outside without re-parsing the .scw file, which
+# is what makes sensitivity sweeps (change one judgement, re-run) cheap.
+
+"""
+    _desc_index(cib, descriptor) -> Int
+
+Resolve a descriptor given by name (`AbstractString`) or 0-based index (`Integer`) to its 1-based position in `cib.descriptors`. Throws on an unknown name or an out-of-range index.
+"""
+# Two methods, one name: Julia picks between them on the TYPE of the second
+# argument (multiple dispatch), so the caller can pass either "Trade" or 0.
+function _desc_index(cib::CIB, descriptor::AbstractString)
+    position = findfirst(==(String(descriptor)), cib.descriptors)
+    isnothing(position) && throw(ArgumentError(
+        "Unknown descriptor: \"$descriptor\". Available: $(join(cib.descriptors, ", "))"))
+    return position
+end
+
+function _desc_index(cib::CIB, descriptor::Integer)
+    (0 <= descriptor < cib.numberOfDescriptors) || throw(ArgumentError(
+        "Descriptor index $descriptor out of range 0:$(cib.numberOfDescriptors - 1)"))
+    return Int(descriptor) + 1     # callers count descriptors from 0, arrays from 1
+end
+
+"""
+    _table_index(cib, descriptor, variant) -> Int
+
+Resolve a (descriptor, variant) pair to the 1-based flat row/column index into `cib.cim`. Both may be given by name (`AbstractString`) or by 0-based index (`Integer`).
+
+This is the same offset arithmetic the scoring loops do inline — descriptor `i`'s variants start at `desc_offsets[i]`, so variant `v` of that descriptor lives at `desc_offsets[i] + v + 1`.
+"""
+function _table_index(cib::CIB, descriptor, variant::AbstractString)
+    descriptorPosition = _desc_index(cib, descriptor)
+    descriptorName = cib.descriptors[descriptorPosition]
+    variantNames = cib.variants[descriptorName]
+    variantPosition = findfirst(==(String(variant)), variantNames)
+    isnothing(variantPosition) && throw(ArgumentError(
+        "Unknown variant \"$variant\" for descriptor \"$descriptorName\". " *
+        "Available: $(join(variantNames, ", "))"))
+    # findfirst already returns a 1-based position, so no +1 here.
+    return cib.desc_offsets[descriptorPosition] + variantPosition
+end
+
+function _table_index(cib::CIB, descriptor, variant::Integer)
+    descriptorPosition = _desc_index(cib, descriptor)
+    variantCount = cib.numberOfVariants[descriptorPosition]
+    (0 <= variant < variantCount) || throw(ArgumentError(
+        "Variant index $variant out of range 0:$(variantCount - 1) " *
+        "for descriptor \"$(cib.descriptors[descriptorPosition])\""))
+    return cib.desc_offsets[descriptorPosition] + Int(variant) + 1
+end
+
+"""
+    set_impact!(cib, src_desc, src_var, tgt_desc, tgt_var, value) -> Int
+
+Set the cross-impact contributed by the source variant (`src_desc`=`src_var`) onto the target variant (`tgt_desc`=`tgt_var`), i.e. `cim[source, target]`, and return the previous value.
+
+Descriptors and variants may be given by name (`AbstractString`) or by 0-based index (`Integer`). This updates **both** the cross-impact matrix `cim` and its stored transpose `cim_t`, so that every analysis routine — which may read either — sees a consistent matrix.
+
+Because the matrices are edited in place, the already-loaded model changes without any re-parse of the `.scw` file; the next [`find_consistent`](@ref) or [`find_basins`](@ref) call reflects the new value. That is what makes it cheap to sweep one expert judgement across a range and watch the consistent scenarios move.
+
+Note the `!` in the name: by Julia convention it warns that the argument is modified rather than copied.
+"""
+function set_impact!(cib::CIB, src_desc, src_var, tgt_desc, tgt_var, value::Integer)
+    sourceIndex = _table_index(cib, src_desc, src_var)
+    targetIndex = _table_index(cib, tgt_desc, tgt_var)
+    previousValue = cib.cim[sourceIndex, targetIndex]
+    newValue = Int(value)
+    cib.cim[sourceIndex, targetIndex]   = newValue
+    cib.cim_t[targetIndex, sourceIndex] = newValue   # keep the transpose in sync
+    return previousValue
+end
+
+"""
+    get_impact(cib, src_desc, src_var, tgt_desc, tgt_var) -> Int
+
+Return the current cross-impact `cim[source, target]` contributed by the source variant (`src_desc`=`src_var`) onto the target variant (`tgt_desc`=`tgt_var`). Descriptors and variants may be given by name or 0-based index. The read-only partner of [`set_impact!`](@ref).
+"""
+function get_impact(cib::CIB, src_desc, src_var, tgt_desc, tgt_var)
+    sourceIndex = _table_index(cib, src_desc, src_var)
+    targetIndex = _table_index(cib, tgt_desc, tgt_var)
+    return cib.cim[sourceIndex, targetIndex]
+end
+
+#endregion
+
 
 end
