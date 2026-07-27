@@ -8,12 +8,60 @@ Weimer-Jehle, W. (2006). Cross-impact balances: A system-theoretical approach to
 """
 module CrossImpactBalances
 
+# `export` lists the names visible after `using CrossImpactBalances` — like
+# Python's `__all__` or C#'s `public`. Everything else in the module is still
+# reachable as `CrossImpactBalances.name`, it just isn't brought into scope
+# automatically. Names starting with an underscore are internal helpers.
 export CIB, load_scw, load_solutions,
        impact_balance,
        SuccessionRule, GlobalSuccession, SequentialSuccession,
        succession_step,
        find_consistent, find_basins,
        signature, inv_signature, max_signature
+
+# ── Julia notes for readers coming from Python or .NET ──────────────────────
+#
+# Features that recur throughout this file:
+#
+# * 1-based indexing: Julia arrays start at index 1 (like MATLAB/Fortran),
+#   and a range `1:n` includes BOTH endpoints. Scenarios themselves store
+#   0-based variant numbers (matching the Python original and the signature
+#   arithmetic), which is why many array accesses add `+ 1`.
+#
+# * Multiple dispatch: several functions below share one name but differ in
+#   their argument TYPES (e.g. `succession_step(::GlobalSuccession, ...)` vs
+#   `succession_step(::SequentialSuccession, ...)`). Julia picks the method
+#   from the runtime types of all arguments — like C# method overloading,
+#   but resolved dynamically, and it is the standard way to write what
+#   Python/C# would express with an interface or virtual method.
+#
+# * A trailing `!` in a function name (e.g. `push!`, `_successor_table!`) is
+#   a naming convention meaning "this function mutates one of its
+#   arguments". It has no effect on behaviour — it is a warning label.
+#
+# * Words starting with `@` are macros — code transformations applied before
+#   compilation. The ones used here are performance/threading annotations:
+#   `@inbounds` (skip array bounds checks), `@simd` (allow vectorisation),
+#   `Threads.@spawn` (run on a worker thread, like Task.Run), `@sync` (wait
+#   for all tasks spawned inside the block, like Task.WaitAll), and `@view`
+#   (slice an array without copying it).
+#
+# * `:auto`, `:sweep`, `:bnb` are Symbols — lightweight interned names, used
+#   here the way C# would use an enum or Python a short string constant.
+#
+# * `Union{Nothing, Int}` is a nullable type (C#'s `int?`); `nothing` plays
+#   the role of null/None, tested with `isnothing(x)` or `x === nothing`.
+#
+# * `condition && action` and `condition || action` are used as one-line if
+#   statements: `&&` runs the action only when the condition is true,
+#   `||` only when it is false (e.g. `isempty(s) && continue`).
+#
+# * `"""docstrings"""` directly above a definition are attached to it as
+#   documentation (visible via `?name` in the REPL); `[`Name`](@ref)` inside
+#   them is a cross-reference link for the documentation generator.
+#
+# * `#region` / `#endregion` comments are only editor folding markers
+#   (recognised by VS Code); Julia ignores them.
 
 """
     CIB
@@ -31,7 +79,8 @@ Fields:
 - `consistentScenarios`: list of consistent scenarios (each a Vector{Int}, 0-based variant indices)
 - `desc_offsets`: cumulative 0-based variant offsets per descriptor, shows where in the CIM each descriptor's variants start
 
-`CIB` is immutable in its field bindings. `kernel` is a `Vector` whose contents may be mutated in place.
+A `struct` in Julia is immutable: the field *bindings* can never be reassigned after construction (like a C# readonly record or a frozen dataclass). The arrays the fields point at can still have their *contents*
+changed — which is how `consistentScenarios` gets filled in after the object is built.
 """
 struct CIB
     descriptors::Vector{String}
@@ -44,6 +93,22 @@ struct CIB
     consistentScenarios::Vector{Vector{Int}}
     desc_offsets::Vector{Int}
 end
+
+"""
+    _score_type(cib) -> Type{<:Signed}
+
+Narrowest safe integer type for impact-balance accumulation. `Int16` when `4 * (ndesc + 1) * maximum(abs, cim)` fits (margin covers the incremental row-delta updates; Int16 arithmetic wraps silently, so this guard is the only protection), otherwise `Int`. Realistic CIB matrices (entries ±3) are far inside the Int16 bound. Narrower integers matter because SIMD processes twice as many Int16 values per instruction as Int32.
+    
+Basically, Int16 is faster so use it if possible, and only for extremely large CIB matrices would the value of a scenario possibly be above the Int16 limit of 32,767)
+"""
+function _score_type(cib::CIB)
+    # `cond ? a : b` is the ternary operator, as in C#.
+    maxAbsoluteImpact = cib.numberOfDimensions == 0 ? 0 : Int(maximum(abs, cib.cim))
+    return 4 * (cib.numberOfDescriptors + 1) * maxAbsoluteImpact <= Int(typemax(Int16)) ? Int16 : Int
+end
+#TODO: should really be a property of the CIB not computed multiple times. also, it's in the wrong place, this section is for sweeps
+
+
 
 #region "files parsers"
 # ─── .scw file parser ───────────────────────────────────────────────────────
@@ -61,83 +126,105 @@ function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
                   algorithm::Symbol=:auto)
     descriptors = String[]
     variants = Dict{String, Vector{String}}()
-    nvars = Int[]
+    variantCounts = Int[]        # how many variants each descriptor has
 
-    # State machine
-    s = 0
-    n = 0       # total variant count
-    d = -1      # descriptor counter
-    v = 0       # variant counter for current descriptor
-    r = 0       # row counter for CIM
-    current_desc = ""
+    # The .scw format is line-oriented: a header section listing descriptors
+    # ('&' lines) and their variants ('-' lines), then six '#'-separated
+    # sections, the sixth of which is the cross-impact matrix as CSV rows.
+    # We read it with a small state machine: parserState 0 is the header,
+    # each '#' line advances the state, and state 5 collects matrix rows.
+    parserState = 0
+    totalVariants = 0            # running count of all variants seen
+    descriptorsSeen = -1         # -1 until the first descriptor line arrives
+    variantsInCurrent = 0        # variants seen for the descriptor being read
+    currentDescriptor = ""
 
-    # First pass: count dimensions
-    cim_rows = Vector{Vector{Int}}()
+    matrixRows = Vector{Vector{Int}}()   # raw CIM rows, validated below
 
     for line in eachline(scw_file)
         stripped = lstrip(line)
-        isempty(stripped) && continue
+        isempty(stripped) && continue    # skip blank lines
 
-        if s == 0
+        if parserState == 0
             if stripped[1] == '&'
-                desc = strip(stripped[2:end])
-                push!(descriptors, desc)
-                variants[desc] = String[]
-                if d > -1
-                    push!(nvars, v)
+                # A new descriptor. Before starting it, record how many
+                # variants the previous descriptor had (skipped for the very
+                # first one, when descriptorsSeen is still -1).
+                descriptorName = strip(stripped[2:end])
+                push!(descriptors, descriptorName)
+                variants[descriptorName] = String[]
+                if descriptorsSeen > -1
+                    push!(variantCounts, variantsInCurrent)
                 end
-                v = 0
-                d += 1
-                current_desc = desc
+                variantsInCurrent = 0
+                descriptorsSeen += 1
+                currentDescriptor = descriptorName
             elseif stripped[1] == '-'
-                push!(variants[current_desc], strip(stripped[2:end]))
-                n += 1
-                v += 1
+                # A variant belonging to the descriptor currently being read.
+                push!(variants[currentDescriptor], strip(stripped[2:end]))
+                totalVariants += 1
+                variantsInCurrent += 1
             elseif stripped[1] == '#'
-                s = 1
-                push!(nvars, v)
+                # End of the header: close out the last descriptor's count
+                # and move to section 1.
+                parserState = 1
+                push!(variantCounts, variantsInCurrent)
             end
-        elseif s < 5 && stripped[1] == '#'
-            s += 1
-        elseif s == 5
+        elseif parserState < 5 && stripped[1] == '#'
+            # Sections 1-4 hold ScenarioWizard metadata we don't need; just
+            # count the '#' separators until the matrix section arrives.
+            parserState += 1
+        elseif parserState == 5
             if stripped[1] == '#'
-                s += 1
+                parserState += 1     # '#' after the matrix: we're done reading
             else
-                row = parse.(Int, split(stripped, ','))
-                push!(cim_rows, row)
-                r += 1
+                # A matrix row: comma-separated integers. `parse.(Int, ...)`
+                # uses broadcasting — the dot applies `parse` to every element
+                # of the split list at once (like Python's map / LINQ Select).
+                rowValues = parse.(Int, split(stripped, ','))
+                push!(matrixRows, rowValues)
             end
         end
     end
 
-    n == 0 && error("load_scw: no variants found in $(scw_file) — file is empty or malformed")
-    length(cim_rows) == n || error("load_scw: cross-impact matrix has $(length(cim_rows)) " *
-                                   "rows but $n variants in $(scw_file)")
+    # `$(...)` inside a string is interpolation, like Python f-strings.
+    totalVariants == 0 && error("load_scw: no variants found in $(scw_file) — file is empty or malformed")
+    length(matrixRows) == totalVariants ||
+        error("load_scw: cross-impact matrix has $(length(matrixRows)) " *
+              "rows but $totalVariants variants in $(scw_file)")
 
-    # Build CIM matrix
-    cim = zeros(Int, n, n)
-    for (i, row) in enumerate(cim_rows)
-        length(row) == n || error("load_scw: row $i of CIM has $(length(row)) entries but $n expected")
-        for (j, val) in enumerate(row)
-            cim[i, j] = val
+    # Copy the validated rows into a proper square matrix.
+    cim = zeros(Int, totalVariants, totalVariants)
+    for (rowIndex, rowValues) in enumerate(matrixRows)
+        length(rowValues) == totalVariants ||
+            error("load_scw: row $rowIndex of CIM has $(length(rowValues)) entries but $totalVariants expected")
+        for (columnIndex, value) in enumerate(rowValues)
+            cim[rowIndex, columnIndex] = value
         end
     end
 
-    ndesc = d + 1
+    numberOfDescriptors = descriptorsSeen + 1
 
-    desc_offsets = Vector{Int}(undef, ndesc)
-    off = 0
-    for i in 1:ndesc
-        desc_offsets[i] = off
-        off += nvars[i]
+    # desc_offsets[i] is where descriptor i's block of variants starts in the
+    # matrix (0-based). E.g. with variant counts [3, 2, 4] the offsets are
+    # [0, 3, 5]: descriptor 2's variants occupy matrix rows 4 and 5.
+    desc_offsets = Vector{Int}(undef, numberOfDescriptors)  # undef = allocate without initialising
+    runningOffset = 0
+    for descriptorIndex in 1:numberOfDescriptors
+        desc_offsets[descriptorIndex] = runningOffset
+        runningOffset += variantCounts[descriptorIndex]
     end
 
     # Precompute the transpose so impact_balance / find_basins can do
     # contiguous SIMD column reads in cim_t (= the row vectors of cim).
+    # Julia stores matrices column-major (like Fortran, unlike C#/NumPy's
+    # default row-major), so summing down a column is the fast direction.
     cim_t = permutedims(cim)
 
-    # Build CIB without a kernel first; if needed, populate kernel in place.
-    cib = CIB(descriptors, variants, nvars, cim, cim_t, n, ndesc,
+    # Build the CIB with an empty kernel first, then fill the kernel in
+    # place (the struct is immutable, but the vector's contents are not).
+    cib = CIB(descriptors, variants, variantCounts, cim, cim_t,
+              totalVariants, numberOfDescriptors,
               Vector{Vector{Int}}(), desc_offsets)
 
     if !isnothing(kernel)
@@ -159,21 +246,22 @@ end
 Parse a ScenarioWizard .sl solutions file. Returns 0-based variant indices.
 """
 function load_solutions(cib::CIB, sl_file::String)
-    kern = Vector{Vector{Int}}()
+    solutions = Vector{Vector{Int}}()
     for line in eachline(sl_file)
         stripped = lstrip(line)
         isempty(stripped) && continue
-        stripped[1] != '"' && continue
+        stripped[1] != '"' && continue   # solution lines start with a quote
 
         # Extract the quoted index string, e.g. "2 3 2"
-        m = match(r"^\"([^\"]+)\"", stripped)
-        isnothing(m) && continue
+        quoted = match(r"^\"([^\"]+)\"", stripped)
+        isnothing(quoted) && continue
 
-        indices = parse.(Int, split(strip(m.captures[1])))
-        # Convert from 1-based (ScenarioWizard) to 0-based (internal)
-        push!(kern, indices .- 1)
+        indices = parse.(Int, split(strip(quoted.captures[1])))
+        # ScenarioWizard numbers variants from 1; internally we use 0-based
+        # numbers. `.- 1` is a broadcast: subtract 1 from every element.
+        push!(solutions, indices .- 1)
     end
-    return kern
+    return solutions
 end
 #endregion
 
@@ -182,28 +270,32 @@ end
 """
     signature(cib, u) -> Int
 
-Compute a unique, sequential, integer signature for scenario `u` (0-based variant indices). Used for the mixed radix step through of scenarios
+Compute a unique, sequential, integer signature for scenario `u` (0-based variant indices).
+
+A scenario is a choice of one variant per descriptor. Treating those choices as the digits of a mixed-radix number (each descriptor's "digit" can count up to its own variant count) maps every scenario to a distinct integer in `0:max_signature(cib)` — exactly like reading [7, 2, 4] as a decimal number, except each position can have a different base. This lets the search code step through all scenarios with a single counter and avoids expensive modulus operations
 """
-function signature(cib::CIB, scenarios::Vector{Int})
-    sig = 0
-    order = 1
-    for (scenarioNumber, variantNumber) in zip(scenarios, cib.numberOfVariants)
-        sig += order * scenarioNumber
-        order *= variantNumber
+function signature(cib::CIB, scenario::Vector{Int})
+    signatureValue = 0
+    placeValue = 1     # the "place value" of the current digit (1, then ×base each step)
+    # zip pairs each descriptor's chosen variant with its variant count, like Python's zip.
+    for (chosenVariant, variantCount) in zip(scenario, cib.numberOfVariants)
+        signatureValue += placeValue * chosenVariant
+        placeValue *= variantCount
     end
-    return sig
+    return signatureValue
 end
 
 """
     inv_signature(cib, s) -> Vector{Int}
 
-Convert a signature back to a scenario (0-based variant indices).
+Convert a signature back to a scenario (0-based variant indices), the reverse of the function above
 """
-function inv_signature(cib::CIB, signature::Int)
+function inv_signature(cib::CIB, signatureValue::Int)
     scenario = Int[]
-    for variantNumber in cib.numberOfVariants
-        push!(scenario, signature % variantNumber)
-        signature = signature ÷ variantNumber
+    for variantCount in cib.numberOfVariants
+        # `%` is remainder, `÷` is integer division (Python's //, C#'s /).
+        push!(scenario, signatureValue % variantCount)
+        signatureValue = signatureValue ÷ variantCount
     end
     return scenario
 end
@@ -214,7 +306,10 @@ end
 The maximum signature value (= total scenarios - 1).
 """
 function max_signature(cib::CIB)
-    return signature(cib, [nv - 1 for nv in cib.numberOfVariants])
+    # The largest signature belongs to the scenario picking the last variant
+    # of every descriptor. `[... for ... in ...]` is a comprehension, as in
+    # Python.
+    return signature(cib, [variantCount - 1 for variantCount in cib.numberOfVariants])
 end
 #endregion
 
@@ -223,19 +318,23 @@ end
 """
     impact_balance(cib, u) -> Vector{Int}
 
-Compute the impact balance vector for scenario `u`.
-
-    Returns a vector of length ndim (one score per variant across all descriptors).
+Compute the impact balance vector for scenario `u`: one score per variant across all descriptors (length `numberOfDimensions`). The score of a variant is the total impact the scenario's chosen variants exert on it — the higher the score, the better that variant fits the scenario.
 """
-function impact_balance(cib::CIB, scenarios::Vector{Int})
-    noOfDimensions = cib.numberOfDimensions                       
-    impactBalance = zeros(Int, noOfDimensions)               #create an empty array for the IB results
-    cim_t = cib.cim_t                      # row r of cim lives at column r of cim_t, transpose the matrix so we can use SIMD
-    offsets = cib.desc_offsets
-    @inbounds for (i, scenario) in enumerate(scenarios)  #don't need bounds checking, for speed
-        r = offsets[i] + scenario + 1
-        @simd for j in 1:noOfDimensions
-            impactBalance[j] += cim_t[j, r]           # contiguous column read → AVX
+function impact_balance(cib::CIB, scenario::Vector{Int})
+    numberOfDimensions = cib.numberOfDimensions
+    impactBalance = zeros(Int, numberOfDimensions)
+
+    # Work with the transposed matrix. this is a trick to allow the CPU to use SIMD instructions.
+    cimTranspose = cib.cim_t
+    descriptorOffsets = cib.desc_offsets
+
+    # @inbounds tells Julia to skip array bounds checking inside the block — the equivalent of unchecked array access in C#. Safe here because all the indices are derived from the CIB's own dimensions.
+    @inbounds for (descriptorIndex, chosenVariant) in enumerate(scenario)
+        # The matrix row belonging to this descriptor's chosen variant (+1 converts the 0-based variant number to a 1-based array index).
+        sourceRow = descriptorOffsets[descriptorIndex] + chosenVariant + 1
+        # @simd allows the compiler to vectorise this accumulation loop (process several array elements per CPU instruction).
+        @simd for targetVariant in 1:numberOfDimensions
+            impactBalance[targetVariant] += cimTranspose[targetVariant, sourceRow]
         end
     end
     return impactBalance
@@ -243,26 +342,26 @@ end
 
 #endregion
 
-#region ─── Succession 
+#region ─── Succession
 
 """
     SuccessionRule
 
-Succession is one of the two core concepts of CIB - "how do we move from one scenario to the next". The other core concept is consistency - "is this scenario better than others".
+Succession is one of the two core concepts of CIB - "how do we move from one scenario to the next".
+The other core concept is consistency - "is this scenario better than others".
 Note that these concepts are separate in that the question of whether there is a better scenario is separate from the question of how to get there.
 
-To allow flexibility in how succession is calculated, we define here an abstract supertype called [`SuccessionRule`](@ref). 
+To allow flexibility in how succession is calculated, we define here an abstract supertype called [`SuccessionRule`](@ref). An abstract type cannot be instantiated itself — it only serves as a parent for concrete rule types, the way an interface or abstract base class would in C# or Python.
 
 To add in a new rule, define
 
     struct MyRule <: SuccessionRule end
 
-and a single method
+(`<:` means "is a subtype of") and a single method
 
     succession_step(rule::MyRule, cib::CIB, u::Vector{Int}) -> Vector{Int}
 
-and every analysis routine — [`find_consistent`](@ref) and [`find_basins`](@ref) — works with it immediately. The only assumption is that SuccessionRule depends only on the current scenario, not the path to get there (in technical terms, it's a Markov process).
-
+and every analysis routine — [`find_consistent`](@ref) and [`find_basins`](@ref) — works with it immediately, because they dispatch on the rule's type. The only assumption is that a SuccessionRule depends only on the current scenario, not the path taken to get there (in technical terms, it's a Markov process).
 """
 abstract type SuccessionRule end
 
@@ -273,8 +372,6 @@ struct GlobalSuccession <: SuccessionRule end
 
 """
 Sequential (successive / Gauss–Seidel) succession: descriptors are updated one at a time in descriptor order, each using the impact balance of the scenario *as already partially updated within the same step*.
-
-Although its *trajectories* differ from [`GlobalSuccession`](@ref) (the successor of a non-fixed scenario depends on the update order), its *fixed points* are identical: at a scenario where no variant strictly beats the current one in `impact_balance(u)`, no descriptor ever fires, so the intermediate states never leave `u` — and conversely the first descriptor with a strict improver fires while the intermediate state is still `u`. It therefore declares [`fixed_point_margin`](@ref)` = 0` and shares the fast `find_consistent` searches. `find_basins` still uses the generic per-scenario path, because basins depend on the trajectories, not just the fixed points.
 """
 struct SequentialSuccession <: SuccessionRule end
 
@@ -285,45 +382,56 @@ struct SequentialSuccession <: SuccessionRule end
 One step of succession under `rule`.
 """
 function succession_step(::GlobalSuccession, cib::CIB, scenario::Vector{Int})
+
+    # Score every variant against the CURRENT scenario once, then let each descriptor independently pick its best variant from those scores.
     impactBalance = impact_balance(cib, scenario)
     successor = copy(scenario)
-    start = 1  # 1-based index into ib
-    for i in 1:cib.numberOfDescriptors
-        noOfVariants = cib.numberOfVariants[i]
-        stop = start + noOfVariants - 1
-        ib_desc = @view impactBalance[start:stop]
-        max_val = ib_desc[scenario[i] + 1]  # current variant's score (+1 for 1-based)
-        for j in 0:noOfVariants-1
-            if ib_desc[j + 1] > max_val  # strict >, so ties keep current/lower index
-                max_val = ib_desc[j + 1]
-                successor[i] = j
+    firstColumn = 1     # start of this descriptor's block in impactBalance (1-based). will be increased by the number of variants to point to the start of the next descriptor's block later on
+
+    for descriptorIndex in 1:cib.numberOfDescriptors
+        variantCount = cib.numberOfVariants[descriptorIndex]
+        lastColumn = firstColumn + variantCount - 1
+
+        # @view slices without copying — like a NumPy view or a C# Span, not the fresh array a plain slice would allocate.
+        descriptorScores = @view impactBalance[firstColumn:lastColumn]
+
+        # Seed the running best with the CURRENT variant's score, so a tie  can never displace it.
+        bestScore = descriptorScores[scenario[descriptorIndex] + 1]
+        for variantIndex in 0:variantCount-1
+
+            # Strict > means ties keep the current variant, and among equal challengers the lowest index wins (it is reached first).
+            if descriptorScores[variantIndex + 1] > bestScore
+                bestScore = descriptorScores[variantIndex + 1]
+                successor[descriptorIndex] = variantIndex
             end
         end
-        start = stop + 1
+        firstColumn = lastColumn + 1
     end
     return successor
 end
 
+"""
+as above except for the SequentialSuccession rule
+"""
 function succession_step(::SequentialSuccession, cib::CIB, scenario::Vector{Int})
     successor = copy(scenario)
-    @inbounds for i in 1:cib.numberOfDescriptors
-        impactBalance = impact_balance(cib, successor)     # recomputed from the partially-updated v
-        offset = cib.desc_offsets[i]
-        noOfvariants = cib.numberOfVariants[i]
-        max_val = impactBalance[offset + successor[i] + 1]    # current variant's score (favour on ties)
-        for j in 0:noOfvariants-1
-            if impactBalance[offset + j + 1] > max_val
-                max_val = impactBalance[offset + j + 1]
-                successor[i] = j
+    @inbounds for descriptorIndex in 1:cib.numberOfDescriptors
+        # Unlike the global rule, the scores are recomputed for EVERY descriptor, from the partially-updated successor — so descriptor 2 already sees whatever descriptor 1 just changed.
+        impactBalance = impact_balance(cib, successor)
+        offset = cib.desc_offsets[descriptorIndex]
+        variantCount = cib.numberOfVariants[descriptorIndex]
+
+        # Current variant's score seeds the best, so ties favour it.
+        bestScore = impactBalance[offset + successor[descriptorIndex] + 1]
+        for variantIndex in 0:variantCount-1
+            if impactBalance[offset + variantIndex + 1] > bestScore
+                bestScore = impactBalance[offset + variantIndex + 1]
+                successor[descriptorIndex] = variantIndex
             end
         end
     end
     return successor
 end
-
-# Convenience: no rule given means the standard global rule.
-succession_step(cib::CIB, scenario::Vector{Int}) =
-    succession_step(GlobalSuccession(), cib, scenario)
 
 #endregion
 
@@ -332,16 +440,13 @@ succession_step(cib::CIB, scenario::Vector{Int}) =
 """
     fixed_point_margin(rule) -> Union{Nothing,Int}
 
-a standard fixed point or consistent scenario is one where the scenario cannot be improved by choosing a different variant.
-by setting the fixed_point_margin, you can change this to "cannot be improved... by at least the margin". This reflects the fact that social systems have some intertia or reistance to change and so may not shift for a relatively small improvement.
-fixed_point_margin=0 gives the standard behaviour
+A standard fixed point (consistent scenario) is one where no descriptor can be improved by choosing a different variant. By declaring a `fixed_point_margin`, a rule changes this to "cannot be improved *by more than the margin*". This reflects the fact that social systems have some inertia or resistance to change, and so may not shift for a relatively small improvement. `fixed_point_margin = 0` gives the standard behaviour.
+
+Declaring a margin is what lets a rule use the fast search strategies in [`find_consistent`](@ref); a rule that returns `nothing` (the default) is searched by the generic one-scenario-at-a-time scan instead.
 """
 fixed_point_margin(::SuccessionRule) = nothing
 fixed_point_margin(::GlobalSuccession) = 0
-# Sequential succession's fixed points coincide with global's (see the
-# SequentialSuccession docstring for the induction argument), so it may claim
-# the margin-0 fast searches. Verified against a from-scratch oracle in
-# test/property_tests.jl.
+# Sequential succession's fixed points coincide with global's (can be proven by induction) so it can also use the margin-0 fast searches.
 fixed_point_margin(::SequentialSuccession) = 0
 
 """
@@ -354,7 +459,7 @@ Find every consistent scenario — every fixed point of the succession map.
 
 `algorithm` selects the search strategy (only for rules with a [`fixed_point_margin`](@ref)):
 - `:sweep` — enumerate every scenario with the incremental odometer sweep.
-- `:bnb`   — branch-and-bound: assign descriptors depth-first and prune subtrees that provably contain no fixed point. Exact — returns the identical kernel — and typically visits a small fraction of the space on strongly-coupled matrices.
+- `:bnb`   — branch-and-bound: assign descriptors depth-first and prune subtrees that provably contain no fixed point. Exact — returns the identical kernel — and typically visits a small fraction of the space.
 - `:auto`  (default) — the sweep for small spaces (< 10^5 scenarios), otherwise branch-and-bound with a node budget of `n ÷ 16`; if pruning is too weak to pay off, the budget trips and the sweep runs instead.
 
 The returned kernel is ordered by ascending signature.
@@ -363,472 +468,213 @@ function find_consistent(cib::CIB; rule::SuccessionRule=GlobalSuccession(),
                          algorithm::Symbol=:auto,
                          bnb_node_budget::Union{Nothing,Int}=nothing)
 
-    return _exhaustive_kernel(rule, cib; algorithm=algorithm,
+    return _find_kernel(rule, cib; algorithm=algorithm,
                               bnb_node_budget=bnb_node_budget)
 end
 
 """
-    _exhaustive_kernel(rule, cib; algorithm, bnb_node_budget)
+    _find_kernel(rule, cib; algorithm, bnb_node_budget)
 
 Exhaustive fixed-point search under `rule`. A rule that declares a [`fixed_point_margin`](@ref) gets the fast threaded sweep / branch-and-bound — the margin parameterises the per-descriptor fixed-point test, so both paths serve global succession (`m = 0`), inertial/threshold rules (`m > 0`) and any other rule with the same separable structure. A rule with no margin falls back to a generic ascending-signature scan that tests `succession_step(rule, u) == u`.
+This is because if we know that we can use the standard 'no variant improves the scenario by more than a fixed amount' rule to identify fixed points, there are shortcuts we can use. 
+The generic path is left for other rules which might define fixed points differently.
 """
-function _exhaustive_kernel(rule::SuccessionRule, cib::CIB; algorithm::Symbol=:auto,
+function _find_kernel(rule::SuccessionRule, cib::CIB; algorithm::Symbol=:auto,
                             bnb_node_budget::Union{Nothing,Int}=nothing)
     margin = fixed_point_margin(rule)
+
+    # Generic fallback for rules without a declared margin: walk every scenario in ascending signature order and keep the ones that are their own successor.
+    # Single-threaded, one succession_step call per scenario. This is a slow but guaranteed correct for any succession rule approach.
+    # The built in rules never come here because both declare margin = 0 so can use the fast path    
     if margin === nothing
-        # Generic fallback: enumerate the whole space in ascending-signature
-        # order and keep the scenarios that are their own successor. Single-
-        # threaded O(n) correctness baseline for a rule with no separable path.
-        # does NOT fire for the standard succession rule since that has margin ===0
         algorithm === :auto || throw(ArgumentError(
             "algorithm=$(repr(algorithm)) needs a rule with a fixed_point_margin; " *
             "this rule uses the generic scan (algorithm=:auto)"))
-        kern = Vector{Vector{Int}}()
-        for sig in 0:max_signature(cib)
-            u = inv_signature(cib, sig)
-            succession_step(rule, cib, u) == u && push!(kern, u)
+        consistentScenarios = Vector{Vector{Int}}()
+        for currentSignature in 0:max_signature(cib)
+            scenario = inv_signature(cib, currentSignature)
+            #if this scenario is its own successor then add it to the stack of consistent scenarios
+            if succession_step(rule, cib, scenario) == scenario
+                push!(consistentScenarios, scenario)
+            end
         end
-        return kern
+        return consistentScenarios
     end
-    # Threshold rule: the fast paths, parameterised by the margin.
+
+    # at this point we know the rule declared a margin so we can use the fast searches
+    # there's a fast search that checks all scenarios and one that uses 'branch and bound' to only check a subset
+    # first check that the algorithm is a valid one
     algorithm in (:auto, :bnb, :sweep) ||
         throw(ArgumentError("algorithm must be :auto, :bnb or :sweep, got $(repr(algorithm))"))
-    n = max_signature(cib) + 1
-    if algorithm == :sweep || (algorithm == :auto && n < 100_000)
-        return _find_consistent_exhaustive(cib; margin=margin) #note this doesn't depend on the RULE
-    end
-    sufmin, sufmax = _bnb_bounds(cib)
-    budget = something(bnb_node_budget,
-                       algorithm == :bnb ? typemax(Int) : n ÷ 16)
-    kern, _ = _bnb_fixed_points(cib, sufmin, sufmax; node_budget=budget, margin=margin)
-    !isnothing(kern) && return kern
-    # Budget tripped: pruning too weak on this matrix — fall back.
-    return _find_consistent_exhaustive(cib; margin=margin)
-end
+    numberOfScenarios = max_signature(cib) + 1
 
-"""
-    _score_type(cib) -> Type{<:Signed}
-
-Narrowest safe integer type for impact-balance accumulation. `Int16` when
-`4 * (ndesc + 1) * maximum(abs, cim)` fits (margin covers the incremental
-row-delta updates; Int16 arithmetic wraps silently, so this guard is the
-only protection), otherwise `Int`. Realistic CIB matrices (entries ±3)
-are far inside the Int16 bound.
-"""
-function _score_type(cib::CIB)
-    maxabs = cib.numberOfDimensions == 0 ? 0 : Int(maximum(abs, cib.cim))
-    return 4 * (cib.numberOfDescriptors + 1) * maxabs <= Int(typemax(Int16)) ? Int16 : Int
-end
-#TODO: should really be a property of the CIB not computed multiple times
-
-"""
-    _find_consistent_exhaustive(cib) -> Vector{Vector{Int}}
-
-Splits the scenario space into contiguous chunks scheduled as tasks. Within a chunk, the impact-balance vector is maintained *incrementally*: a mixed-radix odometer advances the scenario, and each digit change updates the balance by the difference of two CIM rows (a `@simd` loop over the narrowed transpose from [`_score_type`](@ref)), so no per-scenario score recomputation happens at all. 
-
-"""
-function _find_consistent_exhaustive(cib::CIB; margin::Int=0)
-    T = _score_type(cib)
-    return _sweep_fixed_points(cib, Matrix{T}(cib.cim_t); margin=margin)
-end
-
-function _sweep_fixed_points(cib::CIB, cimT::Matrix{T}; margin::Int=0) where {T<:Signed} #score has to have +- so T must be Signed
-    n = max_signature(cib) + 1
-    nchunks = max(1, min(n, 16 * Threads.nthreads()))
-    chunk_size = cld(n, nchunks)
-    nchunks = cld(n, chunk_size)
-
-    results = [Vector{Vector{Int}}() for _ in 1:nchunks]
-    @sync for c in 1:nchunks #run all chunks and wait for them all to finish before proceeding
-        out = results[c]
-        first_sig = (c - 1) * chunk_size
-        last_sig = min(c * chunk_size, n) - 1
-        Threads.@spawn _sweep_chunk!(out, cimT, first_sig, last_sig,
-                                     cib.numberOfVariants, cib.desc_offsets,
-                                     cib.numberOfDescriptors, cib.numberOfDimensions, margin)
+    # where the caller insists on a full sweep, or the number of scenarios is too low to make it worthwhile
+    # doing a branch and bound, just run through them all in order
+    if algorithm == :sweep || (algorithm == :auto && numberOfScenarios < 100_000)
+        # Note the sweep depends only on the margin, not on the rule itself.
+        return _find_kernel_checkall_fast(cib; margin=margin)
     end
 
-    # Chunks cover ascending contiguous signature ranges; merging in chunk
-    # order keeps the kernel sorted by signature. No dedup needed.
-    kern = Vector{Vector{Int}}()
-    for c in 1:nchunks
-        append!(kern, results[c])
-    end
-    return kern
-end
+    # ok, now we're doing branch and bound to reduce the number of scenarios we need to review
+    # this works by gradually introducing each descriptor, and then seeing if it can prove that even if it added every other descriptor, nothing could be a fixed point
+    suffixMin, suffixMax = _bnb_bounds(cib)
 
-function _sweep_chunk!(out::Vector{Vector{Int}}, cimT::Matrix{T},
-                       first_sig::Int, last_sig::Int,
-                       nvariants::Vector{Int}, offsets::Vector{Int},
-                       ndesc::Int, ndim::Int, margin::Int) where {T<:Signed}
-    v    = Vector{Int}(undef, ndesc)
-    rows = Vector{Int}(undef, ndesc)   # column of cimT holding descriptor i's current row
-    ib   = zeros(T, ndim)
+    # `something(a, b)` returns the first argument that isn't `nothing` — like C#'s ?? null-coalescing operator.
+    nodeBudget = something(bnb_node_budget,
+                           algorithm == :bnb ? typemax(Int) : numberOfScenarios ÷ 16)
+    
+    # get the set of fixed points/ consistent scenarios, if any
+    kernel, _ = _bnb_fixed_points(cib, suffixMin, suffixMax;
+                                  node_budget=nodeBudget, margin=margin)
 
-    # Decode first_sig (the only divmod in this chunk) and build the
-    # initial impact balance from scratch.
-    s = first_sig
-    @inbounds for i in 1:ndesc
-        nv = nvariants[i]
-        v[i] = s % nv
-        rows[i] = offsets[i] + v[i] + 1
-        s = s ÷ nv
-    end
-    @inbounds for i in 1:ndesc
-        r = rows[i]
-        @simd for j in 1:ndim
-            ib[j] += cimT[j, r]
-        end
+    #did we find any fixed points?
+    if !isnothing(kernel)
+        return kernel
     end
 
-    @inbounds for sig in first_sig:last_sig
-        # ── Fixed-point check: per-descriptor early-exit compare over ib ──
-        fixed = true
-        for i in 1:ndesc
-            off = offsets[i]
-            curm = ib[off + v[i] + 1] + margin   # unseated only by a variant beating this
-            for j in 1:nvariants[i]
-                if ib[off + j] > curm   # strict >: ties / within-margin keep the current variant. 
-                    fixed = false
-                    break #we've found a descriptor where there's a variant that is better. so we already know this isn't a consistent scenario
-                end
-            end
-            fixed || break
-        end
-        fixed && push!(out, copy(v)) #if this is a fixed point, store it
-
-        # ── Odometer increment with fused row-delta ib update ──
-        if sig < last_sig
-            for i in 1:ndesc
-                nv = nvariants[i]
-                nv == 1 && continue    # radix-1: value stays 0, carry onward
-                rold = rows[i]
-                if v[i] + 1 < nv
-                    v[i] += 1
-                    rnew = rold + 1
-                    rows[i] = rnew
-                    @simd for j in 1:ndim
-                        ib[j] += cimT[j, rnew] - cimT[j, rold]
-                    end
-                    break
-                end
-                v[i] = 0               # roll over; carry to next digit
-                rnew = offsets[i] + 1
-                rows[i] = rnew
-                @simd for j in 1:ndim
-                    ib[j] += cimT[j, rnew] - cimT[j, rold]
-                end
-            end
-        end
-    end
-    return out
+    #ok we didn't. something strange going on. let's try the full sweep
+    return _find_kernel_checkall_fast(cib; margin=margin)
 end
 
 #endregion
 
-#region "basins"
-"""
-    find_basins(cib; rule=GlobalSuccession()) -> (fixed_points, basin_sizes, cycle_count)
-
-Exhaustive basin-of-attraction analysis under `rule` (default [`GlobalSuccession`](@ref)). Follows the succession chain from every scenario in the space, counting how many starting points converge to each fixed point/ consistent scenario.
-
-This runs in two phases: a threaded sweep fills a flat successor table (every scenario's succession step), then a resolution pass walks the table with path compression so each scenario is resolved exactly once. Memory is ~8n bytes for the two flat tables (Int32 entries when the space fits, Int64 otherwise), independent of the thread count.
-For example, the first phase works out that scenario A maps to B, B maps to C, and C maps to D which is a consistent scenario. Therefore, A, B, C and D are all in D's basin and the second phase works this out.
-
-The default [`GlobalSuccession`](@ref) rule takes a fast path: the successor table is filled by a mixed-radix odometer that maintains the impact balance incrementally (one row delta per scenario, no allocation) instead of calling [`succession_step`](@ref) per scenario. Any other rule uses the generic per-scenario path — identical output, just slower.
-"""
-function find_basins(cib::CIB; rule::SuccessionRule=GlobalSuccession())
-    return _basins(rule, cib)
-end
-
-# Fast path: global succession only. The odometer chunk re-derives the rule's
-# argmax semantics internally, which is exactly why this specialization cannot
-# serve an arbitrary rule.
-function _basins(::GlobalSuccession, cib::CIB)
-    n = max_signature(cib) + 1
-    T = _score_type(cib)
-    if n <= Int(typemax(Int32)) - 1
-        return _fast_basins(cib, Int32, Matrix{T}(cib.cim_t))
-    end
-    return _fast_basins(cib, Int64, Matrix{T}(cib.cim_t))
-end
-
-function _fast_basins(cib::CIB, ::Type{S},
-                      cimT::Matrix{T}) where {S<:Union{Int32,Int64}, T<:Signed}
-    n = max_signature(cib) + 1
-    succ = Vector{S}(undef, n)
-    _successor_table!(succ, cib, cimT)
-    fp_sigs, sizes, cycle_count = _resolve_and_tally(succ, n)
-    fixed_points = [inv_signature(cib, s) for s in fp_sigs]
-    return (fixed_points, sizes, cycle_count)
-end
-
-# Generic path: works for any rule, because it only ever calls the rule's own
-# succession_step. Allocates a few vectors per scenario, so it is much slower
-# than the odometer path — a correctness baseline, not a hot loop.
-function _basins(rule::SuccessionRule, cib::CIB)
-    n = max_signature(cib) + 1
-    if n <= Int(typemax(Int32)) - 1
-        return _generic_basins(rule, cib, Int32)
-    end
-    return _generic_basins(rule, cib, Int64)
-end
-
-function _generic_basins(rule::SuccessionRule, cib::CIB,
-                         ::Type{S}) where {S<:Union{Int32,Int64}}
-    n = max_signature(cib) + 1
-    succ = Vector{S}(undef, n)
-    nt = Threads.nthreads()
-    chunk = cld(n, nt)
-    @sync for t in 1:nt
-        lo = (t - 1) * chunk
-        hi = min(t * chunk, n) - 1
-        lo > hi && continue
-        Threads.@spawn for sig in lo:hi          # disjoint ranges → race-free
-            u = inv_signature(cib, sig)
-            v = succession_step(rule, cib, u)
-            @inbounds succ[sig + 1] = S(signature(cib, v))
-        end
-    end
-    fp_sigs, sizes, cycle_count = _resolve_and_tally(succ, n)
-    fixed_points = [inv_signature(cib, s) for s in fp_sigs]
-    return (fixed_points, sizes, cycle_count)
-end
+#region "Exhaustive review of scenarios looking for fixed points"
 
 """
-    _successor_table!(succ, cib, cimT) -> succ
+    _find_kernel_checkall_fast(cib) -> Vector{Vector{Int}}
 
-Fill `succ[sig + 1]` with the succession-step signature of every scenario.
-Threaded over contiguous chunks (disjoint writes); each chunk advances a mixed-radix odometer and maintains the impact balance incrementally, then takes the per-descriptor argmax (ties favor the current variant, then the lowest index — identical to [`succession_step`](@ref)).
+Splits the scenario space into contiguous chunks scheduled as tasks. Within a chunk, the impact-balance vector is maintained *incrementally*: a mixed-radix odometer advances the scenario, and each digit change updates the balance by the difference of two CIM rows (a `@simd` loop over the narrowed transpose from [`_score_type`](@ref)), so no per-scenario score recomputation happens at all.
 """
-
-function _successor_table!(succ::Vector{S}, cib::CIB, cimT::Matrix{T}) where {S,T}
-    n = max_signature(cib) + 1
-    orders = Vector{Int}(undef, cib.numberOfDescriptors)   # mixed-radix place values
-    o = 1
-    for i in 1:cib.numberOfDescriptors
-        orders[i] = o
-        o *= cib.numberOfVariants[i]
-    end
-
-    nchunks = max(1, min(n, 16 * Threads.nthreads()))
-    chunk_size = cld(n, nchunks)
-    nchunks = cld(n, chunk_size)
-    @sync for c in 1:nchunks
-        first_sig = (c - 1) * chunk_size
-        last_sig = min(c * chunk_size, n) - 1
-        Threads.@spawn _successor_chunk!(succ, cimT, first_sig, last_sig,
-                                         cib.numberOfVariants, cib.desc_offsets,
-                                         orders, cib.numberOfDescriptors, cib.numberOfDimensions)
-    end
-    return succ
+function _find_kernel_checkall_fast(cib::CIB; margin::Int=0)
+    scoreType = _score_type(cib)
+    # `Matrix{scoreType}(...)` copies cim_t into a matrix of the narrower
+    # element type, so the hot loops move less memory.
+    return _sweep_fixed_points_all(cib, Matrix{scoreType}(cib.cim_t); margin=margin)
 end
 
-function _successor_chunk!(succ::Vector{S}, cimT::Matrix{T},
-                           first_sig::Int, last_sig::Int,
-                           nvariants::Vector{Int}, offsets::Vector{Int},
-                           orders::Vector{Int}, ndesc::Int, ndim::Int) where {S,T}
-    v    = Vector{Int}(undef, ndesc)
-    rows = Vector{Int}(undef, ndesc)
-    ib   = zeros(T, ndim)
+# `where {ScoreInt<:Signed}` declares a type parameter — like a C# generic method `Sweep<T>(...) where T : ...`.
+# Julia compiles a specialised version of the function for each concrete element type it is called with (Int16 or Int here).
+# Scores can be negative, so the type must be a signed integer.
+function _sweep_fixed_points_all(cib::CIB, cimTranspose::Matrix{ScoreInt};
+                             margin::Int=0) where {ScoreInt<:Signed}
+    numberOfScenarios = max_signature(cib) + 1
 
-    s = first_sig
-    @inbounds for i in 1:ndesc
-        nv = nvariants[i]
-        v[i] = s % nv
-        rows[i] = offsets[i] + v[i] + 1
-        s = s ÷ nv
+    # divide up all the scenarios into 'chunks' and process each one individually
+    # we need to be careful dividing up into threads since the number of scenarios might not be an exact multiple of the number of threads
+    numberOfChunks = max(1, min(numberOfScenarios, 16 * Threads.nthreads()))
+    chunkSize = cld(numberOfScenarios, numberOfChunks)
+    numberOfChunks = cld(numberOfScenarios, chunkSize)
+
+    # One private output vector per chunk, so the threads never write to shared state and need no locks.
+    chunkResults = [Vector{Vector{Int}}() for _ in 1:numberOfChunks]
+  
+    # @sync waits for every task spawned inside the block to finish (like Task.WaitAll); Threads.@spawn schedules the call on a worker thread (like Task.Run).
+    @sync for chunkIndex in 1:numberOfChunks
+        chunkOutput = chunkResults[chunkIndex]
+        firstSignature = (chunkIndex - 1) * chunkSize
+        lastSignature = min(chunkIndex * chunkSize, numberOfScenarios) - 1
+        Threads.@spawn _sweep_chunk_all!(chunkOutput, cimTranspose,
+                                     firstSignature, lastSignature,
+                                     cib.numberOfVariants, cib.desc_offsets,
+                                     cib.numberOfDescriptors, cib.numberOfDimensions,
+                                     margin)
     end
-    @inbounds for i in 1:ndesc
-        r = rows[i]
-        @simd for j in 1:ndim
-            ib[j] += cimT[j, r]
+
+    # Chunks are in scenario number order so we can just concatenate them, no need to dedupe or to sort
+    kernel = Vector{Vector{Int}}()
+    for chunkIndex in 1:numberOfChunks
+        append!(kernel, chunkResults[chunkIndex])
+    end
+    return kernel
+end
+
+# The per-chunk worker for the sweep: checks every scenario in firstSignature:lastSignature for consistency, pushing the fixed points it finds onto foundFixedPoints (hence the `!` in the name).
+function _sweep_chunk_all!(foundFixedPoints::Vector{Vector{Int}}, cimTranspose::Matrix{ScoreInt},
+                       firstSignature::Int, lastSignature::Int,
+                       variantCounts::Vector{Int}, descriptorOffsets::Vector{Int},
+                       numberOfDescriptors::Int, numberOfDimensions::Int,
+                       margin::Int) where {ScoreInt<:Signed}
+    scenario      = Vector{Int}(undef, numberOfDescriptors)  # current odometer digits
+    activeRows    = Vector{Int}(undef, numberOfDescriptors)  # cimTranspose column of each descriptor's current variant
+    impactBalance = zeros(ScoreInt, numberOfDimensions)
+
+    # Decode firstSignature into its mixed-radix digits (the only division
+    # in this whole chunk) and build the initial impact balance from scratch.
+    remainder = firstSignature
+    @inbounds for descriptorIndex in 1:numberOfDescriptors
+        variantCount = variantCounts[descriptorIndex]
+        scenario[descriptorIndex] = remainder % variantCount
+        activeRows[descriptorIndex] = descriptorOffsets[descriptorIndex] + scenario[descriptorIndex] + 1
+        remainder = remainder ÷ variantCount
+    end
+    @inbounds for descriptorIndex in 1:numberOfDescriptors
+        sourceRow = activeRows[descriptorIndex]
+        @simd for targetVariant in 1:numberOfDimensions
+            impactBalance[targetVariant] += cimTranspose[targetVariant, sourceRow]
         end
     end
 
-    @inbounds for sig in first_sig:last_sig
-        # ── Successor signature: full per-descriptor argmax over ib ──
-        w_sig = 0
-        for i in 1:ndesc
-            off = offsets[i]
-            wi = v[i]
-            max_val = ib[off + wi + 1]   # current variant seeds the max
-            for j in 0:nvariants[i]-1
-                score = ib[off + j + 1]
-                better = score > max_val         # strict >: ties keep current/lower index
-                max_val = ifelse(better, score, max_val)
-                wi = ifelse(better, j, wi)        # branchless select (no misprediction)
+    @inbounds for currentSignature in firstSignature:lastSignature
+        # Fixed-point check: is any variant strictly better (beyond the margin) than the one this scenario currently uses?
+        # We only have to find one descriptor this applies to, no need to check any beyond that. So, exit at the first descriptor that fails — most scenarios fail early.
+        isFixedPoint = true
+        for descriptorIndex in 1:numberOfDescriptors
+            offset = descriptorOffsets[descriptorIndex]
+
+            # A challenger must beat the current variant's score PLUS the margin to unseat it.
+            scoreToBeat = impactBalance[offset + scenario[descriptorIndex] + 1] + margin
+            for variantColumn in 1:variantCounts[descriptorIndex]
+                if impactBalance[offset + variantColumn] > scoreToBeat
+                    # Some variant is strictly better, so this scenario is not consistent — no need to check the rest.
+                    isFixedPoint = false
+                    break #drop out of the for
+                end
             end
-            w_sig += orders[i] * wi
-        end
-        succ[sig + 1] = S(w_sig)
 
-        # ── Odometer increment with fused row-delta ib update ──
-        if sig < last_sig
-            for i in 1:ndesc
-                nv = nvariants[i]
-                nv == 1 && continue      # radix-1: value stays 0, carry onward
-                rold = rows[i]
-                if v[i] + 1 < nv
-                    v[i] += 1
-                    rnew = rold + 1
-                    rows[i] = rnew
-                    @simd for j in 1:ndim
-                        ib[j] += cimT[j, rnew] - cimT[j, rold]
+            if !isFixedPoint
+                break #drop out of the descriptors loop
+            end
+        end
+
+        # Store a COPY: the scenario buffer is reused by the next iteration.
+        if isFixedPoint push!(foundFixedPoints, copy(scenario))
+
+        # ── Advance the odometer by one and patch the impact balance ──
+        # Incrementing one digit means one descriptor swapped variants, so the balance changes by (new variant's row - old variant's row): two rows, not a full recalculation.
+        if currentSignature < lastSignature
+            for descriptorIndex in 1:numberOfDescriptors
+                variantCount = variantCounts[descriptorIndex]
+                variantCount == 1 && continue    # single-variant digit never changes; carry onward
+                oldRow = activeRows[descriptorIndex]
+                if scenario[descriptorIndex] + 1 < variantCount
+                    # Normal increment: this digit goes up by one, done.
+                    scenario[descriptorIndex] += 1
+                    newRow = oldRow + 1
+                    activeRows[descriptorIndex] = newRow
+                    @simd for targetVariant in 1:numberOfDimensions
+                        impactBalance[targetVariant] += cimTranspose[targetVariant, newRow] -
+                                                        cimTranspose[targetVariant, oldRow]
                     end
                     break
                 end
-                v[i] = 0                 # roll over; carry to next digit
-                rnew = offsets[i] + 1
-                rows[i] = rnew
-                @simd for j in 1:ndim
-                    ib[j] += cimT[j, rnew] - cimT[j, rold]
+                # This digit rolls over to 0 and the carry moves to the next descriptor (the loop continues).
+                scenario[descriptorIndex] = 0
+                newRow = descriptorOffsets[descriptorIndex] + 1
+                activeRows[descriptorIndex] = newRow
+                @simd for targetVariant in 1:numberOfDimensions
+                    impactBalance[targetVariant] += cimTranspose[targetVariant, newRow] -
+                                                    cimTranspose[targetVariant, oldRow]
                 end
             end
         end
     end
-    return succ
+    return foundFixedPoints
 end
 
-"""
-    _fp_id!(reg_lock, fp_sig_by_id, id_by_fp_sig, sig) -> id
+#endregion
 
-Locked get-or-assign of a dense 1-based id for the fixed point with signature
-`sig`. Called once per fixed point discovered (≈ `nfp` times total across all
-workers), so the lock is essentially uncontended. Concurrent discoverers of the
-same fixed point serialize here and receive the same id.
-"""
-@noinline function _fp_id!(reg_lock::ReentrantLock, fp_sig_by_id::Vector{Int},
-                           id_by_fp_sig::Dict{Int,Int}, sig::Int)
-    lock(reg_lock)
-    try
-        id = get(id_by_fp_sig, sig, 0)
-        if id == 0
-            push!(fp_sig_by_id, sig)
-            id = length(fp_sig_by_id)
-            id_by_fp_sig[sig] = id
-        end
-        return id
-    finally
-        unlock(reg_lock)
-    end
-end
 
-"""
-    _resolve_chunk!(res, succ, lo, hi, reg_lock, fp_sig_by_id, id_by_fp_sig)
-
-Resolve the starts in `lo:hi` into the shared `res`, following successor chains.
-Cycle detection is **thread-private** (a per-worker `history` + backward scan),
-so `res` only ever holds *final* labels — 0 = unvisited, -1 = cycle, k > 0 =
-converges to the fixed point with dense id `k`. There is no shared in-progress
-marker, so a worker that walks into another worker's not-yet-resolved chain just
-re-walks it (redundant, never a false cycle) and reaches the same attractor;
-every state's attractor is deterministic, so concurrent writes to the same slot
-store the same value — a benign race. Fixed-point ids come from the locked
-registry ([`_fp_id!`](@ref)), hit ≈ `nfp` times.
-"""
-function _resolve_chunk!(res::Vector{S}, succ::Vector{S}, lo::Int, hi::Int,
-                         reg_lock::ReentrantLock, fp_sig_by_id::Vector{Int},
-                         id_by_fp_sig::Dict{Int,Int}) where {S}
-    history = Int[]
-    @inbounds for start in lo:hi
-        res[start + 1] != 0 && continue
-        empty!(history)
-        cur = start
-        label = zero(S)
-        while true
-            r = res[cur + 1]
-            if r != 0                        # already resolved: inherit (fp id or -1)
-                label = r
-                break
-            end
-            onchain = false                  # already on our own chain? -> ≥2-cycle
-            for k in length(history):-1:1
-                if history[k] == cur
-                    onchain = true
-                    break
-                end
-            end
-            if onchain
-                label = S(-1)                # whole chain (incl. pre-cycle tail) is cycle
-                break
-            end
-            push!(history, cur)
-            nxt = Int(succ[cur + 1])
-            if nxt == cur                    # fixed point (counts itself: it's in history)
-                label = S(_fp_id!(reg_lock, fp_sig_by_id, id_by_fp_sig, cur))
-                break
-            end
-            cur = nxt
-        end
-        for h in history
-            res[h + 1] = label
-        end
-    end
-    return nothing
-end
-
-"""
-    _resolve_and_tally(succ, n) -> (fp_sigs, sizes, cycle_count)
-
-Resolve every scenario to its attractor by walking the successor table, then
-tally basin sizes and the cycle count. The walk is threaded over disjoint start
-ranges ([`_resolve_chunk!`](@ref)); it is race-safe because `res` holds only
-final labels and every attractor is deterministic. Each fixed point gets a dense
-id the first time it is reached (via a locked registry); the tally then indexes
-a dense per-fixed-point counter (fixed points are few), so it costs an array
-increment per scenario rather than a hash lookup. Output fixed points are sorted
-by signature, so the result is identical at any thread count.
-"""
-function _resolve_and_tally(succ::Vector{S}, n::Int) where {S}
-    res = zeros(S, n)
-    reg_lock = ReentrantLock()
-    fp_sig_by_id = Int[]             # dense id (1-based) -> fixed-point signature
-    id_by_fp_sig = Dict{Int,Int}()   # fixed-point signature -> dense id
-
-    nt = Threads.nthreads()
-    chunk = cld(n, nt)
-    @sync for t in 1:nt
-        lo = (t - 1) * chunk
-        hi = min(t * chunk, n) - 1
-        Threads.@spawn _resolve_chunk!(res, succ, lo, hi, reg_lock,
-                                       fp_sig_by_id, id_by_fp_sig)
-    end
-
-    # ── Threaded tally: res holds a dense fixed-point id (>0) or -1 (cycle) ──
-    nfp = length(fp_sig_by_id)
-    tally_chunk = cld(n, nt)
-    local_counts = [zeros(Int, nfp) for _ in 1:nt]
-    local_cyc = zeros(Int, nt)
-    @sync for t in 1:nt
-        lo = (t - 1) * tally_chunk
-        hi = min(t * tally_chunk, n) - 1
-        counts = local_counts[t]
-        Threads.@spawn begin
-            cyc = 0
-            @inbounds for i in lo:hi
-                c = Int(res[i + 1])
-                if c == -1
-                    cyc += 1
-                else
-                    counts[c] += 1              # c is a dense id in 1:nfp
-                end
-            end
-            local_cyc[t] = cyc
-        end
-    end
-
-    total = zeros(Int, nfp)
-    for counts in local_counts
-        @inbounds for k in 1:nfp
-            total[k] += counts[k]
-        end
-    end
-    perm = sortperm(fp_sig_by_id)
-    return fp_sig_by_id[perm], total[perm], sum(local_cyc)
-end
-
-#region "IN DEVELOPMENT: ─── Branch-and-bound exhaustive search ─────────────────────────────────────"
+#region "Branch-and-bound exhaustive search"
 
 """
     _bnb_bounds(cib) -> (sufmin, sufmax)
@@ -836,31 +682,41 @@ end
 Suffix score bounds for branch-and-bound. `sufmin[k, c]` / `sufmax[k, c]` is the minimum / maximum total contribution descriptors `k..ndesc` can make to the impact score of flat variant column `c` over all choices of their variants. Row `ndesc + 1` is zero, so once descriptors `1..k` are assigned, `sufmin[k+1, c]`..`sufmax[k+1, c]` brackets what the still-free descriptors can add to column `c`.
 """
 function _bnb_bounds(cib::CIB)
-    ndesc, ndim = cib.numberOfDescriptors, cib.numberOfDimensions
-    cim_t = cib.cim_t
-    sufmin = zeros(Int, ndesc + 1, ndim)
-    sufmax = zeros(Int, ndesc + 1, ndim)
-    @inbounds for k in ndesc:-1:1
-        off = cib.desc_offsets[k]
-        nv = cib.numberOfVariants[k]
-        for c in 1:ndim
-            mn = typemax(Int)
-            mx = typemin(Int)
-            for s in 0:nv-1
-                val = Int(cim_t[c, off + s + 1])   # = cim[row of variant s, c]
-                mn = ifelse(val < mn, val, mn)
-                mx = ifelse(val > mx, val, mx)
+    numberOfDescriptors, numberOfDimensions = cib.numberOfDescriptors, cib.numberOfDimensions
+    cimTranspose = cib.cim_t
+    suffixMin = zeros(Int, numberOfDescriptors + 1, numberOfDimensions)
+    suffixMax = zeros(Int, numberOfDescriptors + 1, numberOfDimensions)
+    # Build the bounds back-to-front: descriptor k's bounds are its own
+    # best/worst row entry plus whatever descriptors k+1..end can add.
+    # `ndesc:-1:1` is a range counting down (like range(n, 0, -1) in Python).
+    @inbounds for descriptorIndex in numberOfDescriptors:-1:1
+        offset = cib.desc_offsets[descriptorIndex]
+        variantCount = cib.numberOfVariants[descriptorIndex]
+        for targetVariant in 1:numberOfDimensions
+            minValue = typemax(Int)
+            maxValue = typemin(Int)
+            for variantIndex in 0:variantCount-1
+                # = cim[row of this variant, targetVariant]
+                value = Int(cimTranspose[targetVariant, offset + variantIndex + 1])
+                minValue = ifelse(value < minValue, value, minValue)
+                maxValue = ifelse(value > maxValue, value, maxValue)
             end
-            sufmin[k, c] = sufmin[k + 1, c] + mn
-            sufmax[k, c] = sufmax[k + 1, c] + mx
+            suffixMin[descriptorIndex, targetVariant] = suffixMin[descriptorIndex + 1, targetVariant] + minValue
+            suffixMax[descriptorIndex, targetVariant] = suffixMax[descriptorIndex + 1, targetVariant] + maxValue
         end
     end
-    return sufmin, sufmax
+    return suffixMin, suffixMax
 end
 
-# Per-task DFS state. `p` is the running prefix impact balance (exact
-# contribution of the assigned descriptors to every column); `v` the current
-# partial assignment. `total`/`abort`/`budget` are shared across tasks.
+# Per-task depth-first-search state, bundled in a struct so the recursion
+# passes one argument instead of a dozen. `prefixBalance` is the running
+# exact contribution of the already-assigned descriptors to every column;
+# `partialScenario` is the current partial assignment. The three fields
+# after `foundFixedPoints` coordinate the node budget across all tasks:
+# `nodesVisited` is this task's private counter (a Ref is a mutable
+# single-value box — needed because the struct itself is immutable),
+# `totalNodes`/`abortFlag` are Atomics shared by every task (like C#'s
+# Interlocked operations).
 struct _BnBState
     cim_t::Matrix{Int}
     sufmin::Matrix{Int}
@@ -869,40 +725,36 @@ struct _BnBState
     offsets::Vector{Int}
     ndesc::Int
     ndim::Int
-    v::Vector{Int}
-    p::Vector{Int}
-    out::Vector{Vector{Int}}
-    nodes::Base.RefValue{Int}
-    total::Threads.Atomic{Int}
-    abort::Threads.Atomic{Bool}
-    budget::Int
+    partialScenario::Vector{Int}
+    prefixBalance::Vector{Int}
+    foundFixedPoints::Vector{Vector{Int}}
+    nodesVisited::Base.RefValue{Int}
+    totalNodes::Threads.Atomic{Int}
+    abortFlag::Threads.Atomic{Bool}
+    nodeBudget::Int
     margin::Int
 end
 
 """
-    _bnb_pruned(st, k) -> Bool
+    _bnb_pruned(state, assignedCount) -> Bool
 
-With descriptors `1..k` assigned, decide whether the current subtree can be
-discarded: true iff some assigned descriptor `j` has a competitor variant
-whose *worst-case* completed score still exceeds the chosen variant's
-*best-case* completed score by more than the rule's `margin` — then every
-completion fails the fixed-point test at `j`. Ties (and gaps within the
-margin) never prune, matching the favour-current convention, and at
-`k == ndesc` the suffix bounds are zero, so this condition IS the exact
-margin fixed-point predicate on the full scenario (`margin = 0` recovers
-plain global consistency).
+With descriptors `1..assignedCount` assigned, decide whether the current subtree can be discarded: true iff some assigned descriptor has a competitor variant whose *worst-case* completed score still exceeds the chosen variant's *best-case* completed score by more than the rule's `margin` — then every completion fails the fixed-point test at that descriptor. Ties (and gaps within the margin) never prune, matching the favour-current convention, and once every descriptor is assigned the suffix bounds are zero, so this condition IS the exact margin fixed-point predicate on the full scenario (`margin = 0` recovers plain global consistency).
 """
-function _bnb_pruned(st::_BnBState, k::Int)
-    p = st.p
-    sufmin = st.sufmin
-    sufmax = st.sufmax
-    kk = k + 1
-    @inbounds for j in 1:k
-        off = st.offsets[j]
-        cs = off + st.v[j] + 1
-        best_cur = p[cs] + sufmax[kk, cs] + st.margin
-        for c in off+1:off+st.nvariants[j]
-            if p[c] + sufmin[kk, c] > best_cur
+function _bnb_pruned(state::_BnBState, assignedCount::Int)
+    prefixBalance = state.prefixBalance
+    suffixMin = state.sufmin
+    suffixMax = state.sufmax
+    suffixRow = assignedCount + 1   # bounds row for the still-unassigned descriptors
+    @inbounds for descriptorIndex in 1:assignedCount
+        offset = state.offsets[descriptorIndex]
+        chosenColumn = offset + state.partialScenario[descriptorIndex] + 1
+        # The most the chosen variant's final score could possibly be,
+        # plus the margin a challenger must exceed.
+        bestCaseChosen = prefixBalance[chosenColumn] + suffixMax[suffixRow, chosenColumn] + state.margin
+        for column in offset+1:offset+state.nvariants[descriptorIndex]
+            # If a challenger's WORST case still beats the chosen variant's
+            # BEST case, no completion of this subtree can be consistent.
+            if prefixBalance[column] + suffixMin[suffixRow, column] > bestCaseChosen
                 return true
             end
         end
@@ -910,46 +762,53 @@ function _bnb_pruned(st::_BnBState, k::Int)
     return false
 end
 
-# Charge one visited node against the shared budget (flushed every 256).
-# Returns false when the budget has tripped and the search must abort.
-function _bnb_charge!(st::_BnBState)
-    st.nodes[] += 1
-    if st.nodes[] >= 256
-        Threads.atomic_add!(st.total, st.nodes[])
-        st.nodes[] = 0
-        if st.total[] > st.budget || st.abort[]
-            st.abort[] = true
+# Charge one visited node against the shared budget. The private counter is
+# flushed to the shared atomic only every 256 nodes, so the tasks rarely
+# touch shared state. Returns false when the budget has tripped and the
+# whole search must abort.
+function _bnb_charge!(state::_BnBState)
+    # `state.nodesVisited[]` — the [] reads/writes the value inside a Ref box.
+    state.nodesVisited[] += 1
+    if state.nodesVisited[] >= 256
+        Threads.atomic_add!(state.totalNodes, state.nodesVisited[])
+        state.nodesVisited[] = 0
+        if state.totalNodes[] > state.nodeBudget || state.abortFlag[]
+            state.abortFlag[] = true
             return false
         end
     end
     return true
 end
 
-# Depth-first over variants of descriptor k. Returns false on abort.
-function _bnb_node!(st::_BnBState, k::Int)
-    nv = st.nvariants[k]
-    off = st.offsets[k]
-    p = st.p
-    cim_t = st.cim_t
-    ndim = st.ndim
-    @inbounds for s in 0:nv-1
-        col = off + s + 1
-        @simd for j in 1:ndim          # push chosen row onto the prefix
-            p[j] += cim_t[j, col]
+# Depth-first over the variants of descriptor `depth`. Returns false on abort.
+function _bnb_node!(state::_BnBState, depth::Int)
+    variantCount = state.nvariants[depth]
+    offset = state.offsets[depth]
+    prefixBalance = state.prefixBalance
+    cimTranspose = state.cim_t
+    numberOfDimensions = state.ndim
+    @inbounds for variantIndex in 0:variantCount-1
+        variantColumn = offset + variantIndex + 1
+        # Push this variant's row onto the running prefix balance...
+        @simd for targetVariant in 1:numberOfDimensions
+            prefixBalance[targetVariant] += cimTranspose[targetVariant, variantColumn]
         end
-        st.v[k] = s
-        ok = _bnb_charge!(st)
-        if ok && !_bnb_pruned(st, k)
-            if k == st.ndesc
-                push!(st.out, copy(st.v))
+        state.partialScenario[depth] = variantIndex
+        keepGoing = _bnb_charge!(state)
+        if keepGoing && !_bnb_pruned(state, depth)
+            if depth == state.ndesc
+                # All descriptors assigned and the prune (now exact) passed:
+                # this is a fixed point. Store a copy — the buffer is reused.
+                push!(state.foundFixedPoints, copy(state.partialScenario))
             else
-                ok = _bnb_node!(st, k + 1)
+                keepGoing = _bnb_node!(state, depth + 1)
             end
         end
-        @simd for j in 1:ndim          # pop
-            p[j] -= cim_t[j, col]
+        # ...and pop it again before trying the next variant.
+        @simd for targetVariant in 1:numberOfDimensions
+            prefixBalance[targetVariant] -= cimTranspose[targetVariant, variantColumn]
         end
-        ok || return false
+        keepGoing || return false
     end
     return true
 end
@@ -958,73 +817,413 @@ end
     _bnb_fixed_points(cib, sufmin, sufmax; node_budget)
         -> (Union{Nothing, Vector{Vector{Int}}}, nodes_visited)
 
-Threaded branch-and-bound search for all fixed points. Subtrees are fanned
-out as tasks over the assignments of the first `L` descriptors (chosen so
-the task count comfortably exceeds the thread count). The first element is
-`nothing` if the visited-node budget trips (pruning too weak to beat the
-sweep), else the complete kernel sorted by ascending signature; the second
-is the number of tree nodes visited (partial scenarios expanded).
+Threaded branch-and-bound search for all fixed points. Subtrees are fanned out as tasks over the assignments of the first few descriptors (chosen so the task count comfortably exceeds the thread count). The first element is `nothing` if the visited-node budget trips (pruning too weak to beat the sweep), else the complete kernel sorted by ascending signature; the second is the number of tree nodes visited (partial scenarios expanded).
 """
 function _bnb_fixed_points(cib::CIB, sufmin::Matrix{Int}, sufmax::Matrix{Int};
                            node_budget::Int, margin::Int=0)
-    ndesc = cib.numberOfDescriptors
-    nvariants = cib.numberOfVariants
-    offsets = cib.desc_offsets
-    ndim = cib.numberOfDimensions
-    cim_t = cib.cim_t
+    numberOfDescriptors = cib.numberOfDescriptors
+    variantCounts = cib.numberOfVariants
+    descriptorOffsets = cib.desc_offsets
+    numberOfDimensions = cib.numberOfDimensions
+    cimTranspose = cib.cim_t
 
-    # Prefix depth: enough top-level assignments to keep every thread busy.
-    L = 0
-    nprefix = 1
-    while L < ndesc && nprefix < 4 * Threads.nthreads()
-        L += 1
-        nprefix *= nvariants[L]
+    # Choose how many leading descriptors to pre-assign: every combination
+    # of their variants becomes one task, so keep multiplying until there
+    # are comfortably more tasks than threads.
+    prefixDepth = 0
+    numberOfPrefixes = 1
+    while prefixDepth < numberOfDescriptors && numberOfPrefixes < 4 * Threads.nthreads()
+        prefixDepth += 1
+        numberOfPrefixes *= variantCounts[prefixDepth]
     end
 
-    total = Threads.Atomic{Int}(0)
-    abort = Threads.Atomic{Bool}(false)
-    outs = [Vector{Vector{Int}}() for _ in 1:nprefix]
+    totalNodes = Threads.Atomic{Int}(0)
+    abortFlag = Threads.Atomic{Bool}(false)
+    taskOutputs = [Vector{Vector{Int}}() for _ in 1:numberOfPrefixes]
 
-    @sync for pid in 0:nprefix-1
-        out = outs[pid + 1]
+    @sync for prefixId in 0:numberOfPrefixes-1
+        taskOutput = taskOutputs[prefixId + 1]
         Threads.@spawn begin
-            st = _BnBState(cim_t, sufmin, sufmax, nvariants, offsets,
-                           ndesc, ndim, zeros(Int, ndesc), zeros(Int, ndim),
-                           out, Ref(0), total, abort, node_budget, margin)
-            # Build the prefix, checking the prune at every level so a
-            # subtree dead at depth i < L is skipped without descending.
-            s = pid
+            state = _BnBState(cimTranspose, sufmin, sufmax, variantCounts, descriptorOffsets,
+                              numberOfDescriptors, numberOfDimensions,
+                              zeros(Int, numberOfDescriptors), zeros(Int, numberOfDimensions),
+                              taskOutput, Ref(0), totalNodes, abortFlag, node_budget, margin)
+            # Decode this task's prefixId into variant choices for the first
+            # prefixDepth descriptors (same mixed-radix arithmetic as
+            # inv_signature), checking the prune at every level so a subtree
+            # already dead partway through the prefix is skipped without
+            # descending into it.
+            remainder = prefixId
             alive = true
-            @inbounds for i in 1:L
-                st.v[i] = s % nvariants[i]
-                s = s ÷ nvariants[i]
-                col = offsets[i] + st.v[i] + 1
-                @simd for j in 1:ndim
-                    st.p[j] += cim_t[j, col]
+            @inbounds for descriptorIndex in 1:prefixDepth
+                state.partialScenario[descriptorIndex] = remainder % variantCounts[descriptorIndex]
+                remainder = remainder ÷ variantCounts[descriptorIndex]
+                variantColumn = descriptorOffsets[descriptorIndex] +
+                                state.partialScenario[descriptorIndex] + 1
+                @simd for targetVariant in 1:numberOfDimensions
+                    state.prefixBalance[targetVariant] += cimTranspose[targetVariant, variantColumn]
                 end
-                alive = _bnb_charge!(st) && !_bnb_pruned(st, i)
+                alive = _bnb_charge!(state) && !_bnb_pruned(state, descriptorIndex)
                 alive || break
             end
             if alive
-                if L == ndesc
-                    push!(out, copy(st.v))   # surviving depth-ndesc prune == fixed point
+                if prefixDepth == numberOfDescriptors
+                    # The prefix IS a full scenario and it survived the
+                    # (exact, at full depth) prune: it is a fixed point.
+                    push!(taskOutput, copy(state.partialScenario))
                 else
-                    _bnb_node!(st, L + 1)
+                    _bnb_node!(state, prefixDepth + 1)
                 end
             end
-            Threads.atomic_add!(total, st.nodes[])   # flush residual node count
+            Threads.atomic_add!(totalNodes, state.nodesVisited[])   # flush the residual private count
         end
     end
 
-    abort[] && return (nothing, total[])
-    kern = Vector{Vector{Int}}()
-    for out in outs
-        append!(kern, out)
+    # `abortFlag[]` reads the atomic's value.
+    abortFlag[] && return (nothing, totalNodes[])
+    kernel = Vector{Vector{Int}}()
+    for taskOutput in taskOutputs
+        append!(kernel, taskOutput)
     end
-    sort!(kern; by = u -> signature(cib, u))
-    return (kern, total[])
+    # Tasks finish in nondeterministic order; sort so the result is stable.
+    sort!(kernel; by = scenario -> signature(cib, scenario))
+    return (kernel, totalNodes[])
 end
 
 #endregion
 
-end # module
+#region "basins"
+"""
+    find_basins(cib; rule=GlobalSuccession()) -> (fixed_points, basin_sizes, cycle_count)
+
+Exhaustive basin-of-attraction analysis under `rule` (default [`GlobalSuccession`](@ref)). Follows the succession chain from every scenario in the space, counting how many starting points converge to each fixed point / consistent scenario.
+
+This runs in two phases: a threaded sweep fills a flat successor table (every scenario's succession step), then a resolution pass walks the table with path compression so each scenario is resolved exactly once. Memory is ~8n bytes for the two flat tables (Int32 entries when the space fits, Int64 otherwise), independent of the thread count.
+For example, the first phase works out that scenario A maps to B, B maps to C, and C maps to D which is a consistent scenario. Therefore A, B, C and D are all in D's basin, and the second phase works this out.
+
+The default [`GlobalSuccession`](@ref) rule takes a fast path: the successor table is filled by a mixed-radix odometer that maintains the impact balance incrementally (one row delta per scenario, no allocation) instead of calling [`succession_step`](@ref) per scenario. Any other rule uses the generic per-scenario path — identical output, just slower.
+"""
+function find_basins(cib::CIB; rule::SuccessionRule=GlobalSuccession())
+    return _basins(rule, cib)
+end
+
+# Fast path, selected by dispatch when the rule is exactly GlobalSuccession.
+# The odometer chunk re-derives that rule's argmax semantics internally,
+# which is exactly why this specialisation cannot serve an arbitrary rule.
+function _basins(::GlobalSuccession, cib::CIB)
+    numberOfScenarios = max_signature(cib) + 1
+    scoreType = _score_type(cib)
+    # Store table entries as Int32 when every signature fits — half the
+    # memory, and memory traffic is what bounds this analysis.
+    if numberOfScenarios <= Int(typemax(Int32)) - 1
+        return _fast_basins(cib, Int32, Matrix{scoreType}(cib.cim_t))
+    end
+    return _fast_basins(cib, Int64, Matrix{scoreType}(cib.cim_t))
+end
+
+# `::Type{SignatureInt}` receives a TYPE as an argument value (Int32 or
+# Int64 above) — passing types around as ordinary values is normal in Julia.
+function _fast_basins(cib::CIB, ::Type{SignatureInt},
+                      cimTranspose::Matrix{ScoreInt}) where {SignatureInt<:Union{Int32,Int64}, ScoreInt<:Signed}
+    numberOfScenarios = max_signature(cib) + 1
+    successorTable = Vector{SignatureInt}(undef, numberOfScenarios)
+    _successor_table!(successorTable, cib, cimTranspose)
+    fixedPointSignatures, basinSizes, cycleCount = _resolve_and_tally(successorTable, numberOfScenarios)
+    fixedPoints = [inv_signature(cib, sig) for sig in fixedPointSignatures]
+    return (fixedPoints, basinSizes, cycleCount)
+end
+
+# Generic path: works for any rule, because it only ever calls the rule's
+# own succession_step. Allocates a few vectors per scenario, so it is much
+# slower than the odometer path — a correctness baseline, not a hot loop.
+function _basins(rule::SuccessionRule, cib::CIB)
+    numberOfScenarios = max_signature(cib) + 1
+    if numberOfScenarios <= Int(typemax(Int32)) - 1
+        return _generic_basins(rule, cib, Int32)
+    end
+    return _generic_basins(rule, cib, Int64)
+end
+
+function _generic_basins(rule::SuccessionRule, cib::CIB,
+                         ::Type{SignatureInt}) where {SignatureInt<:Union{Int32,Int64}}
+    numberOfScenarios = max_signature(cib) + 1
+    successorTable = Vector{SignatureInt}(undef, numberOfScenarios)
+    numberOfThreads = Threads.nthreads()
+    chunkSize = cld(numberOfScenarios, numberOfThreads)
+    @sync for threadIndex in 1:numberOfThreads
+        firstSignature = (threadIndex - 1) * chunkSize
+        lastSignature = min(threadIndex * chunkSize, numberOfScenarios) - 1
+        firstSignature > lastSignature && continue
+        # Each task writes a disjoint range of the table, so there is no
+        # data race even though they share the array.
+        Threads.@spawn for currentSignature in firstSignature:lastSignature
+            scenario = inv_signature(cib, currentSignature)
+            successor = succession_step(rule, cib, scenario)
+            @inbounds successorTable[currentSignature + 1] =
+                SignatureInt(signature(cib, successor))
+        end
+    end
+    fixedPointSignatures, basinSizes, cycleCount = _resolve_and_tally(successorTable, numberOfScenarios)
+    fixedPoints = [inv_signature(cib, sig) for sig in fixedPointSignatures]
+    return (fixedPoints, basinSizes, cycleCount)
+end
+
+"""
+    _successor_table!(successorTable, cib, cimTranspose) -> successorTable
+
+Fill `successorTable[sig + 1]` with the succession-step signature of every scenario.
+Threaded over contiguous chunks (disjoint writes); each chunk advances a mixed-radix odometer and maintains the impact balance incrementally, then takes the per-descriptor argmax (ties favour the current variant, then the lowest index — identical to [`succession_step`](@ref)).
+"""
+function _successor_table!(successorTable::Vector{SignatureInt}, cib::CIB,
+                           cimTranspose::Matrix{ScoreInt}) where {SignatureInt, ScoreInt}
+    numberOfScenarios = max_signature(cib) + 1
+    # Mixed-radix place values, so a chunk can assemble a successor's
+    # signature from its digits without any multiplication loop.
+    placeValues = Vector{Int}(undef, cib.numberOfDescriptors)
+    placeValue = 1
+    for descriptorIndex in 1:cib.numberOfDescriptors
+        placeValues[descriptorIndex] = placeValue
+        placeValue *= cib.numberOfVariants[descriptorIndex]
+    end
+
+    numberOfChunks = max(1, min(numberOfScenarios, 16 * Threads.nthreads()))
+    chunkSize = cld(numberOfScenarios, numberOfChunks)
+    numberOfChunks = cld(numberOfScenarios, chunkSize)
+    @sync for chunkIndex in 1:numberOfChunks
+        firstSignature = (chunkIndex - 1) * chunkSize
+        lastSignature = min(chunkIndex * chunkSize, numberOfScenarios) - 1
+        Threads.@spawn _successor_chunk!(successorTable, cimTranspose,
+                                         firstSignature, lastSignature,
+                                         cib.numberOfVariants, cib.desc_offsets,
+                                         placeValues, cib.numberOfDescriptors,
+                                         cib.numberOfDimensions)
+    end
+    return successorTable
+end
+
+# The per-chunk worker for the successor table. Same odometer + incremental
+# impact balance as _sweep_chunk!, but instead of a yes/no consistency test
+# it records where every scenario steps to.
+function _successor_chunk!(successorTable::Vector{SignatureInt}, cimTranspose::Matrix{ScoreInt},
+                           firstSignature::Int, lastSignature::Int,
+                           variantCounts::Vector{Int}, descriptorOffsets::Vector{Int},
+                           placeValues::Vector{Int}, numberOfDescriptors::Int,
+                           numberOfDimensions::Int) where {SignatureInt, ScoreInt}
+    scenario      = Vector{Int}(undef, numberOfDescriptors)
+    activeRows    = Vector{Int}(undef, numberOfDescriptors)
+    impactBalance = zeros(ScoreInt, numberOfDimensions)
+
+    # Decode the starting signature and build the initial impact balance,
+    # exactly as in _sweep_chunk!.
+    remainder = firstSignature
+    @inbounds for descriptorIndex in 1:numberOfDescriptors
+        variantCount = variantCounts[descriptorIndex]
+        scenario[descriptorIndex] = remainder % variantCount
+        activeRows[descriptorIndex] = descriptorOffsets[descriptorIndex] + scenario[descriptorIndex] + 1
+        remainder = remainder ÷ variantCount
+    end
+    @inbounds for descriptorIndex in 1:numberOfDescriptors
+        sourceRow = activeRows[descriptorIndex]
+        @simd for targetVariant in 1:numberOfDimensions
+            impactBalance[targetVariant] += cimTranspose[targetVariant, sourceRow]
+        end
+    end
+
+    @inbounds for currentSignature in firstSignature:lastSignature
+        # ── Successor: every descriptor independently picks its best-scoring
+        #    variant, and the choices are assembled straight into a signature.
+        successorSignature = 0
+        for descriptorIndex in 1:numberOfDescriptors
+            offset = descriptorOffsets[descriptorIndex]
+            bestVariant = scenario[descriptorIndex]
+            bestScore = impactBalance[offset + bestVariant + 1]  # current variant seeds the max
+            for variantIndex in 0:variantCounts[descriptorIndex]-1
+                score = impactBalance[offset + variantIndex + 1]
+                isBetter = score > bestScore     # strict >: ties keep current / lower index
+                # `ifelse` evaluates both branches and selects one — no
+                # branch, so the CPU never mispredicts in this hot loop.
+                bestScore = ifelse(isBetter, score, bestScore)
+                bestVariant = ifelse(isBetter, variantIndex, bestVariant)
+            end
+            successorSignature += placeValues[descriptorIndex] * bestVariant
+        end
+        successorTable[currentSignature + 1] = SignatureInt(successorSignature)
+
+        # ── Advance the odometer by one and patch the impact balance
+        #    (identical to the increment in _sweep_chunk!).
+        if currentSignature < lastSignature
+            for descriptorIndex in 1:numberOfDescriptors
+                variantCount = variantCounts[descriptorIndex]
+                variantCount == 1 && continue    # single-variant digit never changes; carry onward
+                oldRow = activeRows[descriptorIndex]
+                if scenario[descriptorIndex] + 1 < variantCount
+                    scenario[descriptorIndex] += 1
+                    newRow = oldRow + 1
+                    activeRows[descriptorIndex] = newRow
+                    @simd for targetVariant in 1:numberOfDimensions
+                        impactBalance[targetVariant] += cimTranspose[targetVariant, newRow] -
+                                                        cimTranspose[targetVariant, oldRow]
+                    end
+                    break
+                end
+                scenario[descriptorIndex] = 0    # roll over; carry to the next digit
+                newRow = descriptorOffsets[descriptorIndex] + 1
+                activeRows[descriptorIndex] = newRow
+                @simd for targetVariant in 1:numberOfDimensions
+                    impactBalance[targetVariant] += cimTranspose[targetVariant, newRow] -
+                                                    cimTranspose[targetVariant, oldRow]
+                end
+            end
+        end
+    end
+    return successorTable
+end
+
+"""
+    _fp_id!(registryLock, signatureForId, idForSignature, sig) -> id
+
+Locked get-or-assign of a dense 1-based id for the fixed point with signature `sig`. Called once per fixed point discovered (≈ number-of-fixed-points times in total across all workers), so the lock is essentially uncontended. Concurrent discoverers of the same fixed point serialise here and receive the same id.
+"""
+# @noinline keeps this rarely-taken locked path out of the caller's hot
+# loop, so the compiler optimises the loop without it.
+@noinline function _fp_id!(registryLock::ReentrantLock, signatureForId::Vector{Int},
+                           idForSignature::Dict{Int,Int}, fixedPointSignature::Int)
+    # lock / try / finally-unlock is the standard exception-safe locking
+    # pattern — the same shape as C#'s `lock` statement expands to.
+    lock(registryLock)
+    try
+        denseId = get(idForSignature, fixedPointSignature, 0)  # 0 = not registered yet
+        if denseId == 0
+            push!(signatureForId, fixedPointSignature)
+            denseId = length(signatureForId)
+            idForSignature[fixedPointSignature] = denseId
+        end
+        return denseId
+    finally
+        unlock(registryLock)
+    end
+end
+
+"""
+    _resolve_chunk!(attractorLabels, successorTable, firstSignature, lastSignature,
+                    registryLock, signatureForId, idForSignature)
+
+Resolve the starting scenarios in `firstSignature:lastSignature` into the shared `attractorLabels`, following successor chains.
+Cycle detection is **thread-private** (a per-worker `history` list plus a backward scan), so `attractorLabels` only ever holds *final* labels — 0 = unvisited, -1 = cycle, k > 0 = converges to the fixed point with dense id `k`. There is no shared in-progress marker, so a worker that walks into another worker's not-yet-resolved chain just re-walks it (redundant, never a false cycle) and reaches the same attractor; every scenario's attractor is deterministic, so concurrent writes to the same slot store the same value — a benign race. Fixed-point ids come from the locked registry ([`_fp_id!`](@ref)), hit only once per fixed point.
+"""
+function _resolve_chunk!(attractorLabels::Vector{SignatureInt}, successorTable::Vector{SignatureInt},
+                         firstSignature::Int, lastSignature::Int,
+                         registryLock::ReentrantLock, signatureForId::Vector{Int},
+                         idForSignature::Dict{Int,Int}) where {SignatureInt}
+    history = Int[]     # the chain of scenarios walked from the current start
+    @inbounds for startSignature in firstSignature:lastSignature
+        attractorLabels[startSignature + 1] != 0 && continue   # already resolved
+        empty!(history)
+        current = startSignature
+        label = zero(SignatureInt)
+        while true
+            existingLabel = attractorLabels[current + 1]
+            if existingLabel != 0
+                # We walked into territory that is already resolved: the
+                # whole chain behind us shares its attractor.
+                label = existingLabel
+                break
+            end
+            # Is `current` already on our own chain? Then we have walked in
+            # a circle — a cycle of length ≥ 2. Scanning backwards finds a
+            # repeat fastest, since a cycle closes near the chain's end.
+            alreadyOnChain = false
+            for position in length(history):-1:1
+                if history[position] == current
+                    alreadyOnChain = true
+                    break
+                end
+            end
+            if alreadyOnChain
+                label = SignatureInt(-1)   # the whole chain (incl. the tail leading in) is labelled cycle
+                break
+            end
+            push!(history, current)
+            next = Int(successorTable[current + 1])
+            if next == current
+                # A scenario that steps to itself is a fixed point. It is
+                # already in `history`, so it counts itself in its own basin.
+                label = SignatureInt(_fp_id!(registryLock, signatureForId,
+                                             idForSignature, current))
+                break
+            end
+            current = next
+        end
+        # Path compression: every scenario on the walked chain gets the
+        # final label, so later walks that touch any of them stop instantly.
+        for visited in history
+            attractorLabels[visited + 1] = label
+        end
+    end
+    return nothing
+end
+
+"""
+    _resolve_and_tally(successorTable, numberOfScenarios) -> (fp_sigs, sizes, cycle_count)
+
+Resolve every scenario to its fixed point attractor by walking the successor table, then tally basin sizes and the cycle count.
+"""
+function _resolve_and_tally(successorTable::Vector{SignatureInt},
+                            numberOfScenarios::Int) where {SignatureInt}
+    attractorLabels = zeros(SignatureInt, numberOfScenarios)
+    registryLock = ReentrantLock()
+    signatureForId = Int[]             # dense id (1-based) -> fixed-point signature
+    idForSignature = Dict{Int,Int}()   # fixed-point signature -> dense id
+
+    numberOfThreads = Threads.nthreads()
+    chunkSize = cld(numberOfScenarios, numberOfThreads)
+    @sync for threadIndex in 1:numberOfThreads
+        firstSignature = (threadIndex - 1) * chunkSize
+        lastSignature = min(threadIndex * chunkSize, numberOfScenarios) - 1
+        Threads.@spawn _resolve_chunk!(attractorLabels, successorTable,
+                                       firstSignature, lastSignature,
+                                       registryLock, signatureForId, idForSignature)
+    end
+
+    # ── Threaded tally. Every label is now a dense fixed-point id (> 0) or
+    #    -1 for a cycle. Each thread counts into its own arrays; the counts
+    #    are combined afterwards, so no locking is needed.
+    numberOfFixedPoints = length(signatureForId)
+    tallyChunkSize = cld(numberOfScenarios, numberOfThreads)
+    perThreadCounts = [zeros(Int, numberOfFixedPoints) for _ in 1:numberOfThreads]
+    perThreadCycleCounts = zeros(Int, numberOfThreads)
+    @sync for threadIndex in 1:numberOfThreads
+        firstSignature = (threadIndex - 1) * tallyChunkSize
+        lastSignature = min(threadIndex * tallyChunkSize, numberOfScenarios) - 1
+        counts = perThreadCounts[threadIndex]
+        Threads.@spawn begin
+            cyclesSeen = 0
+            @inbounds for signatureValue in firstSignature:lastSignature
+                label = Int(attractorLabels[signatureValue + 1])
+                if label == -1
+                    cyclesSeen += 1
+                else
+                    counts[label] += 1   # label is a dense id in 1:numberOfFixedPoints
+                end
+            end
+            perThreadCycleCounts[threadIndex] = cyclesSeen
+        end
+    end
+
+    # Combine the per-thread counts into one total per fixed point.
+    totalCounts = zeros(Int, numberOfFixedPoints)
+    for counts in perThreadCounts
+        @inbounds for fixedPointId in 1:numberOfFixedPoints
+            totalCounts[fixedPointId] += counts[fixedPointId]
+        end
+    end
+    # Discovery order depends on thread timing; sorting by signature makes
+    # the output deterministic. `sortperm` returns the ordering as an index
+    # list (like NumPy's argsort), applied to both arrays in step.
+    sortOrder = sortperm(signatureForId)
+    return signatureForId[sortOrder], totalCounts[sortOrder], sum(perThreadCycleCounts)
+end
+
+#endregion
+
+end
