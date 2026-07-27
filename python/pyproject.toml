@@ -30,9 +30,13 @@ packages = ["crossimpactbalances"]
 # artifacts to override the VCS-ignore exclusion when present.
 artifacts = ["crossimpactbalances/_libcib/**"]
 
-# Ship the juliapkg dependency spec inside the package so juliacall can find it.
-[tool.hatch.build.targets.wheel.force-include]
-"crossimpactbalances/juliapkg.json" = "crossimpactbalances/juliapkg.json"
+# juliapkg.json (the Julia dependency spec juliacall reads) lives inside the
+# package directory and is tracked in git, so the `packages` entry above already
+# ships it in the wheel. Do NOT add a force-include for it: that materialises a
+# second physical copy into site-packages, and for an editable install juliapkg
+# then finds both that copy and the one in the source tree. Its "path": "../.."
+# resolves to a different directory from each, and juliapkg aborts with
+# "'path' entries are not unique".
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

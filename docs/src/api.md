@@ -28,6 +28,16 @@ max_signature
 impact_balance
 ```
 
+## Editing a loaded model
+
+Both matrices are edited in place, so a model can be re-analysed without
+re-parsing its `.scw` file — which is what makes sensitivity sweeps cheap.
+
+```@docs
+set_impact!
+get_impact
+```
+
 ## Succession rules
 
 The succession dynamics is pluggable: define a `struct MyRule <: SuccessionRule`

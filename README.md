@@ -113,6 +113,7 @@ in [`build/`](build/README.md).
 | `load_scw`, `load_solutions` | Parse ScenarioWizard `.scw` and `.sl` files |
 | `signature`, `inv_signature`, `max_signature` | Bijection between scenarios and integers |
 | `impact_balance` | Score every variant against a scenario |
+| `set_impact!`, `get_impact` | Read/edit one cross-impact in a loaded model, no re-parse |
 | `SuccessionRule`, `GlobalSuccession`, `SequentialSuccession` | Pluggable succession dynamics (see [Pluggable succession rules](#pluggable-succession-rules)) |
 | `succession_step` | One deterministic succession step under a chosen rule |
 | `find_consistent` | Find every fixed point by exhaustive search (`algorithm=:auto`/`:bnb`/`:sweep`); honours `rule=` |
