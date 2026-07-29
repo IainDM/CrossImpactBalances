@@ -102,11 +102,13 @@ the GUI; reproduction scripts ship in the repository).
 | `bench_typical` | 59,049 | 16.4 s | 2.7 s | < 1 s | 0.4 ms |
 | `bench_50x50` | 60,466,176 | infeasible | 30.1 s, finds 3/5 | ~5 s, finds 5/5 | **13 ms, finds 5/5** |
 
-: Consistency-search wall-clock times (find-only medians). On the
-60-million-scenario stress file the package also computes the full
-basin-of-attraction analysis in 1.6 s — an analysis the other tools do not
-offer at any size. Like-for-like (same algorithm, single-threaded), the Julia
-engine is 66–159× faster than `cibsa`.
+: Consistency-search wall-clock times (find-only medians). The headline gap on
+`bench_typical` — 16.4 s versus 0.4 ms, roughly 37,000× — combines the replaced
+search algorithm with 10-way threading; like-for-like (the same
+succession-walk algorithm, both single-threaded), the Julia engine is 66–159×
+faster than `cibsa` across the benchmark files. On the 60-million-scenario
+stress file the package also computes the full basin-of-attraction analysis in
+1.6 s — an analysis the other tools do not offer at any size.
 
 This package is not a routine reimplementation of `cibsa`: its speed comes from
 a replaced algorithmic core, not micro-optimisation, which is why the work
@@ -185,15 +187,16 @@ scripted, reproducible CIB studies.
 
 # AI usage disclosure
 
-Generative AI tools (Anthropic's Claude) were used as a coding assistant
-during the development of the software and in drafting this manuscript. All
-algorithms, benchmarks, and text were specified, reviewed, and validated by
-the author; correctness of the software is established independently of any AI
-involvement by property-based tests against brute-force oracles and by
-cross-validation against ScenarioWizard and `cibsa`. The author takes full
-responsibility for the software and this paper.
-<!-- TODO(author): confirm this disclosure matches your actual workflow before
-submission. -->
+Generative AI tools (Anthropic's Claude) were used during the development of
+the software and in the drafting of this manuscript, both as a coding
+assistant and as a source of algorithmic suggestions — notably the
+branch-and-bound search strategy, which was proposed by the AI and then
+reviewed, adapted, and validated by the author. All algorithms, benchmarks,
+and text were reviewed and validated by the author; correctness of the
+software is established independently of any AI involvement by property-based
+tests against brute-force oracles and by cross-validation against
+ScenarioWizard and `cibsa`. The author takes full responsibility for the
+software and this paper.
 
 # Acknowledgements
 
