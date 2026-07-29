@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite it using the metadata below, and cite
+  the cross-impact balance methodology paper (Weimer-Jehle 2006) listed under
+  references.
+type: software
+title: CrossImpactBalances.jl
+version: 0.2.0
+authors:
+  - family-names: Morrow
+    given-names: Iain
+    # TODO(author): uncomment and fill in before submission — JOSS requires it.
+    # orcid: https://orcid.org/0000-0000-0000-0000
+license: MIT
+repository-code: https://github.com/IainDM/CrossImpactBalances
+abstract: >-
+  Fast, exact cross-impact balance (CIB) scenario analysis in Julia: exhaustive
+  consistency search and complete basin-of-attraction analysis on scenario
+  spaces of up to hundreds of millions of combinations, with Python bindings, a
+  C ABI, and a desktop application.
+keywords:
+  - cross-impact balance
+  - scenario analysis
+  - foresight
+  - Julia
+references:
+  - type: article
+    authors:
+      - family-names: Weimer-Jehle
+        given-names: Wolfgang
+    title: "Cross-impact balances: A system-theoretical approach to cross-impact analysis"
+    journal: Technological Forecasting and Social Change
+    year: 2006
+    volume: 73
+    issue: 4
+    start: 334
+    end: 361
+    doi: 10.1016/j.techfore.2005.06.005
