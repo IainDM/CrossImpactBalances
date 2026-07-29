@@ -110,18 +110,44 @@ faster than `cibsa` across the benchmark files. On the 60-million-scenario
 stress file the package also computes the full basin-of-attraction analysis in
 1.6 s — an analysis the other tools do not offer at any size.
 
-This package is not a routine reimplementation of `cibsa`: its speed comes from
-a replaced algorithmic core, not micro-optimisation, which is why the work
-could not have been contributed incrementally upstream. The succession-walk
-search is replaced by a local fixed-point test with early exit (a ~180×
-algorithmic gain before threading), scores are maintained incrementally by a
-mixed-radix odometer rather than recomputed per scenario, an exact
-branch-and-bound search handles spaces too large to enumerate, and basin
-analysis is a new capability. The package also pursues goals outside `cibsa`'s
-scope — an embeddable C ABI, source-free Python distribution, and desktop
-packaging — for which Julia [@bezanson2017] is the enabling host. The Python
-wrapper deliberately preserves a `cibsa`-adjacent workflow so existing users
-can migrate with little friction.
+Decomposing the gap in Table 1 shows that most of it is methodological rather
+than incidental. Two factors are ordinary engineering: expressing the same
+succession-walk search in Julia [@bezanson2017] rather than pure Python
+accounts for the 66–159×, and multi-threading adds only a further ~4× on the
+ten-thread benchmark machine. The remaining orders of magnitude come from
+three algorithmic changes, none present in `cibsa` or, to our knowledge, any
+other CIB tool:
+
+- **A local consistency test instead of succession walks** (~180× at equal
+  thread counts). `cibsa` finds the kernel by running a succession walk from
+  every scenario, each step recomputing a full impact balance and many walks
+  re-visiting the same intermediate states. This package instead asks each
+  scenario a strictly local question — is any descriptor's chosen state beaten
+  by an alternative? — and abandons the scenario at the first beaten
+  descriptor, so a single linear pass replaces $v^d$ walks.
+- **Incremental SIMD scoring.** Scenarios are enumerated by a mixed-radix
+  odometer so that consecutive scenarios differ in one descriptor state, and
+  the impact balance is updated by that state's score-row delta — a vectorised
+  loop over narrow integers with no allocation — instead of being recomputed
+  from scratch each time.
+- **Exact branch-and-bound** (a further ~14× over the sweep on the
+  60-million-scenario file, with fundamentally better scaling). Descriptors
+  are assigned depth-first, and precomputed suffix score bounds prune any
+  subtree that provably contains no consistent scenario; on the stress file
+  the search visits 2.25% of the space. Because its cost scales with the
+  pruned tree rather than the scenario space, it extends exact analysis
+  beyond what enumeration can reach; a visited-node budget falls back to the
+  sweep on weakly-coupled matrices where pruning cannot pay off, preserving
+  exactness.
+
+Basin-of-attraction analysis is not a speedup but a new capability, with its
+own two-phase design (see Software design). These changes replace `cibsa`'s
+core rather than tune it — which is why the work could not have been
+contributed incrementally upstream — and the package also pursues goals
+outside `cibsa`'s scope: an embeddable C ABI, source-free Python
+distribution, and desktop packaging. The Python wrapper nevertheless
+preserves a `cibsa`-adjacent workflow so existing users can migrate with
+little friction.
 
 Correctness is established two ways: a three-way validation showing identical
 kernels — down to individual scenario signatures, with every reported scenario
@@ -134,26 +160,15 @@ oracles on randomised instances.
 
 The engine is pure Julia with zero package dependencies, which keeps it
 auditable, trivially installable, and compilable into a standalone shared
-library. Three exact engines return bit-identical kernels:
-
-- **Incremental sweep.** A mixed-radix odometer enumerates the space while the
-  impact balance is maintained incrementally — each step applies the score
-  delta of the one descriptor state that changed as a SIMD loop over narrow
-  integers — and each scenario is tested locally ("is any chosen state beaten?")
-  with early exit, rather than by following succession walks.
-- **Branch-and-bound** (selected automatically for spaces of $10^5$ scenarios
-  or more). Descriptors are assigned depth-first, and any subtree in which some
-  assigned state is provably beaten in every completion is discarded using
-  precomputed suffix score bounds. The search is exact and typically visits a
-  few percent of the space (2.25% of the 60-million-scenario benchmark); a
-  visited-node budget falls back to the sweep on weakly-coupled matrices where
-  pruning cannot pay off, preserving exactness.
-- **Two-phase basin analysis.** A threaded pass fills a flat successor table;
-  a path-compressed resolution pass then assigns every scenario to its fixed
-  point or cycle in O(N) total work with O(1) cycle detection. Memory is
-  independent of thread count (~8 bytes per scenario), which brought a
-  408-million-scenario model from an infeasible ~13 GB under the previous
-  per-thread design to 1.6 GB.
+library. The sweep (chosen automatically below $10^5$ scenarios), the
+branch-and-bound search (chosen above it), and the basin engine return
+bit-identical results. The basin analysis runs in two phases: a threaded pass
+fills a flat successor table, reusing the incremental SIMD scoring described
+above, and a path-compressed resolution pass then assigns every scenario to
+its fixed point or cycle in O(N) total work with O(1) cycle detection. Memory
+is independent of thread count (~8 bytes per scenario), which brought a
+408-million-scenario model from an infeasible ~13 GB under a per-thread
+design to 1.6 GB.
 
 Succession dynamics is an extension point: a new rule subtypes
 `SuccessionRule` and defines a single `succession_step` method, and every
