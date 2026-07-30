@@ -218,10 +218,13 @@ property-test suite pins every algorithm against brute-force oracles):
 - **Branch-and-bound** (`algorithm=:bnb`, chosen automatically by
   `algorithm=:auto` for spaces ≥ 10^5): descriptors are assigned depth-first
   and any subtree in which some assigned descriptor's chosen variant is
-  provably beaten in every completion is discarded using precomputed suffix
-  score bounds. Exact, and typically visits a few percent of the space; a
-  visited-node budget falls back to the sweep on weakly-coupled matrices
-  where pruning cannot pay off.
+  provably beaten in every completion is discarded using precomputed
+  per-variant-pair suffix difference bounds — for each (chosen, rival) pair
+  the extreme of the score *difference* is taken over each undecided
+  descriptor's shared variant choice, which is strictly tighter than
+  bounding the two scores independently. Exact, and typically visits a few
+  percent of the space; a visited-node budget falls back to the sweep on
+  weakly-coupled matrices where pruning cannot pay off.
 
 Measured on a 4-core Intel Xeon @ 2.10 GHz, Julia 1.11.7 `-t 4`, find-only
 medians of 3 (`test/bench_optim.jl`):
@@ -235,6 +238,15 @@ medians of 3 (`test/bench_optim.jl`):
 Net effect on the 60M-scenario stress file: exhaustive search is ~39× faster
 than v0.1 (and B&B's cost scales with the pruned tree, not the space, so the
 gap widens on larger problems); full basin analysis is ~5.8× faster.
+
+A subsequent tightening of the branch-and-bound test — bounding each
+(chosen, rival) score *difference* over the undecided descriptors' shared
+variant choices, instead of bounding the two scores independently — shrinks
+the visited tree further, with bit-identical results: `bench_typical`
+13.3% → 6.66% of the space, `bench_xlarge` 15.2% → 8.71%, `bench_50x50`
+2.25% → 0.601% (node counts are machine-independent; the timings in the
+table above predate this change). On `bench_50x50` the smaller tree makes
+the B&B search ~4× faster again.
 
 ## Citation
 
