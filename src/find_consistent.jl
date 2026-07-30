@@ -102,7 +102,7 @@ function _find_kernel(rule::SuccessionRule, cib::CIB; algorithm::Symbol=:auto,
 
     # Otherwise branch-and-bound, which avoids looking at most scenarios at
     # all by ruling out whole families of them at once.
-    suffixMin, suffixMax = _bnb_bounds(cib)
+    sufDiff, pairOffsets = _bnb_bounds(cib)
 
     # `something(a, b)` returns the first argument that isn't `nothing` — like
     # C#'s ?? null-coalescing operator. An explicit `:bnb` means the caller
@@ -111,7 +111,7 @@ function _find_kernel(rule::SuccessionRule, cib::CIB; algorithm::Symbol=:auto,
     nodeBudget = something(bnb_node_budget,
                            algorithm == :bnb ? typemax(Int) : numberOfScenarios ÷ 16)
 
-    kernel, _ = _bnb_fixed_points(cib, suffixMin, suffixMax;
+    kernel, _ = _bnb_fixed_points(cib, sufDiff, pairOffsets;
                                   node_budget=nodeBudget, margin=margin)
 
     # Careful: a `nothing` result does NOT mean "this model has no consistent

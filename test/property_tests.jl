@@ -383,3 +383,54 @@ end
     # The margin genuinely makes extra (non-Nash) scenarios sticky somewhere.
     @test saw_strict_superset
 end
+
+@testset "Property: B&B pair-difference bound dominates per-column bounds" begin
+    # The prune uses, per (chosen, rival) pair, the suffix-summed extreme of
+    # the score DIFFERENCE over each undecided descriptor's shared variant
+    # choice. That must never be looser than the decoupled bound it replaced
+    # (per-column suffix min of the rival minus suffix max of the chosen),
+    # because min_a(x_a - y_a) >= min_a x_a - max_a y_a.
+    rng = MersenneTwister(20260730)
+    for _ in 1:20
+        ndesc = rand(rng, 2:6)
+        nvariants = [rand(rng, 1:5) for _ in 1:ndesc]
+        cib = make_cib(nvariants,
+                       rand_cim(rng, nvariants; zero_diag=rand(rng, Bool)))
+        sufDiff, pairOffsets = CrossImpactBalances._bnb_bounds(cib)
+
+        # The pre-tightening per-column suffix extremes, rebuilt naively.
+        ndim = cib.numberOfDimensions
+        sufmin = zeros(Int, ndesc + 1, ndim)
+        sufmax = zeros(Int, ndesc + 1, ndim)
+        for l in ndesc:-1:1, c in 1:ndim
+            rows = cib.desc_offsets[l]+1 : cib.desc_offsets[l]+nvariants[l]
+            sufmin[l, c] = sufmin[l+1, c] + minimum(cib.cim[r, c] for r in rows)
+            sufmax[l, c] = sufmax[l+1, c] + maximum(cib.cim[r, c] for r in rows)
+        end
+
+        for i in 1:ndesc, chosen in 0:nvariants[i]-1, rival in 0:nvariants[i]-1
+            p = pairOffsets[i] + chosen * nvariants[i] + rival + 1
+            chosenCol = cib.desc_offsets[i] + chosen + 1
+            rivalCol = cib.desc_offsets[i] + rival + 1
+            for k in 1:ndesc+1
+                @test sufDiff[p, k] >= sufmin[k, rivalCol] - sufmax[k, chosenCol]
+                chosen == rival && @test sufDiff[p, k] == 0
+            end
+        end
+    end
+end
+
+@testset "B&B node-count regression guard (bench_typical)" begin
+    # Guards pruning EFFECTIVENESS, which the kernel-equality tests above are
+    # blind to. With the pair-difference bound the search expands 3,933 nodes
+    # of bench_typical's 59,049 (the per-column bound needed 7,875). The
+    # threshold leaves headroom only for the small thread-count-dependent
+    # variation in how root prefixes are charged.
+    path = joinpath(@__DIR__, "sample_files", "bench_typical.scw")
+    cib = load_scw(path; kernel=Vector{Vector{Int}}())
+    sufDiff, pairOffsets = CrossImpactBalances._bnb_bounds(cib)
+    kernel, nodes = CrossImpactBalances._bnb_fixed_points(cib, sufDiff, pairOffsets;
+                                                          node_budget=typemax(Int))
+    @test kernel !== nothing
+    @test nodes <= 4_500
+end
