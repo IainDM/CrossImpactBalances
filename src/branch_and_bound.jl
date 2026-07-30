@@ -17,19 +17,16 @@ HOW WE PROVE A NODE IS HOPELESS
 -------------------------------
 Remember what "consistent" means: for every descriptor, the variant the scenario has chosen must score at least as well as its siblings (else that descriptor would move, and the scenario would not be consistent).
 
-In a partial scenario we can't know a variant's final score, because the undecided descriptors will still add to it. But we can put limits on its score. A variant's final score is:
+So what matters is never a variant's score on its own — it is the GAP between a sibling's score and the chosen variant's score. In a partial scenario we can't know that gap exactly, because the undecided descriptors will still add to both sides. But we can bound it. The gap is:
 
-     (what the already-decided descriptors contribute)   <- known exactly
-   + (what the undecided descriptors will contribute)    <- unknown, but bounded
+     (what the already-decided descriptors contribute to the gap)   <- known exactly
+   + (what the undecided descriptors will contribute to the gap)    <- unknown, but bounded
 
-The first part is tracked as we descend (`prefixBalance`). For the second we precompute, once, the smallest and largest total the undecided descriptors could possibly contribute (`_bnb_bounds` → `suffixMin` / `suffixMax`).
+The first part is tracked as we descend (`prefixBalance`). For the second we precompute, once, the least each undecided descriptor could add to the gap of every (chosen, sibling) pair (`_bnb_bounds` → `sufDiff`).
 
- Now compare a chosen variant with one of its siblings:
+The crucial point is that an undecided descriptor sits on ONE variant, and that single choice feeds the sibling and the chosen variant TOGETHER. So we do not bound the sibling's score and the chosen variant's score separately — the variant that flatters the sibling most may not be the variant that starves the chosen variant most, and pairing those two extremes imagines a world that cannot happen. Instead, for each pair we ask: which single variant of this undecided descriptor closes the gap the most? Summing that per-descriptor worst case gives the gap's guaranteed floor.
 
-   * chosen variant's BEST case  = its prefix + the most the rest could add
-   * sibling's WORST case        = its prefix + the least the rest could add
-
-If the sibling's worst case still beats the chosen variant's best case, then the sibling wins no matter how the undecided descriptors turn out. That descriptor would always want to move. Every scenario below the chosen variant is inconsistent so there's no need to look at any of them. 
+If even that guaranteed gap leaves the sibling strictly ahead (by more than the rule's margin), the sibling wins no matter how the undecided descriptors turn out. That descriptor would always want to move. Every scenario below the chosen variant is inconsistent so there's no need to look at any of them.
 
 A WORKED EXAMPLE
 ----------------
@@ -42,25 +39,23 @@ and we are checking whether Policy is happy with Green. Between them, the descri
 
      Green: -4                      Grey: +5
 
-Energy is undecided; from the precomputed bounds, it will contribute:
+so the decided part of Grey's gap over Green is +9. Energy is still undecided; its two variants contribute:
 
-     to Green: between  0 and +1    to Grey: between +1 and +2
+     Renewable: +1 to Green, +2 to Grey   -> widens the gap by +1
+     Fossil:     0 to Green, +1 to Grey   -> widens the gap by +1
 
- So whatever Energy does:
+Whichever way Energy goes, the gap grows by at least min(+1, +1) = +1 — that is the precomputed `sufDiff` entry for the pair (Green, Grey). The final gap is therefore at least 9 + 1 = +10 > 0: Grey strictly beats Green in every completion, Policy abandons Green, and both scenarios under this node — (Boom, Green, Renewable) and (Boom, Green, Fossil) — are inconsistent. We discard them without ever scoring them. In a 12-descriptor model the same single test would have discarded tens of thousands.
 
-     Green ends up between -4 and -3   -> its BEST possible score is  -3
-     Grey  ends up between +6 and +7   -> its WORST possible score is +6
-
-Grey's worst (+6) still beats Green's best (-3). So in every completion, Policy abandons Green for Grey. Both scenarios under this node — (Boom, Green, Renewable) and (Boom, Green, Fossil) — are inconsistent, and we discard them without ever scoring them. In a 12-descriptor model the same single test would have discarded tens of thousands.
+(Bounding each column separately would have been weaker: Green ends up between -4 and -3, Grey between +6 and +7, so the guaranteed gap would only be +6 - (-3) = +9, not +10. The lost +1 comes from pairing Green's best case (Renewable) with Grey's worst case (Fossil) — two different Energy choices that can never happen at once. Here both bounds happen to prune; on tighter matrices only the pair bound does.)
 
 
 WHY THE ANSWER IS STILL EXACT
 -----------------------------
 Two things make this a shortcut rather than an approximation:
 
-1. The bounds are conservative. We only ever prune when the sibling wins even in the most favourable case for the chosen variant, so a scenario that could be consistent is never discarded.
+1. The bounds are conservative. We only ever prune when the sibling stays ahead even in the completion most favourable to the chosen variant, so a scenario that could be consistent is never discarded.
 
-2. At the bottom of the tree, when every descriptor is decided, there is nothing left undecided, so the suffix bounds are all zero and both limits collapse to the true score. The prune test becomes precisely the ordinary consistency test. That is why a leaf which survives the prune IS a consistent scenario and needs no further checking.
+2. At the bottom of the tree, when every descriptor is decided, there is nothing left undecided, so the suffix differences are all zero and the guaranteed gap IS the true gap. The prune test becomes precisely the ordinary consistency test. That is why a leaf which survives the prune IS a consistent scenario and needs no further checking.
 
 
 The result is identical to the sweep's.
@@ -68,9 +63,9 @@ The result is identical to the sweep's.
  WHY THERE IS A NODE BUDGET
 --------------------------
 Pruning only pays when the cross-impact matrix is strongly coupled, so that descriptors decisively push each other around.
-If the impacts are weak or evenly balanced, the brackets overlap almost everywhere, almost nothing gets pruned, and we end up walking the whole tree — which is slower than the sweep, because the sweep has the odometer trick and visits only the leaves whereas the tree walk also visits every internal node.
+If the impacts are weak or evenly balanced, the guaranteed gaps almost never clear the margin, almost nothing gets pruned, and we end up walking the whole tree — which is slower than the sweep, because the sweep has the odometer trick and visits only the leaves whereas the tree walk also visits every internal node.
 
-testing on the sample files in the repository shows that the big, strongly-coupled models are where the win is: CIB_nested finds its 20 consistent scenarios after looking at one ten-thousandth of the space.
+testing on the sample files in the repository shows that the big, strongly-coupled models are where the win is: CIB_nested finds its 20 consistent scenarios after looking at one twenty-five-thousandth of the space.
 
 In some cases - tiny or weakly-coupled models - this branch and bound takes more effort than it saves. So we say that it can run until it reaches a certain % of nodes and if it hasn't worked by then, it is abandoned for a full sweep using _find_kernel.
 
@@ -80,52 +75,79 @@ In some cases - tiny or weakly-coupled models - this branch and bound takes more
 """
 TECHNICAL description of _bnb_bounds calculations
 
-    _bnb_bounds(cib) -> (suffixMin, suffixMax)
+    _bnb_bounds(cib) -> (sufDiff, pairOffsets)
 
-Precompute, for every variant column, how much the descriptors from `k` onwards could add to that column's score — at least (`suffixMin`) and at most (`suffixMax`). This is the "unknown but bounded" half of the bracket described in the section header, and it is computed once and reused by every node in the tree.
+Precompute, for every ordered pair of variant columns (chosen, rival) belonging to the same descriptor, the least the still-undecided descriptors could add to the rival's lead over the chosen variant. This is the "unknown but bounded" half of the gap described in the section header, computed once and reused by every node in the tree.
 
-`suffixMin[k, c]` / `suffixMax[k, c]` is the minimum / maximum total contribution descriptors `k..numberOfDescriptors` can make to the impact score of variant column `c`, over every possible choice of their variants. Each descriptor is free to choose independently, so the extremes just add up: the minimum is the sum of each descriptor's own smallest entry in column `c`.
+`sufDiff[p, k]` is the minimum total contribution descriptors `k..numberOfDescriptors` can make to (rival's score − chosen's score), over every possible choice of their variants. `p` identifies the pair: descriptor `i`'s pairs occupy a block starting at `pairOffsets[i]` (0-based, mirroring `desc_offsets`), and the pair (chosenLocal, rivalLocal) — both 0-based — sits at `p = pairOffsets[i] + chosenLocal * v_i + rivalLocal + 1`.
 
-Row `numberOfDescriptors + 1` is left as zero — "no descriptors left to decide, so they can add nothing". That is what makes the prune test exact at the bottom of the tree. So once descriptors `1..k` are assigned, `suffixMin[k+1, c] .. suffixMax[k+1, c]` brackets what the still-undecided descriptors can add to column `c`.
+Across descriptors the minima simply add, because each undecided descriptor chooses its variant independently of the others. Within one descriptor they do NOT decompose per column: its single variant choice feeds the chosen and the rival columns together, so the minimum is taken over that shared choice — `min_a (cim[a→rival] − cim[a→chosen])`. That coupling makes this bound strictly tighter than bounding each column's score separately whenever different variants attain the two per-column extremes.
+
+Column `numberOfDescriptors + 1` is left as zero — "no descriptors left to decide, so they can add nothing". That is what makes the prune test exact at the bottom of the tree. So once descriptors `1..k` are assigned, `sufDiff[p, k+1]` is the guaranteed floor on what the still-undecided descriptors add to pair `p`'s gap.
+
+The table is stored pairs-major, `(number of pairs) × (numberOfDescriptors + 1)`: Julia arrays are column-major, so the prune's scan over one descriptor's rivals at a fixed depth reads consecutive memory.
+
+A self-pair (rival == chosen) has difference identically zero, so its entries are all zero. It is kept so each descriptor's rival scan is one contiguous block, and so that a (hypothetical) negative margin reproduces the sweep's semantics exactly — the sweep's rival loop includes the chosen column too.
 """
 function _bnb_bounds(cib::CIB)
-    numberOfDescriptors, numberOfDimensions = cib.numberOfDescriptors, cib.numberOfDimensions
+    numberOfDescriptors = cib.numberOfDescriptors
     cimTranspose = cib.cim_t
-    suffixMin = zeros(Int, numberOfDescriptors + 1, numberOfDimensions)
-    suffixMax = zeros(Int, numberOfDescriptors + 1, numberOfDimensions)
 
-    # Build the bounds back-to-front: descriptor k's bounds are its own best/worst row entry plus whatever descriptors k+1..end can add.
-    # `ndesc:-1:1` is a range counting down (like range(n, 0, -1) in Python).
-    @inbounds for descriptorIndex in numberOfDescriptors:-1:1
-        offset = cib.desc_offsets[descriptorIndex]
-        variantCount = cib.numberOfVariants[descriptorIndex]
-        for targetVariant in 1:numberOfDimensions
-            minValue = typemax(Int)
-            maxValue = typemin(Int)
-            for variantIndex in 0:variantCount-1
-                # = cim[row of this variant, targetVariant]
-                value = Int(cimTranspose[targetVariant, offset + variantIndex + 1])
-                minValue = ifelse(value < minValue, value, minValue)
-                maxValue = ifelse(value > maxValue, value, maxValue)
+    pairOffsets = Vector{Int}(undef, numberOfDescriptors)
+    numberOfPairs = 0
+    for descriptorIndex in 1:numberOfDescriptors
+        pairOffsets[descriptorIndex] = numberOfPairs
+        numberOfPairs += cib.numberOfVariants[descriptorIndex]^2
+    end
+
+    sufDiff = zeros(Int, numberOfPairs, numberOfDescriptors + 1)
+
+    # Build the bounds back-to-front: the floor from descriptor k onwards is
+    # its own worst single-variant gap contribution plus whatever descriptors
+    # k+1..end can add. `ndesc:-1:1` is a range counting down (like
+    # range(n, 0, -1) in Python).
+    @inbounds for sourceDescriptor in numberOfDescriptors:-1:1
+        sourceOffset = cib.desc_offsets[sourceDescriptor]
+        sourceVariantCount = cib.numberOfVariants[sourceDescriptor]
+        pairIndex = 0
+        for descriptorIndex in 1:numberOfDescriptors
+            columnOffset = cib.desc_offsets[descriptorIndex]
+            variantCount = cib.numberOfVariants[descriptorIndex]
+            for chosenLocal in 0:variantCount-1
+                chosenColumn = columnOffset + chosenLocal + 1
+                for rivalLocal in 0:variantCount-1
+                    rivalColumn = columnOffset + rivalLocal + 1
+                    pairIndex += 1
+                    minDiff = typemax(Int)
+                    for sourceVariant in 0:sourceVariantCount-1
+                        # One variant of the source descriptor feeds BOTH
+                        # columns, so take the extreme of the difference —
+                        # not the difference of the extremes.
+                        sourceRow = sourceOffset + sourceVariant + 1
+                        difference = Int(cimTranspose[rivalColumn, sourceRow]) -
+                                     Int(cimTranspose[chosenColumn, sourceRow])
+                        minDiff = ifelse(difference < minDiff, difference, minDiff)
+                    end
+                    sufDiff[pairIndex, sourceDescriptor] =
+                        sufDiff[pairIndex, sourceDescriptor + 1] + minDiff
+                end
             end
-            suffixMin[descriptorIndex, targetVariant] = suffixMin[descriptorIndex + 1, targetVariant] + minValue
-            suffixMax[descriptorIndex, targetVariant] = suffixMax[descriptorIndex + 1, targetVariant] + maxValue
         end
     end
-    return suffixMin, suffixMax
+    return sufDiff, pairOffsets
 end
 
 """
 Everything one task needs while walking its part of the tree, bundled into a struct so the recursion passes one argument instead of a dozen.
 
-`partialScenario` is the node we are currently at — the variants decided so far. `prefixBalance` is what those decided descriptors contribute to every variant's score: the "known exactly" half of the bracket in the section header, kept up to date as we descend rather than recomputed at each node.
+`partialScenario` is the node we are currently at — the variants decided so far. `prefixBalance` is what those decided descriptors contribute to every variant's score: the "known exactly" half of the gap in the section header, kept up to date as we descend rather than recomputed at each node.
 
 The three fields after `foundFixedPoints` implement the node budget. `nodesVisited` is this task's private counter (a `Ref` is a mutable single-value box, needed because the struct itself is immutable), while `totalNodes` and `abortFlag` are Atomics shared by every task — the Julia equivalent of C#'s Interlocked operations.
 """
 struct _BnBState
     cim_t::Matrix{Int}
-    sufmin::Matrix{Int}
-    sufmax::Matrix{Int}
+    sufdiff::Matrix{Int}
+    pairOffsets::Vector{Int}
     nvariants::Vector{Int}
     offsets::Vector{Int}
     ndesc::Int
@@ -143,26 +165,33 @@ end
 """
     _bnb_pruned(state, assignedCount) -> Bool
 
-Can this whole branch of the tree be thrown away? This is the test worked through in the section header: with descriptors `1..assignedCount` decided, return true if some decided descriptor has a rival variant that wins in *every* possible completion — its worst case still beats the chosen variant's best case (by more than the rule's `margin`). If so, no scenario below this node can be consistent, so the caller skips the entire subtree.
+Can this whole branch of the tree be thrown away? This is the test worked through in the section header: with descriptors `1..assignedCount` decided, return true if some decided descriptor has a rival variant whose guaranteed gap over the chosen variant — the decided part plus the precomputed floor on what the undecided descriptors add — exceeds the rule's `margin`. Such a rival wins in *every* possible completion, so no scenario below this node can be consistent and the caller skips the entire subtree.
 
 Only *decided* descriptors are checked, because an undecided one has no chosen variant to be unhappy with yet.
 
-Ties — and gaps within the margin — never prune, which matches the convention everywhere else that a descriptor keeps its current variant unless something strictly beats it. Once every descriptor is assigned the suffix bounds are zero, so this condition becomes exactly the margin consistency test on the completed scenario (`margin = 0` recovers plain global consistency).
+The rival scan includes the chosen variant itself (its pair entries are all zero, so for `margin ≥ 0` it can never trigger); keeping it makes the scan one contiguous block and preserves exact sweep parity for negative margins.
+
+Ties — and gaps within the margin — never prune, which matches the convention everywhere else that a descriptor keeps its current variant unless something strictly beats it. Once every descriptor is assigned the suffix differences are zero, so this condition becomes exactly the margin consistency test on the completed scenario (`margin = 0` recovers plain global consistency).
 """
 function _bnb_pruned(state::_BnBState, assignedCount::Int)
     prefixBalance = state.prefixBalance
-    suffixMin = state.sufmin
-    suffixMax = state.sufmax
-    suffixRow = assignedCount + 1   # bounds row for the still-undecided descriptors
+    sufDiff = state.sufdiff
+    suffixColumn = assignedCount + 1   # bounds column for the still-undecided descriptors
     @inbounds for descriptorIndex in 1:assignedCount
         offset = state.offsets[descriptorIndex]
-        chosenColumn = offset + state.partialScenario[descriptorIndex] + 1
-        # Best case for the variant this branch chose: what the decided descriptors already give it, plus the most the undecided ones could add. A rival has to clear this (and the margin) to win outright. 
-        # In the worked example this is Green's -4 + 1 = -3.
-        bestCaseChosen = prefixBalance[chosenColumn] + suffixMax[suffixRow, chosenColumn] + state.margin
-        for column in offset+1:offset+state.nvariants[descriptorIndex]
-            # Worst case for a rival variant: its decided contribution plus the least the undecided descriptors could add — in the example, Grey's +5 + 1 = +6. If even that beats the chosen variant's best case, the rival wins however the rest turns out, so nothing below this node can be consistent.
-            if prefixBalance[column] + suffixMin[suffixRow, column] > bestCaseChosen
+        variantCount = state.nvariants[descriptorIndex]
+        chosenLocal = state.partialScenario[descriptorIndex]
+        # What a rival must overcome: the chosen variant's decided score plus
+        # the margin. In the worked example this is Green's -4.
+        threshold = prefixBalance[offset + chosenLocal + 1] + state.margin
+        pairBase = state.pairOffsets[descriptorIndex] + chosenLocal * variantCount
+        for rivalLocal in 1:variantCount
+            # The rival's decided score plus the guaranteed floor on what the
+            # undecided descriptors add to its lead — in the example, Grey's
+            # +5 + 1 = +6 against Green's -4. One number per PAIR, because
+            # each undecided descriptor feeds both columns with the same
+            # variant choice.
+            if prefixBalance[offset + rivalLocal] + sufDiff[pairBase + rivalLocal, suffixColumn] > threshold
                 return true
             end
         end
@@ -229,7 +258,7 @@ function _bnb_node!(state::_BnBState, depth::Int)
 end
 
 """
-    _bnb_fixed_points(cib, suffixMin, suffixMax; node_budget, margin)
+    _bnb_fixed_points(cib, sufDiff, pairOffsets; node_budget, margin)
         -> (Union{Nothing, Vector{Vector{Int}}}, nodesVisited)
 
 Run the branch-and-bound search described in the section header, across all threads.
@@ -238,7 +267,7 @@ The work is split by chopping the tree near the top: every combination of varian
 
 Returns a tuple. The first element is the complete kernel sorted by ascending signature — or `nothing` if the search gave up because it blew the node budget, which is the caller's signal to fall back to the sweep. The second is how many tree nodes were visited, i.e. how many partial scenarios were expanded; comparing that with the total number of scenarios shows how much the pruning actually saved.
 """
-function _bnb_fixed_points(cib::CIB, sufmin::Matrix{Int}, sufmax::Matrix{Int};
+function _bnb_fixed_points(cib::CIB, sufDiff::Matrix{Int}, pairOffsets::Vector{Int};
                            node_budget::Int, margin::Int=0)
     numberOfDescriptors = cib.numberOfDescriptors
     variantCounts = cib.numberOfVariants
@@ -264,7 +293,7 @@ function _bnb_fixed_points(cib::CIB, sufmin::Matrix{Int}, sufmax::Matrix{Int};
     @sync for prefixId in 0:numberOfPrefixes-1
         taskOutput = taskOutputs[prefixId + 1]
         Threads.@spawn begin
-            state = _BnBState(cimTranspose, sufmin, sufmax, variantCounts, descriptorOffsets,
+            state = _BnBState(cimTranspose, sufDiff, pairOffsets, variantCounts, descriptorOffsets,
                               numberOfDescriptors, numberOfDimensions,
                               zeros(Int, numberOfDescriptors), zeros(Int, numberOfDimensions),
                               taskOutput, Ref(0), totalNodes, abortFlag, node_budget, margin)
