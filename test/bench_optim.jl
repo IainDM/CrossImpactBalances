@@ -26,8 +26,8 @@ for name in ["bench_typical", "bench_xlarge", "bench_50x50"]
     t_bnb   = med3(() -> find_consistent(cib; algorithm=:bnb))
     t_bas   = med3(() -> find_basins(cib))
 
-    sufmin, sufmax = CrossImpactBalances._bnb_bounds(cib)
-    _, nodes = CrossImpactBalances._bnb_fixed_points(cib, sufmin, sufmax;
+    sufDiff, pairOffsets = CrossImpactBalances._bnb_bounds(cib)
+    _, nodes = CrossImpactBalances._bnb_fixed_points(cib, sufDiff, pairOffsets;
                                                      node_budget=typemax(Int))
 
     ks = [signature(cib, u) for u in find_consistent(cib; algorithm=:sweep)]

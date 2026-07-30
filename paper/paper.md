@@ -130,11 +130,14 @@ other CIB tool:
   the impact balance is updated by that state's score-row delta — a vectorised
   loop over narrow integers with no allocation — instead of being recomputed
   from scratch each time.
-- **Exact branch-and-bound** (a further ~14× over the sweep on the
+- **Exact branch-and-bound** (a further ~50× over the sweep on the
   60-million-scenario file, with fundamentally better scaling). Descriptors
-  are assigned depth-first, and precomputed suffix score bounds prune any
-  subtree that provably contains no consistent scenario; on the stress file
-  the search visits 2.25% of the space. Because its cost scales with the
+  are assigned depth-first, and precomputed suffix bounds on each rival
+  variant's score *difference* — taken over the undecided descriptors'
+  shared variant choices, which is strictly tighter than bounding the two
+  scores independently — prune any subtree that provably contains no
+  consistent scenario; on the stress file the search visits 0.6% of the
+  space. Because its cost scales with the
   pruned tree rather than the scenario space, it extends exact analysis
   beyond what enumeration can reach; a visited-node budget falls back to the
   sweep on weakly-coupled matrices where pruning cannot pay off, preserving
