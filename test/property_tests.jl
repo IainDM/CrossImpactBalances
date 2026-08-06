@@ -119,6 +119,13 @@ function check_case(cib::CIB)
     @test last.(got) == want_sizes
     @test cyc == want_cyc
     @test sum(sizes) + cyc == max_signature(cib) + 1
+
+    # The streaming method must reproduce the table method's tuple exactly —
+    # same fixed points, same order, same sizes, same cycle count — with its
+    # memo cache and without it (cache misses may only cost time, never
+    # change results).
+    @test find_basins(cib; method=:stream) == (fps, sizes, cyc)
+    @test find_basins(cib; method=:stream, cache_bytes=0) == (fps, sizes, cyc)
 end
 
 @testset "Property: implementations vs naive oracles" begin
@@ -382,6 +389,58 @@ end
     end
     # The margin genuinely makes extra (non-Nash) scenarios sticky somewhere.
     @test saw_strict_superset
+end
+
+@testset "Property: fix_descriptor produces a well-formed, correctly-sliced model" begin
+    rng = MersenneTwister(20260806)
+    for _ in 1:12
+        ndesc = rand(rng, 2:5)
+        nvariants = [rand(rng, 1:4) for _ in 1:ndesc]
+        while prod(nvariants) > 2000
+            nvariants[argmax(nvariants)] -= 1
+        end
+        cib = make_cib(nvariants, rand_cim(rng, nvariants; zero_diag=(rand(rng, 1:3) != 1)))
+        pinned_desc = rand(rng, 1:ndesc)
+        pinned_variant = rand(rng, 0:nvariants[pinned_desc]-1)
+        fixed = fix_descriptor(cib, pinned_desc - 1, pinned_variant)   # 0-based index form
+
+        # A complete, consistent CIB: counts, offsets, transpose, names.
+        @test fixed.numberOfVariants[pinned_desc] == 1
+        @test fixed.numberOfDimensions == sum(fixed.numberOfVariants)
+        @test fixed.desc_offsets == cumsum(vcat(0, fixed.numberOfVariants[1:end-1]))
+        @test fixed.cim_t == permutedims(fixed.cim)
+        name = cib.descriptors[pinned_desc]
+        @test fixed.variants[name] == [cib.variants[name][pinned_variant + 1]]
+        # Name-form addressing still resolves on the reduced model.
+        other = pinned_desc == 1 ? 2 : 1
+        @test get_impact(fixed, name, 0, other - 1, 0) ==
+              get_impact(cib, pinned_desc - 1, pinned_variant, other - 1, 0)
+
+        # The pinned model must pass the whole implementation-vs-oracle battery.
+        check_case(fixed)
+
+        # Slicing: the pinned model's dynamics are the original's restricted to
+        # the slice where that descriptor holds the pinned variant — provided
+        # the descriptor never moves there, which is guaranteed when it is a
+        # dial (tested in structure_tests.jl). Here we verify the weaker,
+        # always-true property: every scenario of the pinned model maps to the
+        # original scenario with the pinned value, with identical impact
+        # balances on every UNPINNED descriptor's block.
+        for s in 0:max_signature(fixed)
+            u = inv_signature(fixed, s)
+            full = copy(u)
+            full[pinned_desc] = pinned_variant
+            ib_fixed = impact_balance(fixed, u)
+            ib_full = impact_balance(cib, full)
+            for d in 1:ndesc
+                d == pinned_desc && continue
+                for v in 0:nvariants[d]-1
+                    @test ib_fixed[fixed.desc_offsets[d] + v + 1] ==
+                          ib_full[cib.desc_offsets[d] + v + 1]
+                end
+            end
+        end
+    end
 end
 
 @testset "Property: B&B pair-difference bound dominates per-column bounds" begin

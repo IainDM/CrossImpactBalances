@@ -93,7 +93,10 @@ function analyze_consistent(cib)
                       "variants" => variant_names(cib, u)) for u in kern]
     return Dict("mode" => "consistent",
                 "descriptors" => cib.descriptors,
-                "total" => total,
+                # Past 2^53 a JSON number silently loses its last digits in the
+                # browser (JS numbers are doubles); a string crosses intact and
+                # renders unchanged. Real matrices with >9e15 scenarios exist.
+                "total" => total > 2^53 ? string(total) : total,
                 "count" => length(kern),
                 "compute_s" => round(compute; digits = 3),
                 "threads" => Threads.nthreads(),

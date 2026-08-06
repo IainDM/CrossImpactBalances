@@ -20,6 +20,7 @@ CIB
 signature
 inv_signature
 max_signature
+scenario_count
 ```
 
 ## Scoring
@@ -57,4 +58,22 @@ CrossImpactBalances.fixed_point_margin
 succession_step
 find_consistent
 find_basins
+```
+
+## Very large scenario spaces
+
+For spaces beyond the table method's memory (see the README's "Very large
+scenario spaces" for the decision table): exact streaming lives on
+`find_basins` itself (`method=:stream`, `signature_range`, `cache_bytes`);
+share estimation and structural decomposition are their own entry points.
+
+```@docs
+estimate_basins
+BasinEstimate
+influence_structure
+InfluenceStructure
+fix_descriptor
+split_cib
+product_basins
+ComposedBasins
 ```
