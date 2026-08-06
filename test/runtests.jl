@@ -297,6 +297,12 @@ end
 
     include("property_tests.jl")
 
+    # Large-space machinery (guards, streaming, sampling, RNG pins) and the
+    # structure analysis (influence map, slicing, product composition). Both
+    # reuse property_tests.jl's oracles and constructors, so order matters.
+    include("large_space_tests.jl")
+    include("structure_tests.jl")
+
     # Consumers outside src/ — the desktop app, the examples, the documented
     # snippets. These break silently otherwise; see the file's header.
     include("smoke_consumers.jl")
