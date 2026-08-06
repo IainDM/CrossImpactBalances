@@ -18,7 +18,7 @@ export CIB, load_scw, load_solutions,
        SuccessionRule, GlobalSuccession, SequentialSuccession,
        succession_step,
        find_consistent, find_basins,
-       signature, inv_signature, max_signature
+       signature, inv_signature, max_signature, scenario_count
 
 # ══ Vocabulary ═════════════════════════════════════════════════════════════
 #
