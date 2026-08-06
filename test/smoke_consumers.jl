@@ -98,6 +98,7 @@ end
 
             # ── CSV export ── (populated as a side effect of analyze_basins)
             @test !isempty(state.last_csv)
+            @test state.last_csv_name == "basin_analysis.csv"
             rows = split(strip(state.last_csv), '\n')
             header = findfirst(r -> startswith(r, "rank,"), rows)
             @test header !== nothing
@@ -107,7 +108,70 @@ end
             for r in rows[header:end]
                 @test count(==(','), r) == expected_columns - 1
             end
+
+            # ── Estimate Basin Shares ──
+            estimate = quietly(() -> App.analyze_estimate(cib, state; samples = 5_000))
+            @test estimate["mode"] == "estimate"
+            @test estimate["samples"] == 5_000
+            # The kernel is exact, so the estimate reports the same attractors
+            # the exact analysis found — zero-hit ones included.
+            @test estimate["count"] == basins["count"]
+            @test sum(s["hits"] for s in estimate["scenarios"]; init = 0) +
+                  estimate["cycle_hits"] == estimate["samples"]
+            for s in estimate["scenarios"]
+                @test length(s["variants"]) == cib.numberOfDescriptors
+                @test 0.0 <= s["ci_lo_pct"] <= s["ci_hi_pct"] <= 100.0
+            end
+            @test App.to_json(estimate) isa AbstractString
+            @test state.last_csv_name == "basin_share_estimate.csv"
+            @test occursin("share_pct", state.last_csv)
+
+            # ── Structure ──
+            structure = quietly(() -> App.analyze_structure(cib))
+            @test structure["mode"] == "structure"
+            @test !isempty(structure["islands"])
+            for island in structure["islands"]
+                @test !isempty(island["descriptors"])
+            end
+            # Descriptors partition across islands, none lost or repeated.
+            all_members = reduce(vcat, [island["descriptors"]
+                                        for island in structure["islands"]])
+            @test sort(all_members) == sort(cib.descriptors)
+            @test App.to_json(structure) isa AbstractString
         end
+    end
+
+    # A model far past the table method's memory must come back as guidance
+    # (the basins_too_big shape the page renders), never as a crash — and the
+    # estimator must work on the very same model. Exercised through the same
+    # dispatch the /analyze route uses.
+    @testset "huge model: guidance + estimate" begin
+        nv = vcat(fill(4, 11), fill(3, 13))          # 2^22 · 3^13 ≈ 6.7e12 scenarios
+        ndim = sum(nv)
+        offsets = cumsum(vcat(0, nv[1:end-1]))
+        cim = zeros(Int, ndim, ndim)
+        cim[1, offsets[2] + 1] = 1                    # one real influence, else silent
+        # A pre-supplied kernel (the all-zeros scenario is a fixed point of
+        # this nearly-silent matrix): estimate_basins would otherwise run
+        # find_consistent, and this degenerate matrix has ~10^12 consistent
+        # scenarios — a hazard of the synthetic test model, not of real ones.
+        huge = CIB(["D$i" for i in 1:24],
+                   Dict("D$i" => ["V$(i)_$j" for j in 1:nv[i]] for i in 1:24),
+                   nv, cim, permutedims(cim), ndim, 24,
+                   [zeros(Int, 24)], offsets)
+        state = App.AppState()
+        @test_throws ArgumentError App.analyze_basins(huge, state)
+
+        est = quietly(() -> App.analyze_estimate(huge, state; samples = 2_000))
+        @test est["mode"] == "estimate"
+        @test est["total"] == 6_687_075_336_192      # < 2^53: crosses as a number
+        @test sum(s["hits"] for s in est["scenarios"]; init = 0) +
+              est["cycle_hits"] == 2_000
+
+        st = quietly(() -> App.analyze_structure(huge))
+        @test st["mode"] == "structure"
+        @test length(st["islands"]) > 1              # the silent descriptors split off
+        @test App.to_json(st) isa AbstractString
     end
 end
 
