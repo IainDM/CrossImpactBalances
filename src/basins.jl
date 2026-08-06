@@ -12,7 +12,7 @@ Exhaustive basin-of-attraction analysis under `rule` (default [`GlobalSuccession
 
 Returns three things: the consistent scenarios found, how many scenarios drain into each one, and how many scenarios instead end up in a repeating cycle and so belong to no basin. (A "fixed point" here is the same thing as a consistent scenario — see the note above.)
 
-This runs in two phases: a threaded sweep fills a flat successor table (every scenario's succession step), then a resolution pass walks the table with path compression so each scenario is resolved exactly once. Memory is ~8n bytes for the two flat tables (Int32 entries when the space fits, Int64 otherwise), independent of the thread count.
+This runs in two phases: a threaded sweep fills a flat successor table (every scenario's succession step), then a resolution pass walks the table with path compression so each scenario is resolved exactly once. Memory is two flat tables — the successor table at 4 bytes per scenario when every signature fits `Int32`, 8 otherwise, plus a 4-byte-per-scenario label table — independent of the thread count. A model too big for that memory raises an informative error rather than crashing; see `method` below for the alternatives.
 For example, the first phase works out that scenario A maps to B, B maps to C, and C maps to D which is a consistent scenario. Therefore A, B, C and D are all in D's basin, and the second phase works this out.
 
 The default [`GlobalSuccession`](@ref) rule takes a fast path: the successor table is filled by a mixed-radix odometer that maintains the impact balance incrementally (one row delta per scenario, no allocation) instead of calling [`succession_step`](@ref) per scenario. Any other rule uses the generic per-scenario path — identical output, just slower.
@@ -254,6 +254,14 @@ Locked get-or-assign of a dense 1-based id for the fixed point with signature `s
     try
         denseId = get(idForSignature, fixedPointSignature, 0)  # 0 = not registered yet
         if denseId == 0
+            # Labels are stored as Int32 (they hold dense ids, never signatures),
+            # so more than ~2.1 billion DISTINCT fixed points cannot be labelled.
+            # No real matrix is near this — it takes something degenerate like an
+            # all-zero CIM over a >2^31 space, where every scenario is its own
+            # fixed point — but wrapping silently would corrupt the tally, so:
+            length(signatureForId) >= typemax(Int32) - 1 && throw(ArgumentError(
+                "find_basins: more than $(typemax(Int32) - 1) distinct fixed points — " *
+                "this degenerate model cannot be tallied with Int32 labels"))
             push!(signatureForId, fixedPointSignature)
             denseId = length(signatureForId)
             idForSignature[fixedPointSignature] = denseId
@@ -272,8 +280,10 @@ end
 
 Resolve the starting scenarios in `firstSignature:lastSignature` into the shared `attractorLabels`, following successor chains.
 Cycle detection is **thread-private** (a per-worker `history` list plus a backward scan), so `attractorLabels` only ever holds *final* labels — 0 = unvisited, -1 = cycle, k > 0 = converges to the fixed point with dense id `k`. There is no shared in-progress marker, so a worker that walks into another worker's not-yet-resolved chain just re-walks it (redundant, never a false cycle) and reaches the same attractor; every scenario's attractor is deterministic, so concurrent writes to the same slot store the same value — a benign race. Fixed-point ids come from the locked registry ([`_fp_id!`](@ref)), hit only once per fixed point.
+
+Labels are always `Int32`, whatever the width of the successor table's signatures: a label is a dense id or a sentinel, never a signature, and half-width labels halve the memory traffic of the resolve and tally passes (which are memory-bound pointer chases).
 """
-function _resolve_chunk!(attractorLabels::Vector{SignatureInt}, successorTable::Vector{SignatureInt},
+function _resolve_chunk!(attractorLabels::Vector{Int32}, successorTable::Vector{SignatureInt},
                          firstSignature::Int, lastSignature::Int,
                          registryLock::ReentrantLock, signatureForId::Vector{Int},
                          idForSignature::Dict{Int,Int}) where {SignatureInt}
@@ -282,7 +292,7 @@ function _resolve_chunk!(attractorLabels::Vector{SignatureInt}, successorTable::
         attractorLabels[startSignature + 1] != 0 && continue   # already resolved
         empty!(history)
         current = startSignature
-        label = zero(SignatureInt)
+        label = zero(Int32)
         while true
             existingLabel = attractorLabels[current + 1]
             if existingLabel != 0
@@ -302,7 +312,7 @@ function _resolve_chunk!(attractorLabels::Vector{SignatureInt}, successorTable::
                 end
             end
             if alreadyOnChain
-                label = SignatureInt(-1)   # the whole chain (incl. the tail leading in) is labelled cycle
+                label = Int32(-1)   # the whole chain (incl. the tail leading in) is labelled cycle
                 break
             end
             push!(history, current)
@@ -310,8 +320,8 @@ function _resolve_chunk!(attractorLabels::Vector{SignatureInt}, successorTable::
             if next == current
                 # A scenario that steps to itself is a fixed point. It is
                 # already in `history`, so it counts itself in its own basin.
-                label = SignatureInt(_fp_id!(registryLock, signatureForId,
-                                             idForSignature, current))
+                label = Int32(_fp_id!(registryLock, signatureForId,
+                                      idForSignature, current))
                 break
             end
             current = next
@@ -332,7 +342,9 @@ Resolve every scenario to its fixed point attractor by walking the successor tab
 """
 function _resolve_and_tally(successorTable::Vector{SignatureInt},
                             numberOfScenarios::Int) where {SignatureInt}
-    attractorLabels = zeros(SignatureInt, numberOfScenarios)
+    # Always Int32: labels hold dense fixed-point ids (or 0/-1 sentinels), never
+    # signatures, so they need no more width than the id space — see _fp_id!.
+    attractorLabels = zeros(Int32, numberOfScenarios)
     registryLock = ReentrantLock()
     signatureForId = Int[]             # dense id (1-based) -> fixed-point signature
     idForSignature = Dict{Int,Int}()   # fixed-point signature -> dense id
