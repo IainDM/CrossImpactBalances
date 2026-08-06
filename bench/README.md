@@ -14,6 +14,7 @@ julia --project=. -t 8 bench/<script>.jl [model]
 | [`stage_breakdown.jl`](stage_breakdown.jl) | per-stage wall time — parallel successor-table build vs resolve+tally. Sweep `-t 1 2 4 8` to see scaling. |
 | [`determinism.jl`](determinism.jl) | runs `find_basins` N times and asserts identical output; prints a fingerprint that must match across thread counts (race/nondeterminism check). |
 | [`ceilings.jl`](ceilings.jl) | machine STREAM bandwidth + random-chase latency, for interpreting the numbers as compute- vs memory-bound. |
+| [`stream_calibration.jl`](stream_calibration.jl) | streaming-basins throughput (`find_basins(...; method=:stream)`), cache on/off, plus a wall-clock forecast for 10¹²–10¹⁸-scenario spaces at several core counts. `[model] [starts] [full]`; `full` streams the whole model and asserts exact equality against the table method. Run this BEFORE committing cluster time to a huge exact stream. |
 
 See also [`../test/benchmark_basins.jl`](../test/benchmark_basins.jl) for the end-to-end
 timing + correctness benchmark against pinned references.
