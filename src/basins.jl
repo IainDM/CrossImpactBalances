@@ -6,19 +6,83 @@ A NOTE ON WORDING. This file says "fixed point" more than the rest of the codeba
 """
 
 """
-    find_basins(cib; rule=GlobalSuccession()) -> (fixed_points, basin_sizes, cycle_count)
+    find_basins(cib; rule=GlobalSuccession(), method=:auto,
+                signature_range=nothing, cache_bytes=2^30, progress=false)
+        -> (fixed_points, basin_sizes, cycle_count)
 
 Exhaustive basin-of-attraction analysis under `rule` (default [`GlobalSuccession`](@ref)). Follows the succession chain from every scenario in the space, counting how many starting points converge to each consistent scenario.
 
-Returns three things: the consistent scenarios found, how many scenarios drain into each one, and how many scenarios instead end up in a repeating cycle and so belong to no basin. (A "fixed point" here is the same thing as a consistent scenario — see the note above.)
+Returns three things: the consistent scenarios found, how many scenarios drain into each one, and how many scenarios instead end up in a repeating cycle and so belong to no basin. (A "fixed point" here is the same thing as a consistent scenario — see the note above.) The result is exact whichever method computes it, and identical between them.
 
-This runs in two phases: a threaded sweep fills a flat successor table (every scenario's succession step), then a resolution pass walks the table with path compression so each scenario is resolved exactly once. Memory is ~8n bytes for the two flat tables (Int32 entries when the space fits, Int64 otherwise), independent of the thread count.
-For example, the first phase works out that scenario A maps to B, B maps to C, and C maps to D which is a consistent scenario. Therefore A, B, C and D are all in D's basin, and the second phase works this out.
+`method` picks how:
 
-The default [`GlobalSuccession`](@ref) rule takes a fast path: the successor table is filled by a mixed-radix odometer that maintains the impact balance incrementally (one row delta per scenario, no allocation) instead of calling [`succession_step`](@ref) per scenario. Any other rule uses the generic per-scenario path — identical output, just slower.
+- `:table` — the two-phase design: a threaded sweep fills a flat successor table (every scenario's succession step), then a resolution pass walks the table with path compression so each scenario is resolved exactly once. For example, the first phase works out that scenario A maps to B, B maps to C, and C maps to D which is a consistent scenario; therefore A, B, C and D are all in D's basin, and the second phase works this out. Fastest, but its memory is two flat tables over the whole space — the successor table at 4 bytes per scenario when every signature fits `Int32`, 8 otherwise, plus a 4-byte label table.
+- `:stream` — walks every start to its trajectory's end with per-attractor counters and NO tables (see stream.jl): memory stays flat however large the space, at the price of recomputing successions along each walk — CPU-days for spaces around 10¹²–10¹³, so measure first with `bench/stream_calibration.jl`. `signature_range=a:b` restricts the starts to that range so the space can be split across machines (`scripts/basin_stream_worker.jl` / `scripts/basin_stream_merge.jl`); the `sum(sizes) + cycles == total` invariant then holds per range, and the merged ranges reproduce the full-space result exactly. `cache_bytes` sizes the lossy memo cache that lets walks stop on already-resolved territory (`0` disables it); `progress=true` prints a throttled status line to stderr.
+- `:auto` (default) — `:table` when both tables fit this machine's memory, otherwise an error explaining the choices ([`estimate_basins`](@ref) for shares with error bars at any size, `method=:stream` for exact-but-slow, [`influence_structure`](@ref)/[`product_basins`](@ref) for exact-by-decomposition). Deliberately never silently starts a multi-day stream.
+
+The default [`GlobalSuccession`](@ref) rule takes a fast path in both methods: the odometer walk maintains the impact balance incrementally (one row delta per scenario, no allocation) instead of calling [`succession_step`](@ref) per scenario. Any other rule uses the generic per-scenario path — identical output, just slower.
 """
-function find_basins(cib::CIB; rule::SuccessionRule=GlobalSuccession())
-    return _find_basins(rule, cib)
+function find_basins(cib::CIB; rule::SuccessionRule=GlobalSuccession(),
+                     method::Symbol=:auto,
+                     signature_range::Union{Nothing,UnitRange{Int}}=nothing,
+                     cache_bytes::Integer=1 << 30,
+                     progress::Bool=false)
+    method in (:auto, :table, :stream) || throw(ArgumentError(
+        "find_basins: method must be :auto, :table or :stream, got $(repr(method))"))
+    numberOfScenarios = max_signature(cib) + 1   # throws its own informative error past Int64
+
+    if signature_range !== nothing
+        method === :stream || throw(ArgumentError(
+            "find_basins: signature_range is only meaningful with method=:stream " *
+            "(the table method always covers the whole space)"))
+        (0 <= first(signature_range) && last(signature_range) < numberOfScenarios &&
+         first(signature_range) <= last(signature_range)) || throw(ArgumentError(
+            "find_basins: signature_range $(signature_range) is not a nonempty subrange " *
+            "of 0:$(numberOfScenarios - 1)"))
+    end
+
+    if method === :auto
+        requiredBytes = _basin_table_bytes(cib)
+        if requiredBytes > Int128(Sys.total_memory())
+            throw(ArgumentError(_too_big_message(cib, requiredBytes)))
+        end
+        method = :table
+    end
+
+    if method === :table
+        # An explicit :table is the caller's judgement call on memory, but a
+        # table whose BYTE COUNT overflows Int64 cannot exist on any machine —
+        # fail with a real explanation instead of a constructor error.
+        _basin_table_bytes(cib) <= Int128(typemax(Int)) || throw(ArgumentError(
+            _too_big_message(cib, _basin_table_bytes(cib))))
+        return _find_basins(rule, cib)
+    end
+
+    firstSignature = signature_range === nothing ? 0 : first(signature_range)
+    lastSignature = signature_range === nothing ? numberOfScenarios - 1 : last(signature_range)
+    return _stream_basins(rule, cib, firstSignature, lastSignature, Int(cache_bytes), progress)
+end
+
+# The table method's memory bill, in Int128 so it is meaningful even for
+# spaces whose byte count overflows Int64 (~10^18 scenarios and up).
+function _basin_table_bytes(cib::CIB)
+    totalScenarios = scenario_count(cib)
+    successorWidth = totalScenarios <= Int128(typemax(Int32)) - 1 ? 4 : 8
+    return totalScenarios * (successorWidth + 4)   # successor table + Int32 labels
+end
+
+function _too_big_message(cib::CIB, requiredBytes::Int128)
+    gib(x) = round(Float64(x) / 2^30, digits=1)
+    return "find_basins: this model has $(scenario_count(cib)) scenarios; the exact " *
+           "table method needs ~$(gib(requiredBytes)) GiB of RAM " *
+           "(this machine reports $(gib(Sys.total_memory())) GiB). Choose explicitly:\n" *
+           "  • estimate_basins(cib; samples=...) — basin shares with confidence " *
+           "intervals in seconds, at any scale (the kernel itself stays exact);\n" *
+           "  • find_basins(cib; method=:stream[, signature_range=a:b]) — exact and " *
+           "memory-flat, but walks every scenario: measure the cost first with " *
+           "bench/stream_calibration.jl, and split across machines with scripts/;\n" *
+           "  • influence_structure(cib) / product_basins(cib) — exact composition " *
+           "when the matrix decomposes into independent parts."
 end
 
 #region "Fast path"
@@ -254,6 +318,14 @@ Locked get-or-assign of a dense 1-based id for the fixed point with signature `s
     try
         denseId = get(idForSignature, fixedPointSignature, 0)  # 0 = not registered yet
         if denseId == 0
+            # Labels are stored as Int32 (they hold dense ids, never signatures),
+            # so more than ~2.1 billion DISTINCT fixed points cannot be labelled.
+            # No real matrix is near this — it takes something degenerate like an
+            # all-zero CIM over a >2^31 space, where every scenario is its own
+            # fixed point — but wrapping silently would corrupt the tally, so:
+            length(signatureForId) >= typemax(Int32) - 1 && throw(ArgumentError(
+                "find_basins: more than $(typemax(Int32) - 1) distinct fixed points — " *
+                "this degenerate model cannot be tallied with Int32 labels"))
             push!(signatureForId, fixedPointSignature)
             denseId = length(signatureForId)
             idForSignature[fixedPointSignature] = denseId
@@ -272,8 +344,10 @@ end
 
 Resolve the starting scenarios in `firstSignature:lastSignature` into the shared `attractorLabels`, following successor chains.
 Cycle detection is **thread-private** (a per-worker `history` list plus a backward scan), so `attractorLabels` only ever holds *final* labels — 0 = unvisited, -1 = cycle, k > 0 = converges to the fixed point with dense id `k`. There is no shared in-progress marker, so a worker that walks into another worker's not-yet-resolved chain just re-walks it (redundant, never a false cycle) and reaches the same attractor; every scenario's attractor is deterministic, so concurrent writes to the same slot store the same value — a benign race. Fixed-point ids come from the locked registry ([`_fp_id!`](@ref)), hit only once per fixed point.
+
+Labels are always `Int32`, whatever the width of the successor table's signatures: a label is a dense id or a sentinel, never a signature, and half-width labels halve the memory traffic of the resolve and tally passes (which are memory-bound pointer chases).
 """
-function _resolve_chunk!(attractorLabels::Vector{SignatureInt}, successorTable::Vector{SignatureInt},
+function _resolve_chunk!(attractorLabels::Vector{Int32}, successorTable::Vector{SignatureInt},
                          firstSignature::Int, lastSignature::Int,
                          registryLock::ReentrantLock, signatureForId::Vector{Int},
                          idForSignature::Dict{Int,Int}) where {SignatureInt}
@@ -282,7 +356,7 @@ function _resolve_chunk!(attractorLabels::Vector{SignatureInt}, successorTable::
         attractorLabels[startSignature + 1] != 0 && continue   # already resolved
         empty!(history)
         current = startSignature
-        label = zero(SignatureInt)
+        label = zero(Int32)
         while true
             existingLabel = attractorLabels[current + 1]
             if existingLabel != 0
@@ -302,7 +376,7 @@ function _resolve_chunk!(attractorLabels::Vector{SignatureInt}, successorTable::
                 end
             end
             if alreadyOnChain
-                label = SignatureInt(-1)   # the whole chain (incl. the tail leading in) is labelled cycle
+                label = Int32(-1)   # the whole chain (incl. the tail leading in) is labelled cycle
                 break
             end
             push!(history, current)
@@ -310,8 +384,8 @@ function _resolve_chunk!(attractorLabels::Vector{SignatureInt}, successorTable::
             if next == current
                 # A scenario that steps to itself is a fixed point. It is
                 # already in `history`, so it counts itself in its own basin.
-                label = SignatureInt(_fp_id!(registryLock, signatureForId,
-                                             idForSignature, current))
+                label = Int32(_fp_id!(registryLock, signatureForId,
+                                      idForSignature, current))
                 break
             end
             current = next
@@ -332,7 +406,9 @@ Resolve every scenario to its fixed point attractor by walking the successor tab
 """
 function _resolve_and_tally(successorTable::Vector{SignatureInt},
                             numberOfScenarios::Int) where {SignatureInt}
-    attractorLabels = zeros(SignatureInt, numberOfScenarios)
+    # Always Int32: labels hold dense fixed-point ids (or 0/-1 sentinels), never
+    # signatures, so they need no more width than the id space — see _fp_id!.
+    attractorLabels = zeros(Int32, numberOfScenarios)
     registryLock = ReentrantLock()
     signatureForId = Int[]             # dense id (1-based) -> fixed-point signature
     idForSignature = Dict{Int,Int}()   # fixed-point signature -> dense id

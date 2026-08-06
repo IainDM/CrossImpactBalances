@@ -42,13 +42,71 @@ end
 fixed_points, basin_sizes, cycle_count = find_basins(cib)
 ```
 
-`load_scw` always enumerates the full scenario space in parallel across
-threads — there is no sampling mode and no completeness caveat. Pass
-`algorithm=:sweep` or `:bnb` to force a search strategy; the default `:auto`
-picks one from the space size.
+`load_scw` finds every consistent scenario **exactly** — the kernel search is
+never sampled and carries no completeness caveat, however large the space (the
+branch-and-bound search's cost scales with what it can prune, not with the
+scenario count). Pass `algorithm=:sweep` or `:bnb` to force a search strategy;
+the default `:auto` picks one from the space size. Basin analysis is exact too,
+by whichever method can physically run (see the next section); for spaces
+beyond every exact method's reach, a separate, explicitly-labelled estimator
+reports basin *shares* with confidence intervals over the exactly-known kernel.
+Discovery is never delegated to sampling.
 
 The package has no dependencies outside the Julia standard library — in fact,
 no dependencies at all.
+
+## Very large scenario spaces
+
+Real matrices reach 10¹² scenarios and beyond (a 24-descriptor model of fours
+and threes is already 6.7×10¹²; add twelve ternary descriptors and it is
+3.6×10¹⁸). Finding the consistent scenarios still takes seconds there. Basins
+are a different matter — counting where *every* start drains is work
+proportional to the space — so `find_basins` offers three routes and refuses,
+with directions, rather than crash or silently start a weeks-long job:
+
+| Situation | Tool | What you get |
+|---|---|---|
+| The two flat tables fit in RAM (roughly ≤10¹⁰ scenarios on a big machine) | `find_basins(cib)` | exact, fastest |
+| They don't, but ~10¹⁰–10¹³ and you need exact numbers | `find_basins(cib; method=:stream)` | exact with flat memory; CPU-days of compute — **measure first** with `bench/stream_calibration.jl`, split across machines with `scripts/basin_stream_worker.jl` + `scripts/basin_stream_merge.jl` |
+| Any size, answers in seconds–minutes | `estimate_basins(cib; samples=...)` | basin **shares** with Wilson confidence intervals; the kernel stays exact and pre-registered, so an attractor sampling never hits still appears — with an explicit upper bound, not a false zero |
+| Any size, exact, when the influence map splits | `influence_structure(cib)` then `product_basins(cib)` | exact basins composed from independent islands (sizes multiply); `fix_descriptor(cib, d, v)` pins never-moving descriptors for exact slice-by-slice analysis |
+
+`scenario_count(cib)` reports the exact size as an `Int128` at any scale.
+(Counts above 2⁵³ ≈ 9×10¹⁵ silently lose their last digits the moment they
+pass through a Float64 — a browser, a JSON number, a spreadsheet. If two
+reported sizes differ in their final digits, suspect that before suspecting
+the models.)
+
+`estimate_basins` is deterministic by construction: the result is a pure
+function of `(model, rule, samples, seed, confidence)` — same seed, same
+answer, bit for bit, on any machine at any thread count. It uses the
+package's own pinned random generator (still zero dependencies), so published
+results stay reproducible across Julia versions. And the division of labour
+keeps the exactness promise above intact: sampling only ever *apportions*
+mass among attractors the exact search already found — it discovers nothing,
+so it can miss nothing.
+
+Splitting an exact stream across a cluster is plain array-job arithmetic —
+disjoint signature ranges, one TSV each, one merge:
+
+```bash
+#SBATCH --array=0-4095
+N=6687075336192                        # scenario_count(cib)
+CHUNK=$(( (N + 4095) / 4096 ))
+FIRST=$(( SLURM_ARRAY_TASK_ID * CHUNK ))
+LAST=$(( FIRST + CHUNK - 1 )); [ "$LAST" -ge "$N" ] && LAST=$(( N - 1 ))
+julia --project=. -t "$SLURM_CPUS_PER_TASK" scripts/basin_stream_worker.jl \
+      model.scw "$FIRST" "$LAST" "part_${SLURM_ARRAY_TASK_ID}.tsv"
+# afterwards, on any machine:
+#   julia --project=. scripts/basin_stream_merge.jl model.scw part_*.tsv
+```
+
+The merge validates that the ranges tile the space exactly and re-checks the
+coverage invariant before printing the final table. At 10¹⁸ scenarios, exact
+enumeration is out of reach at any plausible core count — there,
+`estimate_basins` and the influence-map tools *are* the analysis. The whole
+toolkit is walked through in
+[`examples/05_large_spaces.jl`](examples/05_large_spaces.jl).
 
 ## Python interface
 

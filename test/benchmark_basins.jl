@@ -60,6 +60,21 @@ bench("bench_typical (warmup)", joinpath(SAMPLE_DIR, "bench_typical.scw");
 bench("bench_50x50", joinpath(SAMPLE_DIR, "bench_50x50.scw");
       expect=EXPECT_50X50, cyc_expect=CYC_50X50)
 
+if "stream" in ARGS
+    # The streaming (tableless) method against the same pinned reference —
+    # including the basin of size 3 in 60.5M, which any approximate method
+    # would lose. Exactness is the whole point of method=:stream.
+    cib = preload(joinpath(SAMPLE_DIR, "bench_50x50.scw"))
+    t0 = time_ns()
+    fps, basins, cyc = find_basins(cib; method=:stream)
+    t = (time_ns() - t0) / 1e9
+    sigs = [signature(cib, u) for u in fps]
+    @assert Dict(zip(sigs, basins)) == EXPECT_50X50 "stream: fp sigs/basin sizes mismatch"
+    @assert cyc == CYC_50X50 "stream: cycle_count mismatch"
+    println(rpad("bench_50x50 (stream)", 24), " time=", round(t, digits=3),
+            "s  matches the pinned reference exactly, size-3 basin included")
+end
+
 if "nested" in ARGS
     path = joinpath(SAMPLE_DIR, "CIB_nested.scw")
     cib = preload(path)

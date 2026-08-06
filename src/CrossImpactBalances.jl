@@ -18,7 +18,10 @@ export CIB, load_scw, load_solutions,
        SuccessionRule, GlobalSuccession, SequentialSuccession,
        succession_step,
        find_consistent, find_basins,
-       signature, inv_signature, max_signature
+       estimate_basins, BasinEstimate,
+       influence_structure, InfluenceStructure,
+       fix_descriptor, split_cib, product_basins, ComposedBasins,
+       signature, inv_signature, max_signature, scenario_count
 
 # ══ Vocabulary ═════════════════════════════════════════════════════════════
 #
@@ -102,6 +105,8 @@ include("matrix_editing.jl")   # reading/editing one impact, no re-parse
 
 # ── The dynamics: how one scenario leads to the next ──
 include("succession.jl")       # SuccessionRule and the built-in rules
+include("walk.jl")             # following one trajectory to its end, tablelessly
+include("rng.jl")              # self-contained random numbers + interval statistics
 
 # ── Analysis 1: which scenarios are consistent? ──
 include("find_consistent.jl")  # the entry point, and choosing a strategy
@@ -109,6 +114,9 @@ include("sweep.jl")            #   strategy A: check every scenario, fast
 include("branch_and_bound.jl") #   strategy B: prune whole families at once
 
 # ── Analysis 2: where does each scenario end up? ──
-include("basins.jl")           # basins of attraction
+include("basins.jl")           # basins of attraction (the table method + dispatch)
+include("stream.jl")           # basins without tables: exact at any memory
+include("estimate.jl")         # basin SHARES by sampling, with error bars
+include("structure.jl")        # who influences whom; cutting a model into parts
 
 end # module
