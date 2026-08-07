@@ -21,6 +21,7 @@ export CIB, load_scw, load_solutions,
        estimate_basins, BasinEstimate,
        influence_structure, InfluenceStructure,
        fix_descriptor, split_cib, product_basins, ComposedBasins,
+       transition_graph, TransitionGraph, Transition, to_dot,
        signature, inv_signature, max_signature, scenario_count
 
 # ══ Vocabulary ═════════════════════════════════════════════════════════════
@@ -118,5 +119,8 @@ include("basins.jl")           # basins of attraction (the table method + dispat
 include("stream.jl")           # basins without tables: exact at any memory
 include("estimate.jl")         # basin SHARES by sampling, with error bars
 include("structure.jl")        # who influences whom; cutting a model into parts
+
+# ── Analysis 3: which commitment moves one future into another? ──
+include("transitions.jl")      # the lever map between consistent scenarios
 
 end # module
