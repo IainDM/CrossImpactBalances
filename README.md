@@ -108,6 +108,39 @@ enumeration is out of reach at any plausible core count — there,
 toolkit is walked through in
 [`examples/05_large_spaces.jl`](examples/05_large_spaces.jl).
 
+## Levers: which commitment moves one future into another
+
+Basin sizes answer a question about volume. Past a certain model size that
+answer goes flat — hundreds of consistent scenarios, none holding more than a
+percent or two — and the question that stays sharp is about connectivity:
+
+```julia
+graph = transition_graph(cib; from = Dict("Trade"     => "Free",
+                                          "Economy"   => "Growth",
+                                          "Policy"    => "Weak",
+                                          "Emissions" => "Rising"))
+```
+
+From every consistent scenario, `transition_graph` changes one descriptor at a
+time and follows succession to wherever that leads. Either the system returns
+— the commitment did not take, which measures how much change that future
+absorbs — or it settles somewhere else, and you have a **lever**: a specific,
+nameable change that moves the system from one future to another. `from` adds
+the current state of the world as an extra node (it need not be consistent),
+showing where things drift with no commitment at all and which commitments
+redirect them. `radius=2` also tries pairs, reporting only those that reach
+somewhere no single change could — the combination levers.
+
+**The cost does not depend on the size of the scenario space.** Every walk
+starts from a known attractor; nothing enumerates. A model with 3.5 quintillion
+scenarios costs the same as one with thirty, which makes this the analysis of
+choice exactly where the exact basin analysis cannot run at all.
+
+`to_dot(graph)` renders the result as Graphviz — futures as boxes labelled with
+their robustness, cycles dashed, the current world in bold, and every edge
+carrying the commitment that causes the transition. Worked through in
+[`examples/06_transitions.jl`](examples/06_transitions.jl).
+
 ## Python interface
 
 A Pythonic wrapper lives in [`python/`](python/README.md). It embeds this Julia
