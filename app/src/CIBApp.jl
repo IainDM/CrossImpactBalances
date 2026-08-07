@@ -105,6 +105,9 @@ function analyze_consistent(cib)
                       "variants" => variant_names(cib, u)) for u in kern]
     return Dict("mode" => "consistent",
                 "descriptors" => cib.descriptors,
+                # Carried so the page can build the world-state selectors from
+                # the very first analysis, whatever the user clicks first.
+                "variants" => [cib.variants[name] for name in cib.descriptors],
                 # Past 2^53 a JSON number silently loses its last digits in the
                 # browser (JS numbers are doubles); a string crosses intact and
                 # renders unchanged. Real matrices with >9e15 scenarios exist.
@@ -285,6 +288,77 @@ function analyze_structure(cib)
     return result
 end
 
+# The lever map: which single (or paired) commitment moves one consistent
+# future into another, plus — when the page sends a world state — where things
+# drift today and what redirects them. Costs the same on a 32-scenario model
+# and a 10^18 one, so there is no size guard here and none is needed.
+function analyze_transitions(cib, state::AppState; world::Union{Nothing,Vector{Int}} = nothing,
+                             radius::Int = 1)
+    compute = @elapsed (graph = transition_graph(cib; from = world, radius = radius))
+
+    nodeJson = Dict{String,Any}[]
+    for index in 1:length(graph.nodes)
+        push!(nodeJson, Dict{String,Any}(
+            "index" => index,
+            "kind" => String(graph.kinds[index]),
+            "variants" => variant_names(cib, graph.nodes[index]),
+            "returned" => graph.returned[index],
+            "moved" => graph.moved[index],
+            "destabilized" => graph.destabilized[index],
+            # NaN marks a node nobody perturbed (a cycle, or a destination
+            # discovered mid-walk); JSON has no NaN, so it travels as null.
+            "robustness_pct" => isnan(graph.robustness[index]) ? nothing :
+                                round(100 * graph.robustness[index]; digits = 2)))
+    end
+
+    edgeJson = Dict{String,Any}[]
+    for edge in graph.edges
+        changes = [Dict("descriptor" => cib.descriptors[descriptorIndex],
+                        "from" => cib.variants[cib.descriptors[descriptorIndex]][
+                                      graph.nodes[edge.from][descriptorIndex] + 1],
+                        "to" => cib.variants[cib.descriptors[descriptorIndex]][variantIndex + 1])
+                   for (descriptorIndex, variantIndex) in edge.changes]
+        push!(edgeJson, Dict{String,Any}(
+            "from" => edge.from, "to" => edge.to,
+            "changes" => changes, "steps" => edge.steps,
+            "baseline" => isempty(edge.changes)))
+    end
+
+    io = IOBuffer()
+    println(io, "# Cross-Impact Balances transition graph (levers between futures)")
+    println(io, "# total scenarios,", scenario_count(cib))
+    println(io, "# radius,", radius)
+    println(io, csv_row(vcat(["from_index", "to_index", "to_kind", "steps"],
+                             cib.descriptors, ["commitment"])))
+    for edge in graph.edges
+        commitment = isempty(edge.changes) ? "(baseline — no commitment)" :
+            join([string(cib.descriptors[d], "=",
+                         cib.variants[cib.descriptors[d]][v + 1])
+                  for (d, v) in edge.changes], " + ")
+        println(io, csv_row(vcat(Any[edge.from, edge.to, String(graph.kinds[edge.to]),
+                                     edge.steps],
+                                 variant_names(cib, graph.nodes[edge.to]),
+                                 Any[commitment])))
+    end
+    state.last_csv = String(take!(io))
+    state.last_csv_name = "transition_graph.csv"
+
+    return Dict{String,Any}(
+        "mode" => "transitions",
+        "descriptors" => cib.descriptors,
+        "variants" => [cib.variants[name] for name in cib.descriptors],
+        "total" => json_count(scenario_count(cib)),
+        "count" => count(kind -> kind === :attractor, graph.kinds),
+        "cycles" => count(kind -> kind === :cycle, graph.kinds),
+        "radius" => radius,
+        "world_index" => graph.worldIndex,
+        "nodes" => nodeJson,
+        "edges" => edgeJson,
+        "dot" => to_dot(graph),
+        "compute_s" => round(compute; digits = 3),
+        "threads" => Threads.nthreads())
+end
+
 # ─── Minimal HTTP/1.1 ────────────────────────────────────────────────────────
 # Read one request (request line, headers, and a Content-Length body). Returns
 # (method, target, body) or nothing on a closed/blank connection.
@@ -400,6 +474,15 @@ function handle(sock, state::AppState)
                 analyze_estimate(cib, state; samples = clamp(requested, 1_000, 100_000_000))
             elseif mode == "structure"
                 analyze_structure(cib)
+            elseif mode == "transitions"
+                # The world state arrives as 0-based variant indices, one per
+                # descriptor, comma-separated; absent means "attractors only".
+                worldText = get(params, "world", "")
+                world = isempty(worldText) ? nothing :
+                        [something(tryparse(Int, field), 0) for field in split(worldText, ',')]
+                requestedRadius = something(tryparse(Int, get(params, "radius", "")), 1)
+                analyze_transitions(cib, state; world = world,
+                                    radius = clamp(requestedRadius, 1, 2))
             else
                 analyze_consistent(cib)
             end
@@ -536,6 +619,16 @@ const PAGE = raw"""
   .guide { background:#fff8e6; border:1px solid #eadfa9; border-radius:8px;
            padding:12px 14px; white-space:pre-wrap; font-size:13px; }
   .cihint { color:var(--muted); font-size:12px; }
+  .worldhead { font-size:13px; font-weight:600; }
+  #worldSelects label { font-size:12px; color:var(--muted); display:block; }
+  #worldSelects select { margin-top:2px; }
+  .lever { font-variant-numeric:tabular-nums; }
+  .kindtag { font-size:11px; padding:1px 6px; border-radius:10px; margin-left:6px; }
+  .kind-cycle { background:#fdecea; color:#b3261e; }
+  .kind-world { background:#e6f0ff; color:#1a4fbf; }
+  details.dot { margin-top:14px; }
+  details.dot textarea { width:100%; height:180px; font:12px/1.4 ui-monospace,Menlo,monospace;
+                         border:1px solid var(--line); border-radius:8px; padding:8px; }
   .fname { color:var(--muted); font-size:13px; }
   .muted { color:var(--muted); }
   #status { margin-top:12px; min-height:20px; font-size:14px; }
@@ -563,8 +656,8 @@ const PAGE = raw"""
   <h1>Cross-Impact Balances</h1>
   <p>Load a ScenarioWizard <code>.scw</code> file, then find its consistent
      scenarios exactly, analyse basins of attraction (exact where the space
-     allows, estimated with error bars at any size), or map the model's
-     influence structure.</p>
+     allows, estimated with error bars at any size), map the model's influence
+     structure, or trace the levers that move one future into another.</p>
 </header>
 <main>
   <div class="card">
@@ -586,8 +679,21 @@ const PAGE = raw"""
       </select>
       <button id="btnStructure" disabled
               title="Which descriptors actually influence which; independent islands and never-moving descriptors — the exact route for huge decomposable models">Structure</button>
+      <button id="btnTransitions" disabled
+              title="Which single commitment moves one consistent future into another — costs the same at any scenario-space size">Transitions</button>
       <span style="flex:1"></span>
       <button id="btnQuit" title="Stop the app">Quit</button>
+    </div>
+    <div id="worldPanel" style="display:none; margin-top:14px;">
+      <div class="worldhead">Current state of the world
+        <span class="cihint">— optional; set where things stand today and the
+        transition map will show where they drift and what redirects them</span>
+      </div>
+      <div class="row" id="worldSelects" style="margin-top:8px;"></div>
+      <div class="row" style="margin-top:10px;">
+        <label class="cihint"><input type="checkbox" id="worldOn"> include the world state</label>
+        <label class="cihint"><input type="checkbox" id="pairsOn"> also try pairs of changes (radius 2)</label>
+      </div>
     </div>
     <div id="status"></div>
   </div>
@@ -598,13 +704,16 @@ const PAGE = raw"""
         <button class="green">Export CSV</button></a>
     </div>
     <div class="tablewrap"><table id="table"></table></div>
+    <div id="extra"></div>
   </div>
   <footer>Cross-Impact Balances desktop app · runs locally on your machine</footer>
 </main>
 <script>
 let scwText = null;
+let worldReady = false;          // the world-state selectors have been built
 const $ = id => document.getElementById(id);
-const RUN_BUTTONS = ["btnConsistent", "btnBasins", "btnEstimate", "btnStructure"];
+const RUN_BUTTONS = ["btnConsistent", "btnBasins", "btnEstimate", "btnStructure",
+                     "btnTransitions"];
 
 $("file").addEventListener("change", e => {
   const f = e.target.files[0];
@@ -612,12 +721,36 @@ $("file").addEventListener("change", e => {
   const reader = new FileReader();
   reader.onload = () => {
     scwText = reader.result;
+    worldReady = false;
+    $("worldPanel").style.display = "none";
+    $("worldSelects").innerHTML = "";
     $("fname").textContent = f.name + " (" + f.size.toLocaleString() + " bytes)";
     RUN_BUTTONS.forEach(b => $(b).disabled = false);
     $("status").textContent = "";
   };
   reader.readAsText(f);
 });
+
+// One dropdown per descriptor, built from whatever response carried the
+// model's descriptor and variant names. Defaults to each descriptor's first
+// variant; the user only has to change the ones that matter.
+function buildWorldSelects(descriptors, variants) {
+  if (worldReady || !variants) return;
+  $("worldSelects").innerHTML = descriptors.map((d, i) =>
+    `<span><label for="w${i}">${escapeHtml(d)}</label>`
+    + `<select id="w${i}">`
+    + variants[i].map((v, j) => `<option value="${j}">${escapeHtml(v)}</option>`).join("")
+    + `</select></span>`).join("");
+  $("worldPanel").style.display = "block";
+  worldReady = true;
+}
+
+function worldParam(descriptorCount) {
+  if (!$("worldOn").checked || !worldReady) return "";
+  const picks = [];
+  for (let i = 0; i < descriptorCount; i++) picks.push($("w" + i).value);
+  return "&world=" + picks.join(",");
+}
 
 function setBusy(msg) {
   $("status").innerHTML = '<span class="spinner"></span>' + msg;
@@ -632,7 +765,8 @@ const BUSY_TEXT = {
   consistent: "Searching for consistent scenarios…",
   basins: "Running exact basin analysis… (this can take a moment on large files)",
   estimate: "Estimating basin shares… (the consistent scenarios are found exactly first)",
-  structure: "Mapping the influence structure…"
+  structure: "Mapping the influence structure…",
+  transitions: "Mapping the levers between futures…"
 };
 
 async function analyze(mode) {
@@ -642,6 +776,10 @@ async function analyze(mode) {
     const t0 = performance.now();
     let url = "/analyze?mode=" + mode;
     if (mode === "estimate") url += "&samples=" + $("samples").value;
+    if (mode === "transitions") {
+      url += worldParam($("worldSelects").children.length);
+      if ($("pairsOn").checked) url += "&radius=2";
+    }
     const res = await fetch(url, { method:"POST", body: scwText });
     const data = await res.json();
     const secs = ((performance.now() - t0) / 1000).toFixed(3);
@@ -697,8 +835,62 @@ function render(data, secs) {
   let sum = "";
   let html = "";
   let showExport = false;
+  let extra = "";
 
-  if (data.mode === "basins_too_big") {
+  // Any response carrying descriptor + variant names can populate the
+  // world-state selectors, so they are ready before the first Transitions run.
+  if (data.descriptors && data.variants) buildWorldSelects(data.descriptors, data.variants);
+
+  if (data.mode === "transitions") {
+    const nodeLabel = i => {
+      const n = data.nodes[i - 1];
+      const tag = n.kind === "cycle" ? '<span class="kindtag kind-cycle">cycle</span>'
+                : n.kind === "world" ? '<span class="kindtag kind-world">today</span>' : "";
+      return escapeHtml(n.variants.join(" / ")) + tag;
+    };
+    const changeText = e => e.baseline ? "<i>no commitment (drift)</i>"
+      : e.changes.map(c => `<b>${escapeHtml(c.descriptor)}</b>: `
+          + `${escapeHtml(c.from)}→${escapeHtml(c.to)}`).join(" + ");
+
+    sum = `<b>${data.count}</b> consistent scenario(s)`
+        + (data.cycles ? `, ${data.cycles} cycle destination(s)` : "")
+        + ` across ${fmt(data.total)} scenarios · <b>${data.edges.length}</b> lever(s)`
+        + (data.radius > 1 ? " (single changes and pairs)" : " (single changes)")
+        + `. <span class="muted">(${timing})</span>`;
+    if (data.world_index)
+      sum += `<br>The current state of the world is node [${data.world_index}]`
+           + ` — its first row below is where things drift with no commitment at all.`;
+    showExport = true;
+
+    // Robustness first: which futures absorb change and which are fragile.
+    html = headerRow(["#", "Future", "Kind", "Absorbs", "Moves", "Destabilises", "Robustness"], 3)
+         + "<tbody>";
+    data.nodes.forEach(n => {
+      const rob = n.robustness_pct === null ? '<span class="muted">destination only</span>'
+                                            : n.robustness_pct + "%";
+      html += `<tr><td class="num">${n.index}</td><td>${nodeLabel(n.index)}</td>`
+            + `<td>${escapeHtml(n.kind)}</td>`
+            + `<td class="num">${n.robustness_pct === null ? "—" : n.returned}</td>`
+            + `<td class="num">${n.robustness_pct === null ? "—" : n.moved}</td>`
+            + `<td class="num">${n.robustness_pct === null ? "—" : n.destabilized}</td>`
+            + `<td class="num">${rob}</td></tr>`;
+    });
+    html += "</tbody>";
+
+    // Then the levers themselves, world first when present.
+    const ordered = data.edges.slice().sort((a, b) =>
+      (b.from === data.world_index) - (a.from === data.world_index) || a.from - b.from);
+    let leverHtml = headerRow(["From", "Commitment", "Leads to", "Steps"], 3) + "<tbody>";
+    ordered.forEach(e => {
+      leverHtml += `<tr class="lever"><td>${nodeLabel(e.from)}</td>`
+                 + `<td>${changeText(e)}</td><td>${nodeLabel(e.to)}</td>`
+                 + `<td class="num">${e.steps}</td></tr>`;
+    });
+    leverHtml += "</tbody>";
+    extra = `<div class="tablewrap" style="margin-top:14px;"><table>${leverHtml}</table></div>`
+          + `<details class="dot"><summary>Graphviz source (paste into any Graphviz viewer)</summary>`
+          + `<textarea readonly>${escapeHtml(data.dot)}</textarea></details>`;
+  } else if (data.mode === "basins_too_big") {
     sum = `This model has <b>${fmt(data.total)}</b> scenarios — too large for the `
         + `exact table analysis on this machine. `
         + `<button class="green" id="btnEstimateNudge">Estimate basin shares instead</button>`
@@ -806,6 +998,7 @@ function render(data, secs) {
 
   $("summary").innerHTML = sum;
   $("table").innerHTML = html;
+  $("extra").innerHTML = extra;
   $("exportLink").style.display = showExport ? "inline-block" : "none";
   $("results").style.display = "block";
   const nudge = $("btnEstimateNudge");
@@ -816,6 +1009,7 @@ $("btnConsistent").addEventListener("click", () => analyze("consistent"));
 $("btnBasins").addEventListener("click", () => analyze("basins"));
 $("btnEstimate").addEventListener("click", () => analyze("estimate"));
 $("btnStructure").addEventListener("click", () => analyze("structure"));
+$("btnTransitions").addEventListener("click", () => analyze("transitions"));
 $("btnQuit").addEventListener("click", async () => {
   try { await fetch("/quit"); } catch (e) {}
   document.body.innerHTML =
