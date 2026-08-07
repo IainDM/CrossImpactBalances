@@ -302,6 +302,7 @@ end
     # reuse property_tests.jl's oracles and constructors, so order matters.
     include("large_space_tests.jl")
     include("structure_tests.jl")
+    include("transition_tests.jl")
 
     # Consumers outside src/ — the desktop app, the examples, the documented
     # snippets. These break silently otherwise; see the file's header.

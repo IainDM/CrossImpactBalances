@@ -126,6 +126,40 @@ end
             @test state.last_csv_name == "basin_share_estimate.csv"
             @test occursin("share_pct", state.last_csv)
 
+            # ── Transitions (the lever map) ──
+            transitions = quietly(() -> App.analyze_transitions(cib, state))
+            @test transitions["mode"] == "transitions"
+            @test transitions["count"] == basins["count"]      # same consistent scenarios
+            @test length(transitions["variants"]) == cib.numberOfDescriptors
+            @test transitions["world_index"] == 0              # none supplied
+            @test occursin("digraph", transitions["dot"])
+            for node in transitions["nodes"]
+                @test length(node["variants"]) == cib.numberOfDescriptors
+                @test node["kind"] in ("attractor", "cycle", "world")
+            end
+            for edge in transitions["edges"]
+                @test 1 <= edge["from"] <= length(transitions["nodes"])
+                @test 1 <= edge["to"] <= length(transitions["nodes"])
+                @test !edge["baseline"]                        # no world ⇒ no baseline edge
+                for change in edge["changes"]
+                    @test change["descriptor"] in cib.descriptors
+                    @test change["from"] != change["to"]
+                end
+            end
+            @test App.to_json(transitions) isa AbstractString
+            @test state.last_csv_name == "transition_graph.csv"
+
+            # With a world state: one extra node, and a baseline edge from it.
+            world = zeros(Int, cib.numberOfDescriptors)
+            withWorld = quietly(() -> App.analyze_transitions(cib, state; world = world))
+            @test withWorld["world_index"] == length(withWorld["nodes"])
+            worldNode = withWorld["nodes"][withWorld["world_index"]]
+            @test worldNode["kind"] in ("world", "attractor")   # unless it IS consistent
+            if worldNode["kind"] == "world"
+                @test any(e -> e["baseline"] && e["from"] == withWorld["world_index"],
+                          withWorld["edges"])
+            end
+
             # ── Structure ──
             structure = quietly(() -> App.analyze_structure(cib))
             @test structure["mode"] == "structure"
@@ -172,6 +206,17 @@ end
         @test st["mode"] == "structure"
         @test length(st["islands"]) > 1              # the silent descriptors split off
         @test App.to_json(st) isa AbstractString
+
+        # The lever map costs the same at any scenario-space size, so it needs
+        # no guidance path at all — it simply runs. (The kernel here comes from
+        # the model's own consistentScenarios, set above; find_consistent must
+        # never be let loose on this degenerate matrix.)
+        tr = quietly(() -> App.analyze_transitions(huge, state; world = ones(Int, 24)))
+        @test tr["mode"] == "transitions"
+        @test tr["total"] == 6_687_075_336_192
+        @test tr["world_index"] == length(tr["nodes"])
+        @test !isempty(tr["edges"])
+        @test App.to_json(tr) isa AbstractString
     end
 end
 

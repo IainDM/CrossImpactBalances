@@ -174,8 +174,11 @@ end
 # Decide where the exact kernel comes from. Returns (scenarios, known::Bool);
 # known == false means no kernel could be established (margin-less custom rule,
 # none supplied) and the report can only show what sampling happened to reach.
+# `caller` names the public entry point in messages — transition_graph borrows
+# this exact logic, and its errors should not blame estimate_basins.
 function _resolve_kernel(cib::CIB, rule::SuccessionRule,
-                         kernel::Union{Nothing,Vector{Vector{Int}}})
+                         kernel::Union{Nothing,Vector{Vector{Int}}};
+                         caller::AbstractString="estimate_basins")
     resolved = if kernel !== nothing
         kernel
     elseif fixed_point_margin(rule) == 0 && !isempty(cib.consistentScenarios)
@@ -186,7 +189,7 @@ function _resolve_kernel(cib::CIB, rule::SuccessionRule,
     elseif fixed_point_margin(rule) !== nothing
         find_consistent(cib; rule=rule)
     else
-        println(stderr, "estimate_basins: this rule declares no fixed_point_margin and no " *
+        println(stderr, "$(caller): this rule declares no fixed_point_margin and no " *
                         "kernel was supplied — the exact kernel cannot be precomputed at " *
                         "this scale, so the report covers only attractors that sampling " *
                         "reaches. Pass kernel=... to pre-register known fixed points.")
@@ -194,10 +197,10 @@ function _resolve_kernel(cib::CIB, rule::SuccessionRule,
     end
     for scenario in resolved
         length(scenario) == cib.numberOfDescriptors || throw(ArgumentError(
-            "estimate_basins: kernel scenario $scenario has $(length(scenario)) descriptors, " *
+            "$(caller): kernel scenario $scenario has $(length(scenario)) descriptors, " *
             "model has $(cib.numberOfDescriptors)"))
         succession_step(rule, cib, scenario) == scenario || throw(ArgumentError(
-            "estimate_basins: kernel scenario $scenario is not a fixed point under this rule"))
+            "$(caller): kernel scenario $scenario is not a fixed point under this rule"))
     end
     return resolved, true
 end
