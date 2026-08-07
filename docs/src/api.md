@@ -77,3 +77,18 @@ split_cib
 product_basins
 ComposedBasins
 ```
+
+## Levers between futures
+
+Basin sizes measure volume; this measures connectivity — which commitment
+moves the system from one consistent scenario into another, and where the
+current state of the world drifts if nothing is done. Every walk starts from a
+known attractor, so the cost does not depend on the size of the scenario space
+at all.
+
+```@docs
+transition_graph
+TransitionGraph
+Transition
+to_dot
+```
