@@ -100,8 +100,15 @@ end
 
 function analyze_consistent(cib)
     compute = @elapsed (kern = find_consistent(cib))
-    total = max_signature(cib) + 1
-    scenarios = [Dict("signature" => signature(cib, u),
+    # scenario_count, not max_signature + 1: find_consistent's branch-and-bound
+    # numbers no scenario, so it happily returns a kernel for a model whose
+    # signatures overrun Int64 — and max_signature would then throw here and
+    # throw the finished result away. Signatures go the same way: past Int64
+    # they wrap into negative numbers, so they are only shown while they mean
+    # something. (json_count handles the >2^53 string crossing for both.)
+    total = scenario_count(cib)
+    signaturesFit = total <= Int128(typemax(Int))
+    scenarios = [Dict("signature" => signaturesFit ? json_count(signature(cib, u)) : nothing,
                       "variants" => variant_names(cib, u)) for u in kern]
     return Dict("mode" => "consistent",
                 "descriptors" => cib.descriptors,
@@ -111,7 +118,7 @@ function analyze_consistent(cib)
                 # Past 2^53 a JSON number silently loses its last digits in the
                 # browser (JS numbers are doubles); a string crosses intact and
                 # renders unchanged. Real matrices with >9e15 scenarios exist.
-                "total" => total > 2^53 ? string(total) : total,
+                "total" => json_count(total),
                 "count" => length(kern),
                 "compute_s" => round(compute; digits = 3),
                 "threads" => Threads.nthreads(),
@@ -982,8 +989,10 @@ function render(data, secs) {
     if (isBasins) cols.push("Basin size", "Basin %", "");
     html = headerRow(cols, isBasins ? 2 + data.descriptors.length : cols.length) + "<tbody>";
     data.scenarios.forEach((s, i) => {
+      // signature is null past typemax(Int64), where scenarios have no number
+      // that fits — the variant columns identify them perfectly well.
       html += `<tr><td class="num">${i + 1}</td>`
-            + `<td class="num">${s.signature.toLocaleString()}</td>`;
+            + `<td class="num">${s.signature === null ? "—" : fmt(s.signature)}</td>`;
       s.variants.forEach(v => html += `<td>${escapeHtml(v)}</td>`);
       if (isBasins) {
         html += `<td class="num">${s.basin_size.toLocaleString()}</td>`

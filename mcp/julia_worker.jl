@@ -124,7 +124,10 @@ function format_model_header(buf, cib)
     print(buf, "Variants per descriptor: [")
     print(buf, join(cib.numberOfVariants, ", "))
     println(buf, "]")
-    total = max_signature(cib) + 1
+    # scenario_count, not max_signature + 1: this header is printed alongside
+    # results that find_consistent can now produce for models whose signatures
+    # overrun Int64, and max_signature would throw here and discard them.
+    total = scenario_count(cib)
     println(buf, "Total scenario space: $total")
     println(buf)
 
@@ -292,15 +295,21 @@ function do_succession(file_path::String, pairs::Vector{SubString{String}})
     cib = get_cib(file_path)
     scenario = resolve_scenario(cib, pairs)
 
-    # Collect steps
+    # Collect steps. Scenarios are keyed by their Int128 signature, not the
+    # Int64 one: succession works at any model size, and load_scw now reaches
+    # here with models whose Int64 signatures wrap — where two different
+    # scenarios can share a key and the walk would report a cycle that is not
+    # there. The step limit is the scenario count for the same reason (a
+    # trajectory cannot outlast the space), capped so it stays an Int.
     steps = [copy(scenario)]
     v = copy(scenario)
-    seen_sigs = Set{Int}([signature(cib, v)])
+    seen_sigs = Set{Int128}([CrossImpactBalances._signature128(cib, v)])
     cycle_length = 0
+    step_limit = Int(min(scenario_count(cib) + 10, Int128(typemax(Int))))
 
-    for _ in 1:(max_signature(cib) + 10)  # safety limit
+    for _ in 1:step_limit
         v = succession_step(cib, v)
-        v_sig = signature(cib, v)
+        v_sig = CrossImpactBalances._signature128(cib, v)
         if v_sig in seen_sigs
             # Check if it's a fixed point (same as last step) or a cycle
             if v == steps[end]
@@ -311,7 +320,7 @@ function do_succession(file_path::String, pairs::Vector{SubString{String}})
                 cycle_length = 0
                 for k in length(steps):-1:1
                     cycle_length += 1
-                    if signature(cib, steps[k]) == v_sig
+                    if CrossImpactBalances._signature128(cib, steps[k]) == v_sig
                         break
                     end
                 end
