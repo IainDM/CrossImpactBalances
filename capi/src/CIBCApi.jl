@@ -23,6 +23,20 @@ Runtime lifecycle (from the compiled library): call the generated
 `init_julia(argc, argv)` once before any `cib_*` call, and `shutdown_julia`
 at the end. Pass `-t auto` (or `-tN`) in `argv` to enable threads.
 
+Very large models
+-----------------
+A real ScenarioWizard matrix can have more scenarios than `Int64` can count —
+10²⁴ is an ordinary size in the Weimer-Jehle corpus — and `find_consistent`
+searches those anyway, because branch-and-bound never numbers a scenario. This
+surface reaches them too: `cib_load` reports the space with `scenario_count`
+(exact to ~1.7×10³⁸) rather than `max_signature + 1`, which refuses there, and
+`cib_signature` answers with the `Int128` signature rather than the `Int64` one,
+which wraps into negative numbers. Counts and signatures past 2⁵³ cross the
+boundary as **decimal strings**, because a consumer that parses JSON numbers
+into doubles — every JavaScript one, and anything using a float-backed parser —
+silently loses their last digits. Python's `int()` accepts either form
+unchanged; see `_json_count` below.
+
 Removed options
 ---------------
 `cib_consistent` once accepted `seed`, `ignore_cycles` and `exhaustive`. All
@@ -109,6 +123,29 @@ end
 
 _rule(name) = name == "sequential" ? SequentialSuccession() : GlobalSuccession()
 
+# ── Numbers too big for a JSON number ───────────────────────────────────────
+
+"""Encode a count or a signature for JSON: a number while a `Float64` holds it
+exactly, a decimal **string** past 2⁵³ so a consumer that parses numbers into
+doubles cannot mangle its last digits. `int(...)` in Python takes either form
+transparently. Mirrors `json_count` in `app/src/CIBApp.jl`."""
+_json_count(n::Integer) = Int128(n) <= Int128(2)^53 ? Int(n) : string(n)
+
+"""The inverse, for a signature arriving from a caller: accept the decimal
+string `_json_count` emits as well as a plain number, and refuse anything
+`inv_signature` cannot represent by name, rather than letting it surface as an
+overflow from the JSON number parser."""
+function _signature_arg(x)::Int
+    signatureValue = x isa AbstractString ? parse(Int128, x) : Int128(x)
+    signatureValue <= Int128(typemax(Int)) || throw(ArgumentError(
+        "cib_inv_signature: signature $(signatureValue) is past typemax(Int64) = " *
+        "$(typemax(Int)), and inv_signature works in Int64 — it cannot invert it. " *
+        "(cib_signature still reports such signatures exactly; only the inverse " *
+        "direction stops here.) The scenario's variant indices identify it at any " *
+        "model size."))
+    return Int(signatureValue)
+end
+
 # ── Exported C API ──────────────────────────────────────────────────────────
 
 Base.@ccallable function cib_load(path::Cstring)::Cstring
@@ -122,7 +159,12 @@ Base.@ccallable function cib_load(path::Cstring)::Cstring
             "descriptors" => cib.descriptors,
             "variants" => variants,
             "n_descriptors" => cib.numberOfDescriptors,
-            "n_scenarios" => max_signature(cib) + 1)
+            # scenario_count, not max_signature + 1: max_signature THROWS past
+            # typemax(Int64), and this line is the whole reason a model that
+            # size could not be loaded through the C API at all — the failure
+            # came back from cib_load, so cib_consistent, which handles those
+            # models perfectly well, was unreachable for them.
+            "n_scenarios" => _json_count(scenario_count(cib)))
     end
 end
 
@@ -171,7 +213,7 @@ Base.@ccallable function cib_basins(handle::Cint, opts::Cstring)::Cstring
         _ok("fixed_points" => fps,
             "basin_sizes" => sizes,
             "cycle_count" => cycles,
-            "total" => max_signature(cib) + 1)
+            "total" => _json_count(scenario_count(cib)))
     end
 end
 
@@ -187,14 +229,19 @@ Base.@ccallable function cib_signature(handle::Cint, scenario::Cstring)::Cstring
     _protect() do
         cib = _get(handle)
         u = _intvec(_parse(scenario))
-        _ok("signature" => signature(cib, u))
+        # _signature128, not signature: the same mixed-radix number, in a type
+        # wide enough for every model cib_load now accepts. `signature` returns
+        # an Int and wraps silently into negative numbers past typemax(Int64) —
+        # unreachable while cib_load refused those models, and a wrong answer
+        # rather than an error the moment it stopped refusing.
+        _ok("signature" => _json_count(CrossImpactBalances._signature128(cib, u)))
     end
 end
 
 Base.@ccallable function cib_inv_signature(handle::Cint, sig::Cstring)::Cstring
     _protect() do
         cib = _get(handle)
-        s = Int(_parse(sig))
+        s = _signature_arg(_parse(sig))
         _ok("scenario" => inv_signature(cib, s))
     end
 end
@@ -205,23 +252,38 @@ Base.@ccallable function cib_succession(handle::Cint, req::Cstring)::Cstring
         o = _parse(req)
         u = _intvec(o["scenario"])
         rule = _rule(_opt(o, "rule", "global"))
-        maxsteps = Int(_opt(o, "max_steps", max_signature(cib) + 10))
+        # Int128 signatures as the "have I been here before" key, and a step
+        # limit taken from scenario_count rather than max_signature: succession
+        # itself costs the same at any model size, and cib_load now reaches
+        # here with models whose Int64 signatures wrap — where two different
+        # scenarios can share a key and the walk reports a cycle that is not
+        # there. The limit only has to outlast the longest possible trajectory,
+        # which cannot revisit a scenario; it is clamped so it stays an Int.
+        # Mirrors do_succession in mcp/julia_worker.jl.
+        maxsteps = Int(_opt(o, "max_steps",
+                            Int(min(scenario_count(cib) + 10, Int128(typemax(Int))))))
 
         steps = Vector{Vector{Int}}([copy(u)])
-        seen = Set{Int}([signature(cib, u)])
+        seen = Set{Int128}([CrossImpactBalances._signature128(cib, u)])
         cycle_length = 0
         cur = copy(u)
         for _ in 1:maxsteps
             nxt = succession_step(rule, cib, cur)
-            nsig = signature(cib, nxt)
+            nsig = CrossImpactBalances._signature128(cib, nxt)
             if nsig in seen
                 if nxt == steps[end]
                     cycle_length = 1
                 else
                     push!(steps, copy(nxt))
-                    for k in length(steps):-1:1
+                    # Count back from the step BEFORE the one just pushed.
+                    # Starting AT it matched immediately — `nxt` is what nsig
+                    # is the signature of — so every cycle came back as
+                    # length 1, which `Model.succession` in python/ turns into
+                    # `converged: true`. CIB_global from [0,0,0] is a two-cycle
+                    # that reported as a fixed point.
+                    for k in (length(steps) - 1):-1:1
                         cycle_length += 1
-                        signature(cib, steps[k]) == nsig && break
+                        CrossImpactBalances._signature128(cib, steps[k]) == nsig && break
                     end
                 end
                 break
