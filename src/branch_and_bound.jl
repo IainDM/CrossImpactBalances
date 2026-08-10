@@ -368,10 +368,15 @@ end
 # before the kernel is returned. It only affects how long the answer takes.
 #
 # On Weimer-Jehle's corpus the difference is not marginal. D60 (2.2e23
-# scenarios) went from unfinished after 1.5e9 nodes to 385,394 nodes; B80
-# (1.2e24) from 254 million nodes to 215,530. The repository's own fixtures all
-# improve too, by between 1.06x and 4.7x — the heuristic has not been observed
-# to make any model worse.
+# scenarios) went from unfinished after 2e9 nodes to 385,592; B80 (1.2e24) from
+# 254 million nodes to 215,614; B70 from 366 million to 160,012. The
+# repository's own fixtures all improve too, by 1.1x to 4.66x.
+#
+# It is a heuristic, though, so it is not free everywhere. Measured across all
+# 48 models available (10 fixtures + 38 corpus), two come out worse: N25c needs
+# 2.25x the nodes (502,342 -> 1,129,598) and D35a 4% more. Both are still well
+# under a second, and against savings of 50x to 5,000x elsewhere that is a
+# trade worth making — but "always better" would be the wrong thing to believe.
 
 """
     _bnb_descriptor_order(cib) -> Vector{Int}
