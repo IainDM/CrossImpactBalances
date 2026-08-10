@@ -56,6 +56,19 @@ def test_succession_converges_from_consistent(model):
     assert trace["steps"][0] == sc
 
 
+def test_succession_reports_a_real_cycle(model):
+    """A trajectory that ends in a cycle must not read as converged.
+
+    All-first-variants enters a two-cycle here:
+    [0,0,0] -> [1,1,2] -> [0,1,1] -> [1,1,2]. Both backends counted the cycle
+    starting from the step they had just appended — which is the repeat itself,
+    so the count stopped at once — and reported every cycle as length 1.
+    """
+    trace = model.succession([0, 0, 0])
+    assert trace["cycle_length"] == 2
+    assert trace["converged"] is False
+
+
 def test_basins_cover_space(model):
     result = model.basins()
     assert result.total == model.n_scenarios
