@@ -347,9 +347,11 @@ the B&B search ~4× faster again.
 Deciding the strongly-coupled descriptors first, rather than in file order,
 shrinks it further still and is what makes the largest real models reachable at
 all: on Weimer-Jehle's corpus it took one 10²³-scenario model from unfinished
-after 1.5×10⁹ nodes to 385 thousand, and an 10²⁴-scenario one from 254 million
-nodes to 216 thousand. Every existing benchmark file improves too, by 1.06× to
-4.7× fewer nodes, with identical kernels.
+after 2×10⁹ nodes to 386 thousand, and a 10²⁴-scenario one from 254 million
+nodes to 216 thousand. Every existing benchmark file improves too, by 1.1× to
+4.66× fewer nodes, with identical kernels. It is a heuristic and not free
+everywhere — across all 48 models measured, two need more nodes than file order
+(one 2.25× more, one 4%), both still well under a second.
 
 ## Validation
 

@@ -21,6 +21,26 @@ Everything *derived* from the corpus is committed: the test code (`test/wwj_test
 (`test/verify_wwj.jl`), and the machine-readable results (`test/bench_results_wwj.json`). The tests
 detect that the data is absent and skip, so a clone without it is green.
 
+## How it is exercised
+
+| | What runs | Cost |
+|---|---|---|
+| `Pkg.test()` | All 38 parsed and shape-checked; all 19 ScenarioWizard solution sets confirmed to be genuine fixed points; **17 of the 19 pairs re-searched and compared set-for-set**; the stale exports and blank-variant behaviour pinned | ~1m55s, 1 thread |
+| `JUCIB_WWJ_FULL=1 Pkg.test()` | Adds N40a and D55b (the two slowest pairs), the 19 models with no reference solution, and the composed 10²⁷/10³⁰ kernels | ~25 min, 1 thread |
+| `julia -t auto --project=. test/verify_wwj.jl` | Everything, both disagreement directions, non-zero exit on any discrepancy. **The acceptance test.** | ~25 s, 8 threads |
+
+The gap between the first two rows is `--check-bounds=yes`, which `Pkg.test()` sets and which disables
+every `@inbounds` in the search kernels — about 7× on these searches. N40 takes 4.8 s in an ordinary
+session and 34.8 s under the test runner; N40a 10.7 s becomes 72.8 s and D55b 14.3 s becomes 99.2 s.
+Those last two alone are 59% of the cost of re-searching all 19, which is why they are the two held
+back. ScenarioWizard's answers *for* them are still checked by default — only JuCIB's independent
+re-search of them is deferred.
+
+The `JUCIB_WWJ_FULL=1` figure is dominated not by those two but by the 19 models with no reference
+solution: N45 alone is 170 million nodes. Reach for `test/verify_wwj.jl` instead unless you
+specifically want the searches run under bounds checking — it covers strictly more, both
+disagreement directions included, in about 25 seconds.
+
 ### Staging a copy
 
 Put the 38 `.scw` and 21 `.sl` files directly in `test/wwj_corpus/` — flat, no subdirectories, keeping
