@@ -427,9 +427,12 @@ Two capabilities came out of this corpus:
   scenarios, in 1.9 s.
 
 The corpus also drove the branch-and-bound **descriptor-ordering** change: deciding
-strongly-coupled descriptors first took D60 from unfinished after 1.5×10⁹ nodes to
-385 K, and B80 from 254 M nodes to 216 K. The six files above improve too — 1.06×
-to 4.7× fewer nodes — with identical kernels throughout.
+strongly-coupled descriptors first took D60 from unfinished after 2×10⁹ nodes to
+386 K, B80 from 254 M nodes to 216 K, and B70 from 366 M to 160 K. The six files
+above improve too — 1.1× to 1.63× fewer nodes — and `CIB_natl_regional` by 4.66×,
+with identical kernels throughout. It is a heuristic, so it is not free
+everywhere: of the 48 models measured, two need more nodes than file order (N25c
+2.25×, D35a 4%), both still well under a second.
 
 The corpus itself is **not redistributed**; provenance, the full 38-row table and
 the three known-bad `.sl` exports are in

@@ -19,6 +19,21 @@
 # Compare the scenarios themselves. `sort` on Vector{Vector{Int}} is
 # lexicographic and total, so `sort(a) == sort(b)` is exact set equality at any
 # model size, and `Set` comparison works too.
+#
+# ── WHY SOME OF IT IS BEHIND AN ENV VAR ─────────────────────────────────────
+# `Pkg.test()` runs Julia with `--check-bounds=yes`, which disables every
+# `@inbounds` in the search kernels. That costs the exhaustive searches here
+# roughly 7x: N40 takes 4.8 s in an ordinary session and 34.8 s under the test
+# runner. Searching all 38 models would add 18 minutes to a single-threaded CI
+# leg, so the two slowest paired models, the models with no reference solution,
+# and the four whose kernels have to be composed rather than enumerated are
+# held back behind JUCIB_WWJ_FULL=1.
+#
+# What stays on by default is the claim itself: 17 of the 19 paired models
+# re-searched and compared set-for-set, plus every cheap check on all 38. About
+# 1m55s here. `test/verify_wwj.jl` does the complete job, all 38 models and both
+# disagreement directions, outside the suite and without the bounds penalty.
+const WWJ_FULL = get(ENV, "JUCIB_WWJ_FULL", "") in ("1", "true", "yes")
 
 const WWJ_DIR = joinpath(@__DIR__, "wwj_corpus")
 
@@ -75,6 +90,13 @@ const WWJ_MODELS = [
 # the same reason (its core island alone has 597,824). B100c has one island, so
 # there is nothing to decompose and it is searched whole.
 const WWJ_BY_ISLANDS = ["B90", "B100", "B100b"]
+
+# The two paired models whose re-search does not fit a default CI leg. Measured
+# under `--check-bounds=yes` at one thread: N40a 72.8 s, D55b ~100 s, against
+# 30 s or less for every other pair. Both run under JUCIB_WWJ_FULL=1 and in
+# test/verify_wwj.jl; ScenarioWizard's answers for them are still checked to be
+# genuine fixed points by default, which is the soundness half.
+const WWJ_SLOW_PAIRS = ["N40a", "D55b"]
 
 # .sl exports that do not belong to the .scw of the same name — see
 # test/WWJ_CORPUS.md § Known-bad files. Pinned two-sided: `fixed` is how many of
@@ -176,21 +198,25 @@ else
     end
 
     @testset "JuCIB finds exactly ScenarioWizard's kernel" begin
-        # The expensive direction: nothing ScenarioWizard found that JuCIB
-        # misses, and nothing JuCIB finds that ScenarioWizard missed. All 19
-        # pairs, spaces up to 1.2e24.
+        # The expensive direction, and the point of the whole corpus: nothing
+        # ScenarioWizard found that JuCIB misses, and nothing JuCIB finds that
+        # ScenarioWizard missed. Spaces up to 1.2e24.
         #
         # algorithm=:bnb, not :auto. On a budget trip :auto falls back to the
         # odometer sweep, which on B50 would mean walking 1.1e15 scenarios —
         # a CI hang rather than a test failure. :bnb has no fallback.
         for model in WWJ_MODELS
             model.nsol === nothing && continue
+            (!WWJ_FULL && model.name in WWJ_SLOW_PAIRS) && continue
             cib = wwj_load(model.name)
             kernel = find_consistent(cib; algorithm = :bnb)
             reference = load_solutions(cib, wwj_path(model.name, ".sl"))
             @test length(kernel) == model.kernel
             @test sort(kernel) == sort(reference)      # exact set equality
         end
+        WWJ_FULL || @info "WWJ: re-searched 17 of 19 paired models; " *
+                          "$(join(WWJ_SLOW_PAIRS, ", ")) need JUCIB_WWJ_FULL=1 " *
+                          "(or test/verify_wwj.jl)."
     end
 
     @testset "stale ScenarioWizard exports (N45.sl, N50.sl)" begin
@@ -207,6 +233,15 @@ else
             @test count(u -> CrossImpactBalances.succession_step(cib, u) == u, sols) == stale.fixed
         end
     end
+
+    # ── From here on: JUCIB_WWJ_FULL=1 only ─────────────────────────────────
+    # These prove nothing about ScenarioWizard parity — there is no reference
+    # solution to compare against — so they are the right things to drop from a
+    # default CI leg. test/verify_wwj.jl always runs them.
+    if !WWJ_FULL
+        @info "WWJ: set JUCIB_WWJ_FULL=1 for the models with no reference " *
+              "solution and the composed 10^27/10^30 kernels."
+    else
 
     @testset "kernels for the models with no reference solution" begin
         # No ScenarioWizard answer to compare against, so these are JuCIB's own
@@ -244,6 +279,8 @@ else
         @test length(influence_structure(b100c).components) == 1
         @test length(find_consistent(b100c; algorithm = :bnb)) == 26992
     end
+
+    end   # WWJ_FULL
 
     @testset "blank variant names" begin
         # The corpus's name generator runs off the end of the alphabet and then
