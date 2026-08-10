@@ -152,6 +152,39 @@ end
     @test (fps, sizes, cyc) == (fps2, sizes2, cyc2)
 end
 
+@testset "find_basins at exactly 2^63 scenarios" begin
+    # The one size where max_signature ANSWERS but its `+ 1` wraps: the
+    # largest signature is exactly typemax(Int), so the guard does not fire,
+    # and the count went negative. :table was shielded by accident (its
+    # byte-count guard rejects a model this size first); :stream took the
+    # negative count into the memo cache's sizing and died on an InexactError
+    # — a crash where a refusal belongs. All three entry points must now
+    # refuse in the same words, naming what still works at this scale.
+    boundary = forcing_chain(63)
+    @test scenario_count(boundary) == Int128(2)^63
+    @test max_signature(boundary) == typemax(Int)
+
+    for method in (:auto, :table, :stream)
+        refusal = try; find_basins(boundary; method=method); nothing; catch e; e; end
+        @test refusal isa ArgumentError
+        @test occursin("$(Int128(2)^63) scenarios", refusal.msg)
+        for needle in ("estimate_basins", "product_basins")
+            @test occursin(needle, refusal.msg)
+        end
+    end
+
+    # The range API validates against that same count, so it refuses too
+    # rather than checking a range against a wrapped bound.
+    @test_throws ArgumentError find_basins(boundary; method=:stream, signature_range=0:9)
+
+    # One under the line still runs: the count is the only thing that was
+    # wrong, and 2^62 scenarios are as walkable (a range at a time) as any.
+    justUnder = forcing_chain(62)
+    @test scenario_count(justUnder) == Int128(2)^62
+    _, sizes, cycles = find_basins(justUnder; method=:stream, signature_range=0:999)
+    @test sum(sizes) + cycles == 1_000
+end
+
 @testset "package RNG: pinned streams and unbiased bounded draws" begin
     # THE STREAM-STABILITY CONTRACT (see the file header before touching).
     pins = [
