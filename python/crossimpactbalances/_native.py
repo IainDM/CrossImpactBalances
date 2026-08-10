@@ -192,6 +192,11 @@ class NativeBackend:
             "descriptors": [str(x) for x in d["descriptors"]],
             "variants": {k: [str(v) for v in vs] for k, vs in d["variants"].items()},
             "n_descriptors": int(d["n_descriptors"]),
+            # Past 2**53 the engine sends counts and signatures as decimal
+            # strings, so a JSON consumer backed by doubles cannot round their
+            # last digits away (see `_json_count` in capi/src/CIBCApi.jl).
+            # Python's int() takes either form and is arbitrary-precision, so
+            # a 10**24-scenario model arrives here exact.
             "n_scenarios": int(d["n_scenarios"]),
         }
         return cls(int(d["handle"]), structure, lib=lib)
@@ -230,7 +235,13 @@ class NativeBackend:
         return int(self._lib.call("cib_signature", self._handle, list(u))["signature"])
 
     def inv_signature(self, s: int) -> List[int]:
-        d = self._lib.call("cib_inv_signature", self._handle, int(s))
+        # Send the decimal string past 2**53, mirroring the form cib_signature
+        # emits: a bare JSON number that large overflows the engine's own
+        # number parser, and that parse error would displace the C API's
+        # explanation of why the inverse direction stops at Int64.
+        s = int(s)
+        d = self._lib.call("cib_inv_signature", self._handle,
+                           s if abs(s) <= 2 ** 53 else str(s))
         return [int(x) for x in d["scenario"]]
 
     def set_impact(self, sd, sv, td, tv, value) -> int:
