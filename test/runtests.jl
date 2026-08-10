@@ -304,6 +304,13 @@ end
     include("structure_tests.jl")
     include("transition_tests.jl")
 
+    # Weimer-Jehle's ScenarioWizard corpus: 38 real models (20-100 descriptors,
+    # up to 1.3e30 scenarios) from the author of the method, and the solution
+    # sets ScenarioWizard itself produced for 19 of them. The files are third
+    # party and not redistributed here, so this skips unless a copy is staged —
+    # see test/WWJ_CORPUS.md.
+    include("wwj_tests.jl")
+
     # Consumers outside src/ — the desktop app, the examples, the documented
     # snippets. These break silently otherwise; see the file's header.
     include("smoke_consumers.jl")

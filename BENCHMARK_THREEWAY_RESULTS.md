@@ -25,6 +25,11 @@ Tools under test:
    discrepancy is CIBSA in Monte-Carlo mode missing small-basin fixed points on
    the 60 M-scenario file (expected; see Verification). The v0.2 JuCIB engine
    returns the **same kernels and basin sizes** as v0.1 — only faster.
+   That agreement now extends far beyond these six files: on **Weimer-Jehle's own
+   38-model corpus** JuCIB reproduces ScenarioWizard's solution set exactly on all
+   19 models that ship with one, and the two directions are checked separately —
+   nothing ScenarioWizard found that JuCIB missed (25,136 scenarios), and nothing
+   JuCIB found that ScenarioWizard missed. See *External validation* below.
 2. **ScenarioWizard's "much faster than CIBSA" reputation holds** — emphatically.
    SW returns *instantly* on files where CIBSA's pure-Python full enumeration
    takes 15–16 s, and handles the 60 M file in ~5 s where CIBSA cannot enumerate
@@ -52,7 +57,8 @@ Tools under test:
 
 > Note on threads: the CPU is hybrid (6 performance + 8 efficiency cores). Julia
 > ran with 10 threads, the value configured in `JULIA_NUM_THREADS`. Only JuCIB's
-> `exhaustive=true` sweep and `find_basins` table-fill are multi-threaded.
+> fast-path sweep (`algorithm=:sweep`) and `find_basins` table-fill are
+> multi-threaded.
 
 ## Method — what was timed
 
@@ -61,9 +67,9 @@ Tools under test:
   excluded from the timed region, so JuCIB and CIBSA are compared on the search
   alone. Parse cost is negligible everywhere (≤ 0.6 ms even for the 60 M file),
   so full-load ≈ find-only.
-- **JuCIB, three modes:** (a) `find_consistent(…; exhaustive=false)` single-thread
-  full enumeration — the *same algorithm* as CIBSA (a succession walk from every
-  scenario); (b) `find_consistent(…; exhaustive=true)` — the optimised path
+- **JuCIB, three modes:** (a) a single-threaded succession walk from every
+  scenario — the *same algorithm* as CIBSA, run through the generic scan;
+  (b) `find_consistent(…)` at its default `algorithm=:auto` — the optimised path
   (JuCIB's best): the threaded fixed-point **sweep** for spaces below 10⁵
   scenarios, auto-switching to **branch-and-bound** above it; (c) `find_basins` —
   full basin analysis (threaded successor-table fill + sequential path-compressed
@@ -175,7 +181,7 @@ per the benchmark's "abandon after 30 min" rule.
 ⁴ CIBSA-MC (seed 999, 10 k samples) found 3 of the 5 fixed points. See Verification.
 ⁵ Coarse — a "Computing…" progress dialog appeared and the result rendered within
 the next ~5 s.
-⁶ `exhaustive=true` auto-selects branch-and-bound above 10⁵ scenarios; on this
+⁶ `algorithm=:auto` selects branch-and-bound above 10⁵ scenarios; on this
 file it visits **1,361,846 nodes = 2.25 %** of the space. Across runs the median
 sat at 11–16 ms; 0.013 s is representative.
 
@@ -245,7 +251,7 @@ extends the same idea to spaces too large to enumerate at all (below).
 finds the kernel by running a global succession from *every* starting scenario —
 follow the path scenario → successor → … until it converges or repeats. Each step
 recomputes a full impact balance, and many start points walk through the same
-intermediates, so the work is well above O(N). JuCIB's `exhaustive=true` sweep
+intermediates, so the work is well above O(N). JuCIB's `algorithm=:sweep`
 (`_sweep_fixed_points` / `_sweep_chunk!`) instead asks a strictly **local**
 question of each scenario: *is it already its own successor?* For each descriptor
 it checks whether the currently-selected variant has the maximum impact score; if
@@ -273,7 +279,7 @@ That adds the 4–8× on top — sub-linear here because the problems are small 
 CPU is hybrid (6 fast P-cores + 8 slower E-cores). On the 60 M file this threading
 takes the sweep from **1.18 s (1 thread) to 0.164 s (10 threads)**.
 
-**5. Branch-and-bound for the huge case.** Above 10⁵ scenarios `exhaustive=true`
+**5. Branch-and-bound for the huge case.** Above 10⁵ scenarios `algorithm=:auto`
 switches from the sweep to a branch-and-bound search (`_bnb_fixed_points`): it
 assigns descriptors depth-first and prunes any subtree whose suffix score bounds
 (`_bnb_bounds`) prove no fixed point can lie inside. On `bench_50x50` this visits
@@ -378,6 +384,58 @@ argument for exhaustive search on large, low-basin problems.
 then lowest index — so no tie-related divergence appeared; SW agreed on every
 scenario, so its convention matches too.)
 
+## External validation: the Weimer-Jehle corpus
+
+The six files above are small and mostly self-made. Wolfgang Weimer-Jehle — the
+author of the CIB method and of ScenarioWizard — supplied **38 models from his
+own working files**, 20–100 descriptors, 10⁸·⁴ to 10³⁰·¹ scenarios, 19 of them
+carrying the solution set ScenarioWizard itself produced. That is an independent
+corpus, three to twenty-four orders of magnitude larger than anything here.
+
+**Every one of the 19 pairs agrees exactly**, and the two directions are reported
+separately because they fail in different ways:
+
+- *Missing* — ScenarioWizard found it, JuCIB did not. **Zero, across all 19.** A
+  non-zero count here would mean `find_consistent` is unsound.
+- *Extra* — JuCIB found it, ScenarioWizard did not. **Zero, across all 19.**
+
+| Model | Scenarios | Kernel | Model | Scenarios | Kernel |
+|---|---:|---:|---|---:|---:|
+| N25 | 10^10.4 | 3 | D50 | 10^19.5 | 470 |
+| D30a | 10^11.7 | 13 | D55a | 10^21.5 | 140 |
+| N30 | 10^12.6 | 15 | D55b | 10^21.5 | 328 |
+| D35 | 10^13.7 | 51 | D55c | 10^21.5 | 620 |
+| N35 | 10^14.6 | 3 | B70 | 10^21.1 | 3,156 |
+| B50 | 10^15.1 | 172 | D60 | 10^23.3 | 194 |
+| D40 | 10^15.6 | 110 | B80 | 10^24.1 | 18,432 |
+| N40 | 10^16.8 | 15 | B60 | 10^18.1 | 928 |
+| N40a | 10^16.8 | 18 | D60b | 10^18.1 | 382 |
+| D45 | 10^17.6 | 86 | | | |
+
+The remaining 19 models have no published solution, so JuCIB's kernels for them
+are its own result, recorded as regression values. All 38 are analysable, the
+whole corpus in **24.6 s** on 8 threads.
+
+Two capabilities came out of this corpus:
+
+- **Fourteen of the 38 have more scenarios than `typemax(Int64)`**, so they have no
+  signatures at all. `find_consistent` searches them anyway — branch-and-bound
+  never numbers a scenario — while `max_signature` and `find_basins` still refuse.
+- **Four have kernels too large to hold as a list** (B90's is 1.9×10⁷ scenarios,
+  B100's is 1.9×10¹⁰). Their influence maps split, so `split_cib` gives the size
+  exactly as a product over islands without ever building it — B100, at 10³⁰·¹
+  scenarios, in 1.9 s.
+
+The corpus also drove the branch-and-bound **descriptor-ordering** change: deciding
+strongly-coupled descriptors first took D60 from unfinished after 1.5×10⁹ nodes to
+385 K, and B80 from 254 M nodes to 216 K. The six files above improve too — 1.06×
+to 4.7× fewer nodes — with identical kernels throughout.
+
+The corpus itself is **not redistributed**; provenance, the full 38-row table and
+the three known-bad `.sl` exports are in
+[`test/WWJ_CORPUS.md`](test/WWJ_CORPUS.md), and the machine-readable results in
+`test/bench_results_wwj.json`.
+
 ## Caveats
 
 - **JuCIB numbers are v0.2 (2026-07-21); CIBSA/SW are 2026-06-04.** Only JuCIB was
@@ -417,6 +475,10 @@ Raw results (machine-readable):
 - `test/bench_results_cibsa.json` — CIBSA full-enum + MC (2026-06-04).
 - `test/bench_results_sw.json` — ScenarioWizard kernels (from `.sl`) + observed times (2026-06-04).
 - `test/sample_files/<name>_sw.sl` — ScenarioWizard's exported solution sets.
+- `test/bench_results_wwj.json` — the Weimer-Jehle corpus, all 38 models, both
+  disagreement directions per model (2026-08-10). The inputs themselves are **not
+  redistributed** — see [`test/WWJ_CORPUS.md`](test/WWJ_CORPUS.md) for provenance
+  and how to stage a copy.
 
 Re-run:
 ```bash
@@ -426,6 +488,7 @@ julia -t 1  --project=. test/algo_split.jl       # 1-thread leg of the algorithm
 julia -t 10 --project=. test/algo_split.jl       # 10-thread leg
 python test/bench_cibsa.py                        # CIBSA (imports the Py3-ported clone)
 julia --project=. test/verify_sw.jl               # verify SW .sl files vs JuCIB
+julia -t auto --project=. test/verify_wwj.jl      # the Weimer-Jehle corpus (needs it staged)
 ```
 ScenarioWizard is GUI-driven: *File ▸ Open* a `.scw`, *Analyse ▸ Consistent
 scenarios*, then *Save* the solution set to `<name>_sw.sl`.

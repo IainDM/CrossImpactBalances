@@ -81,6 +81,27 @@ function rand_cim(rng::AbstractRNG, nvariants::Vector{Int};
     return cim
 end
 
+# A FORCING CHAIN of n binary descriptors: descriptor i's variant gives +1 to
+# descriptor i+1's SAME variant and nothing to the other, so each descriptor
+# copies the one before it. Descriptor 1 is unforced — both its variants score
+# 0, and a tie keeps the incumbent — so a scenario is consistent exactly when
+# every descriptor agrees with its predecessor. The kernel is
+# {all-zeros, all-ones} for every n.
+#
+# That gives a model of ANY size with a kernel of known content, known length
+# and known order, which is what makes the past-typemax(Int64) tests in
+# large_space_tests.jl possible: at n = 70 there are 1.18e21 scenarios and no
+# oracle could enumerate them, but the answer is still known in advance.
+# Pruning is total — a node dies the moment a descriptor disagrees with its
+# predecessor — so the search expands O(n) nodes however large n gets.
+function forcing_chain(n::Int)
+    cim = zeros(Int, 2n, 2n)
+    for i in 1:n-1, v in 0:1
+        cim[2(i - 1) + v + 1, 2i + v + 1] = 1
+    end
+    return make_cib(fill(2, n), cim)
+end
+
 sorted_sigs(cib, kern) = sort!([signature(cib, u) for u in kern])
 
 # One instance: every implementation must agree with the oracles.
@@ -481,15 +502,72 @@ end
 
 @testset "B&B node-count regression guard (bench_typical)" begin
     # Guards pruning EFFECTIVENESS, which the kernel-equality tests above are
-    # blind to. With the pair-difference bound the search expands 3,933 nodes
-    # of bench_typical's 59,049 (the per-column bound needed 7,875). The
-    # threshold leaves headroom only for the small thread-count-dependent
-    # variation in how root prefixes are charged.
+    # blind to. Two things earn the number. The pair-difference bound took the
+    # search from 7,875 nodes (per-column bound) to 3,933; deciding the
+    # strongly-coupled descriptors first (`_bnb_descriptor_order`) took it to
+    # 2,787, of bench_typical's 59,049 scenarios. The threshold leaves headroom
+    # only for the small thread-count-dependent variation in how root prefixes
+    # are charged.
+    #
+    # Go through `_bnb_search`, not `_bnb_fixed_points` directly: the ordering
+    # is part of the search, and a guard that skipped it would stop measuring
+    # what `find_consistent` actually does.
     path = joinpath(@__DIR__, "sample_files", "bench_typical.scw")
     cib = load_scw(path; kernel=Vector{Vector{Int}}())
-    sufDiff, pairOffsets = CrossImpactBalances._bnb_bounds(cib)
-    kernel, nodes = CrossImpactBalances._bnb_fixed_points(cib, sufDiff, pairOffsets;
-                                                          node_budget=typemax(Int))
+    kernel, nodes = CrossImpactBalances._bnb_search(cib; node_budget=typemax(Int))
     @test kernel !== nothing
-    @test nodes <= 4_500
+    @test nodes <= 3_200
+end
+
+@testset "forcing chain: the construction, against the oracles" begin
+    # "kernel == {all-zeros, all-ones}" is what the >typemax(Int64) tests in
+    # large_space_tests.jl rest on, so establish it here, at sizes where a
+    # brute-force scan can still check it — and put it through the full
+    # battery, not just the kernel comparison.
+    for n in (7, 12)
+        chain = forcing_chain(n)
+        @test naive_kernel(chain) == [zeros(Int, n), ones(Int, n)]
+        check_case(chain)
+    end
+
+    # One size up, past the 100,000-scenario line where :auto stops sweeping
+    # and starts branching, so both implementations are seen agreeing on this
+    # shape before it is scaled to where only one of them can go.
+    twenty = forcing_chain(20)                      # 1,048,576 scenarios
+    want = [zeros(Int, 20), ones(Int, 20)]
+    for algorithm in (:auto, :sweep, :bnb)
+        @test find_consistent(twenty; algorithm=algorithm) == want
+    end
+end
+
+@testset "B&B descriptor ordering is a permutation, and only that" begin
+    # The order must be a genuine permutation, deterministic, and invisible in
+    # the answer — reordering is a performance change and nothing else.
+    rng = MersenneTwister(20260810)
+    for _ in 1:15
+        ndesc = rand(rng, 2:6)
+        nvariants = [rand(rng, 1:5) for _ in 1:ndesc]
+        cib = make_cib(nvariants, rand_cim(rng, nvariants))
+
+        order = CrossImpactBalances._bnb_descriptor_order(cib)
+        @test sort(order) == collect(1:ndesc)
+        @test order == CrossImpactBalances._bnb_descriptor_order(cib)   # deterministic
+
+        # The permuted model really is the same model, just renumbered.
+        permuted = CrossImpactBalances._permute_descriptors(cib, order)
+        @test permuted.numberOfVariants == cib.numberOfVariants[order]
+        @test permuted.cim_t == permutedims(permuted.cim)
+        @test sum(permuted.cim) == sum(cib.cim)
+        @test permuted.desc_offsets ==
+              cumsum(vcat(0, permuted.numberOfVariants[1:end-1]))
+
+        # And the search through it lands back on the sweep's exact answer, in
+        # the sweep's exact order.
+        @test find_consistent(cib; algorithm=:bnb) ==
+              find_consistent(cib; algorithm=:sweep)
+    end
+
+    # An all-zero matrix has nothing to rank on, so the order stays as written.
+    flat = make_cib([2, 3, 2], zeros(Int, 7, 7))
+    @test CrossImpactBalances._bnb_descriptor_order(flat) == [1, 2, 3]
 end

@@ -31,12 +31,91 @@ const SAMPLES_DIR = joinpath(@__DIR__, "sample_files")
     @test max_signature(big) == 6_687_075_336_191
 
     # 41 ternary descriptors: 3^41 ≈ 3.6e19 > typemax(Int64). The count stays
-    # exact; every signature-based entry point refuses, naming alternatives.
+    # exact; every signature-DRIVEN entry point refuses, naming alternatives.
     huge = make_cib(fill(3, 41), zeros(Int, 123, 123))
     @test scenario_count(huge) == Int128(3)^41
     @test_throws ArgumentError max_signature(huge)
     @test_throws ArgumentError find_basins(huge)
-    @test_throws ArgumentError find_consistent(huge)
+    # NOT plain find_consistent(huge). Branch-and-bound numbers no scenario, so
+    # it now accepts a model this size — and on an all-zero matrix every
+    # scenario is consistent and nothing prunes, so calling it here would run
+    # for centuries. Only the odometer sweep needs signatures, and that is
+    # what is asserted. The >Int64 search itself is covered further down, on a
+    # model whose kernel is small and provably known.
+    @test_throws ArgumentError find_consistent(huge; algorithm=:sweep)
+end
+
+@testset "find_consistent past typemax(Int64)" begin
+    # EXACTLY 2^63 scenarios. max_signature ANSWERS here — the largest
+    # signature is typemax(Int), so the guard does not fire — and it was the
+    # `+ 1` that wrapped, sending a negative count past the "< 100_000" test
+    # and into a sweep over an empty range: an empty kernel, no error. Counting
+    # in Int128 makes this the ordinary case it always looked like.
+    boundary = forcing_chain(63)
+    @test scenario_count(boundary) == Int128(2)^63
+    @test max_signature(boundary) == typemax(Int)
+    @test find_consistent(boundary) == [zeros(Int, 63), ones(Int, 63)]
+
+    # 1.18e21 scenarios: past every Int64 signature, and branch-and-bound does
+    # not care. Completeness here is the construction's, checked exhaustively
+    # against the oracles at n = 7, 12 and 20 in property_tests.jl; soundness
+    # is rechecked below against the public primitive.
+    chain = forcing_chain(70)
+    @test scenario_count(chain) == Int128(2)^70
+    @test_throws ArgumentError max_signature(chain)
+
+    kernel = find_consistent(chain)                    # :auto picks bnb
+    @test kernel == [zeros(Int, 70), ones(Int, 70)]
+    @test find_consistent(chain; algorithm=:bnb) == kernel
+    for u in kernel
+        @test CIBmod.succession_step(chain, u) == u
+    end
+
+    # ORDER. The all-ones scenario's Int64 signature wraps to -1, so the old
+    # sort key put it FIRST; comparing variant choices puts it second, where
+    # ascending signature order actually puts it.
+    @test signature(chain, kernel[2]) == -1            # why that key is unusable
+    @test kernel[1] == zeros(Int, 70)
+end
+
+@testset "what still refuses past typemax(Int64), and how it reads" begin
+    chain = forcing_chain(70)
+
+    # The sweep walks signatures in order, so it cannot go here — and its
+    # message must point at the search that can, not at max_signature's
+    # blanket refusal, which now names find_consistent as still working.
+    swept = try; find_consistent(chain; algorithm=:sweep); nothing; catch e; e; end
+    @test swept isa ArgumentError
+    for needle in (":sweep", ":bnb", "typemax(Int64)", "fix_descriptor")
+        @test occursin(needle, swept.msg)
+    end
+
+    # A rule that declares no fixed_point_margin has only the one-at-a-time
+    # scan, which is signature-driven too.
+    scanned = try; find_consistent(chain; rule=RefGlobal()); nothing; catch e; e; end
+    @test scanned isa ArgumentError
+    @test occursin("fixed_point_margin", scanned.msg)
+
+    # Branch-and-bound out of budget has nothing to fall back to at this size.
+    # An all-zero matrix prunes nothing, so the budget really does trip.
+    flat = make_cib(fill(2, 70), zeros(Int, 140, 140))
+    spent = try
+        find_consistent(flat; algorithm=:bnb, bnb_node_budget=1); nothing
+    catch e; e; end
+    @test spent isa ArgumentError
+    @test occursin("bnb_node_budget", spent.msg)
+end
+
+@testset "kernel order: descriptor comparison == signature order" begin
+    # The documented ordering guarantee, unchanged for every model that fits
+    # Int64 — checked over every ordered pair of scenarios, including radix-1
+    # descriptors (whose digit never differs) and ragged radices.
+    for nvariants in ([2, 3, 4], [1, 5, 2, 3], [3, 3, 3, 3], [2, 1, 1, 2])
+        cib = make_cib(nvariants, zeros(Int, sum(nvariants), sum(nvariants)))
+        scenarios = [inv_signature(cib, s) for s in 0:max_signature(cib)]
+        @test all(CIBmod._sig_less(a, b) == (signature(cib, a) < signature(cib, b))
+                  for a in scenarios, b in scenarios)
+    end
 end
 
 @testset "find_basins method dispatch and memory guard" begin
