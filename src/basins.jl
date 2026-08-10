@@ -29,7 +29,7 @@ function find_basins(cib::CIB; rule::SuccessionRule=GlobalSuccession(),
                      progress::Bool=false)
     method in (:auto, :table, :stream) || throw(ArgumentError(
         "find_basins: method must be :auto, :table or :stream, got $(repr(method))"))
-    numberOfScenarios = max_signature(cib) + 1   # throws its own informative error past Int64
+    numberOfScenarios = _basin_scenario_count(cib)
 
     if signature_range !== nothing
         method === :stream || throw(ArgumentError(
@@ -63,6 +63,34 @@ function find_basins(cib::CIB; rule::SuccessionRule=GlobalSuccession(),
     return _stream_basins(rule, cib, firstSignature, lastSignature, Int(cache_bytes), progress)
 end
 
+# The size of the scenario space as an `Int` — the number both methods index
+# tables by, chunk, and loop to — or a refusal naming what still works.
+#
+# Int128, because `max_signature(cib) + 1` is NOT the same number. A model of
+# exactly 2^63 scenarios has a largest signature of exactly typemax(Int64),
+# so max_signature answers it WITHOUT refusing, and the `+ 1` wraps to
+# typemin(Int64). :table survived that only by accident — its byte-count
+# guard below rejects such a model first — while :stream carried the negative
+# count into the memo cache's sizing and died on an InexactError. Deciding
+# from scenario_count (Int128, and guarded against its own overflow) means
+# nothing can wrap before the comparison that refuses. Same treatment, for
+# the same reason, as find_consistent's — see find_consistent.jl.
+function _basin_scenario_count(cib::CIB)
+    totalScenarios = scenario_count(cib)
+    totalScenarios <= Int128(typemax(Int)) || throw(ArgumentError(
+        "find_basins: this model has $(totalScenarios) scenarios, more than " *
+        "typemax(Int64) = $(typemax(Int)) — both basin methods walk every scenario " *
+        "by its signature and tally the results in Int64, so neither can reach past " *
+        "that many. What still works at this size:\n" *
+        "  • estimate_basins(cib; samples=...) — basin shares with confidence " *
+        "intervals, at any scale (the kernel itself stays exact);\n" *
+        "  • influence_structure(cib) / product_basins(cib) — exact basins by " *
+        "composition when the matrix decomposes into independent parts;\n" *
+        "  • fix_descriptor(cib, d, v) — cut the model down to a space that can be " *
+        "walked."))
+    return Int(totalScenarios)
+end
+
 # The table method's memory bill, in Int128 so it is meaningful even for
 # spaces whose byte count overflows Int64 (~10^18 scenarios and up).
 function _basin_table_bytes(cib::CIB)
@@ -88,7 +116,7 @@ end
 #region "Fast path"
 # Fast path, selected by dispatch when the rule is exactly GlobalSuccession. This code is fine tuned to calculate that rule quickly
 function _find_basins(::GlobalSuccession, cib::CIB)
-    numberOfScenarios = max_signature(cib) + 1
+    numberOfScenarios = _basin_scenario_count(cib)
     scoreType = _score_type(cib)
     # Store table entries as Int32 when every signature fits — half the
     # memory, and memory traffic is what bounds this analysis.
@@ -101,7 +129,7 @@ end
 # `::Type{SignatureInt}` receives a TYPE as an argument value (Int32 or Int64 above) — passing types around as ordinary values is normal in Julia.
 function _fast_basins(cib::CIB, ::Type{SignatureInt},
                       cimTranspose::Matrix{ScoreInt}) where {SignatureInt<:Union{Int32,Int64}, ScoreInt<:Signed}
-    numberOfScenarios = max_signature(cib) + 1
+    numberOfScenarios = _basin_scenario_count(cib)
     successorTable = Vector{SignatureInt}(undef, numberOfScenarios)
     _successor_table!(successorTable, cib, cimTranspose)
     fixedPointSignatures, basinSizes, cycleCount = _resolve_and_tally(successorTable, numberOfScenarios) #grab the basin details
@@ -113,7 +141,7 @@ end
 #region "Generic path"
 # Generic path: works for any rule, because it only ever calls the rule's own succession_step. Allocates a few vectors per scenario, so it is much slower than the odometer path — a correctness baseline or for use when there is no alternative
 function _find_basins(rule::SuccessionRule, cib::CIB)
-    numberOfScenarios = max_signature(cib) + 1
+    numberOfScenarios = _basin_scenario_count(cib)
     if numberOfScenarios <= Int(typemax(Int32)) - 1
         return _generic_basins(rule, cib, Int32)
     end
@@ -122,7 +150,7 @@ end
 
 function _generic_basins(rule::SuccessionRule, cib::CIB,
                          ::Type{SignatureInt}) where {SignatureInt<:Union{Int32,Int64}}
-    numberOfScenarios = max_signature(cib) + 1
+    numberOfScenarios = _basin_scenario_count(cib)
     successorTable = Vector{SignatureInt}(undef, numberOfScenarios)
     numberOfThreads = Threads.nthreads()
     chunkSize = cld(numberOfScenarios, numberOfThreads)
@@ -179,7 +207,7 @@ The work is split into contiguous chunks of the scenario space, one task each. B
 """
 function _successor_table!(successorTable::Vector{SignatureInt}, cib::CIB,
                            cimTranspose::Matrix{ScoreInt}) where {SignatureInt, ScoreInt}
-    numberOfScenarios = max_signature(cib) + 1
+    numberOfScenarios = _basin_scenario_count(cib)
     # The place value of each descriptor's digit in a signature — 1 for the
     # first descriptor, then multiplied by each variant count in turn (the
     # same mixed-radix weights `signature` uses). Precomputing them lets a

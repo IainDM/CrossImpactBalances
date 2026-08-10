@@ -10,3 +10,11 @@ python/dist/
 build/cib-lib/
 capi/Manifest.toml
 python/crossimpactbalances/_libcib/
+
+# Wolfgang Weimer-Jehle's ScenarioWizard corpus — third-party fixtures used by
+# test/wwj_tests.jl and test/verify_wwj.jl. NOT redistributed: they are his
+# files, not ours, and no permission to publish them has been given yet.
+# See test/WWJ_CORPUS.md for provenance, contents and how to stage a copy.
+# When redistribution is agreed, delete the line below and follow the checklist
+# in that file — the tests then stop skipping with no code change.
+test/wwj_corpus/
