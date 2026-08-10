@@ -26,9 +26,9 @@ for name in ["bench_typical", "bench_xlarge", "bench_50x50"]
     t_bnb   = med3(() -> find_consistent(cib; algorithm=:bnb))
     t_bas   = med3(() -> find_basins(cib))
 
-    sufDiff, pairOffsets = CrossImpactBalances._bnb_bounds(cib)
-    _, nodes = CrossImpactBalances._bnb_fixed_points(cib, sufDiff, pairOffsets;
-                                                     node_budget=typemax(Int))
+    # _bnb_search is the whole branch-and-bound path, descriptor ordering
+    # included — the same thing find_consistent(:bnb) above just timed.
+    _, nodes = CrossImpactBalances._bnb_search(cib; node_budget=typemax(Int))
 
     ks = [signature(cib, u) for u in find_consistent(cib; algorithm=:sweep)]
     kb = [signature(cib, u) for u in find_consistent(cib; algorithm=:bnb)]

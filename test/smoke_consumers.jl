@@ -100,7 +100,11 @@ end
     small = filter(samples) do f
         cib = load_scw(joinpath(REPO, "test", "sample_files", f);
                        kernel = Vector{Vector{Int}}())
-        max_signature(cib) + 1 <= 100_000
+        # scenario_count, not max_signature + 1: max_signature THROWS past
+        # typemax(Int64), so a big model dropped into sample_files would break
+        # this filter rather than be filtered out by it. Identical value for
+        # every file here today.
+        scenario_count(cib) <= 100_000
     end
     @test !isempty(small)
 

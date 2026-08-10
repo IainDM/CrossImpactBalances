@@ -7,6 +7,8 @@ Parse a ScenarioWizard .scw file and optionally a .sl solutions file.
 Returns a fully populated CIB object.
 
 Unless a `kernel` or an `sl_file` is supplied, the kernel is computed by [`find_consistent`](@ref), which always searches the full scenario space and uses every available thread (start Julia with `julia -t auto`). `algorithm` is forwarded to select the search strategy.
+
+For a model whose scenario space exceeds `typemax(Int64)` that search is branch-and-bound with nothing to fall back to, so loading can take a while rather than failing fast. Pass `kernel=Vector{Vector{Int}}()` to load the matrix without searching at all.
 """
 function load_scw(scw_file::String; sl_file::Union{String,Nothing}=nothing,
                   kernel::Union{Vector{Vector{Int}},Nothing}=nothing,

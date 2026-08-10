@@ -49,7 +49,9 @@ Find every consistent scenario in the model — the model's *kernel*.
 - `:bnb`   — branch-and-bound (`branch_and_bound.jl`): build scenarios one descriptor at a time and discard whole families that provably contain nothing consistent. Exact — it returns the identical answer — and usually looks at a small fraction of the scenarios.
 - `:auto`  (default) — the sweep for small models (under 100,000 scenarios, where branch-and-bound's overheads are not repaid), otherwise branch-and-bound with a budget; if the pruning turns out too weak to pay off, the budget trips and the sweep runs instead.
 
-The result is ordered by ascending signature, so it does not depend on how many threads happened to be running.
+Branch-and-bound never numbers a scenario, so it — and therefore `:auto` above 100,000 scenarios — keeps working past `typemax(Int64)` ≈ 9.2×10¹⁸ scenarios, where signatures stop existing ([`max_signature`](@ref)). Two strategies do not cross that line, and both say so plainly: `:sweep`, which walks signatures in order, and the generic scan used by rules that declare no [`fixed_point_margin`](@ref). Nor is there anything to fall back TO if branch-and-bound exhausts an explicitly-set `bnb_node_budget` there — so `:auto` does not set one: its usual budget of a sixteenth of the scenario count is unreachable at that scale, and the search simply runs to completion.
+
+The result is ordered by ascending signature — decided by comparing the scenarios' variant choices from the last descriptor down, which is the same order and needs no signature to exist. So it does not depend on how many threads happened to be running, at any model size.
 """
 function find_consistent(cib::CIB; rule::SuccessionRule=GlobalSuccession(),
                          algorithm::Symbol=:auto,
@@ -77,6 +79,18 @@ function _find_kernel(rule::SuccessionRule, cib::CIB; algorithm::Symbol=:auto,
         algorithm === :auto || throw(ArgumentError(
             "algorithm=$(repr(algorithm)) needs a rule with a fixed_point_margin; " *
             "this rule uses the generic scan (algorithm=:auto)"))
+        # The scan is signature-driven — one scenario per signature — so it
+        # stops where signatures do. Branch-and-bound would carry on past here,
+        # but only a rule that declares a margin is allowed to use it.
+        totalScenarios = scenario_count(cib)
+        totalScenarios <= Int128(typemax(Int)) || throw(ArgumentError(
+            "find_consistent: this rule declares no fixed_point_margin, so every " *
+            "scenario has to be visited one at a time, and this model has " *
+            "$(totalScenarios) scenarios — past typemax(Int64) = $(typemax(Int)) " *
+            "there are no signatures to walk. Declaring a fixed_point_margin for " *
+            "the rule (see `fixed_point_margin`) unlocks branch-and-bound, which " *
+            "needs none; fix_descriptor / influence_structure cut the model down " *
+            "instead."))
         consistentScenarios = Vector{Vector{Int}}()
         for currentSignature in 0:max_signature(cib)
             scenario = inv_signature(cib, currentSignature)
@@ -91,28 +105,53 @@ function _find_kernel(rule::SuccessionRule, cib::CIB; algorithm::Symbol=:auto,
     # ── A margin was declared, so the fast searches are available ──
     algorithm in (:auto, :bnb, :sweep) ||
         throw(ArgumentError("algorithm must be :auto, :bnb or :sweep, got $(repr(algorithm))"))
-    numberOfScenarios = max_signature(cib) + 1
+    # Int128, because branch-and-bound does not number a scenario and so does
+    # not stop where signatures do. This count is the only quantity below that
+    # has to be representable, and scenario_count is exact to ~1.7e38 (and
+    # guards even that). max_signature would refuse outright — and worse, for a
+    # model of exactly 2^63 scenarios it returns typemax(Int) WITHOUT refusing,
+    # whose `+ 1` wrapped negative, passed the "< 100_000" test below, and sent
+    # the search into a sweep of an empty range: an empty kernel, no error.
+    numberOfScenarios = scenario_count(cib)
 
     # Use the sweep when asked for it, and when the model is small enough that
     # branch-and-bound's setup would cost more than it saves.
     if algorithm == :sweep || (algorithm == :auto && numberOfScenarios < 100_000)
+        # The sweep is an odometer over signatures, so it needs them to exist.
+        # Only an explicit :sweep can fail this test — the :auto arm above is
+        # already limited to models of under 100,000 scenarios.
+        numberOfScenarios <= Int128(typemax(Int)) || throw(ArgumentError(
+            "find_consistent: algorithm=:sweep walks every scenario in signature " *
+            "order, and this model has $(numberOfScenarios) scenarios — more than " *
+            "typemax(Int64) = $(typemax(Int)), so the signatures it would walk do " *
+            "not exist. Use algorithm=:bnb — branch-and-bound needs no signatures, " *
+            "and it is what :auto picks at this size anyway — or cut the model down " *
+            "with fix_descriptor / influence_structure."))
         # Note the sweep needs only the margin — it never touches the rule.
         return _find_kernel_checkall_fast(cib; margin=margin)
     end
 
     # Otherwise branch-and-bound, which avoids looking at most scenarios at
     # all by ruling out whole families of them at once.
-    sufDiff, pairOffsets = _bnb_bounds(cib)
-
+    #
     # `something(a, b)` returns the first argument that isn't `nothing` — like
     # C#'s ?? null-coalescing operator. An explicit `:bnb` means the caller
     # wants branch-and-bound whatever it costs, so it gets an unlimited
     # budget; `:auto` caps the effort at a sixteenth of the scenario count.
+    #
+    # The sixteenth is computed in Int128 and then clamped, because past ~1.5e20
+    # scenarios it no longer fits an Int. Clamping decides nothing: no search
+    # visits typemax(Int) ≈ 9.2e18 nodes, so a budget at or above that was
+    # already unreachable in exact arithmetic. The practical consequence is that
+    # on a model past Int64 `:auto` runs to completion rather than giving up —
+    # which is right, since there is no sweep to fall back to there.
+    autoBudget = Int(min(numberOfScenarios ÷ 16, Int128(typemax(Int))))
     nodeBudget = something(bnb_node_budget,
-                           algorithm == :bnb ? typemax(Int) : numberOfScenarios ÷ 16)
+                           algorithm == :bnb ? typemax(Int) : autoBudget)
 
-    kernel, _ = _bnb_fixed_points(cib, sufDiff, pairOffsets;
-                                  node_budget=nodeBudget, margin=margin)
+    # _bnb_search picks the descriptor order, searches in it, and puts the
+    # answer back into this model's own descriptor numbering.
+    kernel, _ = _bnb_search(cib; node_budget=nodeBudget, margin=margin)
 
     # Careful: a `nothing` result does NOT mean "this model has no consistent
     # scenarios" — a model with none returns an empty list, perfectly normally.
@@ -124,6 +163,16 @@ function _find_kernel(rule::SuccessionRule, cib::CIB; algorithm::Symbol=:auto,
         return kernel
     end
 
-    # It gave up, so fall back to checking every scenario after all.
+    # It gave up, so fall back to checking every scenario after all — which
+    # only exists while signatures do. Getting here on a bigger model takes an
+    # explicitly-set budget: :auto's own budget is unreachable at that scale
+    # (see the clamp above), so branch-and-bound runs to completion instead.
+    numberOfScenarios <= Int128(typemax(Int)) || throw(ArgumentError(
+        "find_consistent: branch-and-bound spent its node budget of $(nodeBudget) " *
+        "without finishing, and the sweep it falls back to cannot run on a model of " *
+        "$(numberOfScenarios) scenarios (more than typemax(Int64) = $(typemax(Int)), " *
+        "so it has no signatures to walk). Raise bnb_node_budget, or leave it unset — " *
+        "both :auto and :bnb then let branch-and-bound run to completion — or cut the " *
+        "model down with fix_descriptor / influence_structure."))
     return _find_kernel_checkall_fast(cib; margin=margin)
 end

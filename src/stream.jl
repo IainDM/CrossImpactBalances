@@ -347,7 +347,7 @@ end
 function _stream_basins_fast(cib::CIB, cimTranspose::Matrix{ScoreInt},
                              firstSignature::Int, lastSignature::Int,
                              cacheBytes::Int, progress::Bool) where {ScoreInt<:Signed}
-    numberOfScenarios = max_signature(cib) + 1
+    numberOfScenarios = _basin_scenario_count(cib)
     placeValues = Vector{Int}(undef, cib.numberOfDescriptors)
     placeValue = 1
     for descriptorIndex in 1:cib.numberOfDescriptors
