@@ -69,9 +69,14 @@ class Model:
 
         ``backend`` selects the engine: ``"native"`` (compiled library, no
         source), ``"juliacall"`` (in-process Julia source), or ``"auto"`` — the
-        native library if one is found, otherwise juliacall. Load-time options
-        (``mc_threshold``, ``sl_file``, ``compute_kernel``, ``seed``) apply to
-        the juliacall backend; the native backend recomputes on demand.
+        native library if one is found, otherwise juliacall.
+
+        ``sl_file`` and ``compute_kernel`` apply to the juliacall backend,
+        which can find the kernel at load time; the native backend always
+        recomputes on demand and ignores them. ``exhaustive``, ``mc_threshold``
+        and ``seed`` are accepted and ignored by both — they configured a
+        Monte-Carlo sampling search that no longer exists, the engine now
+        always searching exhaustively and deterministically.
         """
         load_kwargs = dict(exhaustive=exhaustive, mc_threshold=mc_threshold,
                            compute_kernel=compute_kernel, sl_file=sl_file, seed=seed)

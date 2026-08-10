@@ -45,7 +45,6 @@ def _bootstrap():
     from juliacall import Main as jl  # heavy: starts Julia, resolves deps
 
     jl.seval("using CrossImpactBalances")
-    jl.seval("using Random")
     _JL = jl
     _CIB = jl.CrossImpactBalances
 
@@ -66,14 +65,6 @@ def get_engine():
             if _CIB is None:
                 _bootstrap()
     return _CIB
-
-
-def make_rng(seed):
-    """Build a Julia RNG from *seed* (or ``None`` for the default RNG)."""
-    jl = get_jl()
-    if seed is None:
-        return jl.Random.default_rng()
-    return jl.Random.Xoshiro(int(seed))
 
 
 def empty_kernel():

@@ -65,6 +65,22 @@ arrays of 0-based variant indices.
 Errors never cross the boundary as exceptions: a failed call returns
 `{"ok": false, "error": "…"}`.
 
+### Numbers past 2⁵³
+
+`n_scenarios`, `total` and `signature` are **decimal strings** rather than JSON
+numbers once they exceed 2⁵³, and `cib_inv_signature` accepts either form.
+A consumer that parses JSON numbers into doubles — every JavaScript one —
+silently rounds away the last digits otherwise, and real ScenarioWizard models
+reach 10³⁰ scenarios. Python's `int()` and Julia's `parse(Int128, …)` take
+both forms unchanged.
+
+Such a model loads and `cib_consistent` searches it: branch-and-bound never
+numbers a scenario. What genuinely stops at `typemax(Int64)` says so in its
+error — `cib_basins`, because both basin methods walk the space by signature,
+and `cib_inv_signature`, because inverting a signature is `Int64` arithmetic
+(`cib_signature` still reports those signatures exactly; only the inverse
+direction stops).
+
 `cib_consistent` previously also accepted `exhaustive`, `ignore_cycles` and
 `seed`. Those are gone along with the simulated annealing and Monte-Carlo
 sampling they configured: the search now always covers the whole scenario

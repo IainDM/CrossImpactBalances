@@ -86,6 +86,22 @@ from crossimpactbalances import to_dataframe
 df = to_dataframe(records)          # requires the [pandas] extra
 ```
 
+## Very large models
+
+A real ScenarioWizard matrix can have more scenarios than `Int64` can count —
+10²⁴ is an ordinary size — and both backends handle those. `n_scenarios` and
+`signature()` are exact Python `int`s at any size (the native backend receives
+them as decimal strings past 2⁵³, so a JSON parser cannot round their last
+digits away), and `consistent_scenarios()` searches such a model exactly:
+branch-and-bound never numbers a scenario.
+
+Two things genuinely stop at `typemax(Int64)`, and say so rather than
+answering wrongly: `basins()`, because both basin methods walk the space by
+signature, and `scenario_from_signature()`, because inverting a signature is
+`Int64` arithmetic. `signature()` still reports those signatures exactly —
+only the inverse direction stops — and the scenario's own variant choices
+identify it at any size.
+
 ## Backends
 
 The same `Model` API runs on either of two engine backends, selected by
