@@ -59,10 +59,15 @@ no dependencies at all.
 
 Real matrices reach 10¹² scenarios and beyond (a 24-descriptor model of fours
 and threes is already 6.7×10¹²; add twelve ternary descriptors and it is
-3.6×10¹⁸). Finding the consistent scenarios still takes seconds there. Basins
-are a different matter — counting where *every* start drains is work
-proportional to the space — so `find_basins` offers three routes and refuses,
-with directions, rather than crash or silently start a weeks-long job:
+3.6×10¹⁸). Finding the consistent scenarios still takes seconds there — and it
+does not stop at 10¹⁸ either: branch-and-bound never numbers a scenario, so
+`find_consistent` keeps working past `typemax(Int64)`, where signatures stop
+existing and `max_signature` refuses. A real 100-descriptor model of 10³⁰
+scenarios is solved in under two seconds by splitting it into independent
+islands (see *Validation* below). Basins are a different matter — counting where
+*every* start drains is work proportional to the space — so `find_basins` offers
+three routes and refuses, with directions, rather than crash or silently start a
+weeks-long job:
 
 | Situation | Tool | What you get |
 |---|---|---|
@@ -274,7 +279,7 @@ naive Python basin loop.
 
 | Operation | Python (naive equivalent) | Julia | Speedup |
 |---|---:|---:|---:|
-| `bench_xlarge` full enumeration (`exhaustive=true`) | 9.8 s | **1.3 ms** | **~7,500×** |
+| `bench_xlarge` full enumeration (`find_consistent`) | 9.8 s | **1.3 ms** | **~7,500×** |
 | `bench_xlarge` basin analysis (`find_basins`) | 10.0 s | **8.1 ms** | **~1,200×** |
 | `bench_typical` (59k scenarios, same problem class as xlarge) | ~10 s | **1.3 ms** | **~7,700×** |
 
@@ -338,6 +343,33 @@ the visited tree further, with bit-identical results: `bench_typical`
 2.25% → 0.601% (node counts are machine-independent; the timings in the
 table above predate this change). On `bench_50x50` the smaller tree makes
 the B&B search ~4× faster again.
+
+Deciding the strongly-coupled descriptors first, rather than in file order,
+shrinks it further still and is what makes the largest real models reachable at
+all: on Weimer-Jehle's corpus it took one 10²³-scenario model from unfinished
+after 2×10⁹ nodes to 386 thousand, and a 10²⁴-scenario one from 254 million
+nodes to 216 thousand. Every existing benchmark file improves too, by 1.1× to
+4.66× fewer nodes, with identical kernels. It is a heuristic and not free
+everywhere — across all 48 models measured, two need more nodes than file order
+(one 2.25× more, one 4%), both still well under a second.
+
+## Validation
+
+Wolfgang Weimer-Jehle — the author of the CIB method and of ScenarioWizard —
+supplied 38 models from his own working files, 20 to 100 descriptors and 10⁸ to
+10³⁰ scenarios. Nineteen of them carry the consistent scenarios ScenarioWizard
+itself found, and on **every one JuCIB's independent exhaustive search returns
+the identical set** — 25,136 reference scenarios, nothing missed in either
+direction. The other nineteen have no published solution; JuCIB solves those too,
+including four whose kernels run to 10⁷ and 10¹⁰ scenarios and are computed
+exactly as products over independent islands rather than enumerated.
+
+The corpus is third-party material and is not redistributed here. Provenance, the
+full per-model table and the three known-bad exports are in
+[`test/WWJ_CORPUS.md`](test/WWJ_CORPUS.md); results are in
+[`BENCHMARK_THREEWAY_RESULTS.md`](BENCHMARK_THREEWAY_RESULTS.md) and
+`test/bench_results_wwj.json`. The earlier three-way comparison against
+ScenarioWizard and the Python `cibsa` package is in the same document.
 
 ## Citation
 

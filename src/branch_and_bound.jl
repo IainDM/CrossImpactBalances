@@ -265,7 +265,7 @@ Run the branch-and-bound search described in the section header, across all thre
 
 The work is split by chopping the tree near the top: every combination of variants for the first few descriptors becomes one task, which then explores its own subtree alone. Enough descriptors are taken to make comfortably more tasks than threads, so no thread sits idle waiting for a slow branch. Tasks share nothing but the node counter, and each collects its own results.
 
-Returns a tuple. The first element is the complete kernel sorted by ascending signature — or `nothing` if the search gave up because it blew the node budget, which is the caller's signal to fall back to the sweep. The second is how many tree nodes were visited, i.e. how many partial scenarios were expanded; comparing that with the total number of scenarios shows how much the pruning actually saved.
+Returns a tuple. The first element is the complete kernel sorted by ascending signature — ordered by comparing variant choices from the last descriptor down, so the order is right even for a model whose signatures overrun `Int64` — or `nothing` if the search gave up because it blew the node budget, which is the caller's signal to fall back to the sweep. The second is how many tree nodes were visited, i.e. how many partial scenarios were expanded; comparing that with the total number of scenarios shows how much the pruning actually saved.
 """
 function _bnb_fixed_points(cib::CIB, sufDiff::Matrix{Int}, pairOffsets::Vector{Int};
                            node_budget::Int, margin::Int=0)
@@ -335,6 +335,183 @@ function _bnb_fixed_points(cib::CIB, sufDiff::Matrix{Int}, pairOffsets::Vector{I
         append!(kernel, taskOutput)
     end
     # Tasks finish in nondeterministic order; sort so the result is stable.
-    sort!(kernel; by = scenario -> signature(cib, scenario))
+    # `_sig_less` (walk.jl) compares the variant choices from the LAST
+    # descriptor downwards, which IS ascending signature order — a signature is
+    # a mixed-radix number whose most significant digit is the last descriptor —
+    # while computing no signature at all. That matters twice. It is cheaper
+    # than the old key, which `sort!` recomputed at every comparison rather than
+    # once per element. And it is the only version that is CORRECT past
+    # typemax(Int64): there `signature` wraps, so on an 80-binary-descriptor
+    # model 18,432 distinct scenarios collapse onto 9,024 distinct keys, and the
+    # all-ones scenario keys as a negative number and sorts FIRST.
+    sort!(kernel; lt = _sig_less)
     return (kernel, totalNodes[])
+end
+
+# ══ Which descriptor to decide first ═══════════════════════════════════════
+#
+# The tree above is built in whatever order the descriptors happen to appear in
+# the file, and that order is not neutral — it decides how soon a node can be
+# proved hopeless.
+#
+# A node is pruned by comparing gaps that only the ALREADY-DECIDED descriptors
+# contribute to. Decide five descriptors that barely touch each other and
+# `prefixBalance` is still near zero: nothing to prune with, so the search
+# grinds down to the leaves. Decide five that push hard on one another and the
+# gaps are already wide at depth five, killing whole subtrees at the top of the
+# tree where they are biggest.
+#
+# So: put the strongly-coupled descriptors first. Start from the descriptor
+# with the most impact weight in total, then keep taking whichever remaining
+# descriptor is most tied to the ones already placed. This is a cheap greedy
+# heuristic, not an optimum, and it cannot affect the ANSWER — it is undone
+# before the kernel is returned. It only affects how long the answer takes.
+#
+# On Weimer-Jehle's corpus the difference is not marginal. D60 (2.2e23
+# scenarios) went from unfinished after 2e9 nodes to 385,592; B80 (1.2e24) from
+# 254 million nodes to 215,614; B70 from 366 million to 160,012. The
+# repository's own fixtures all improve too, by 1.1x to 4.66x.
+#
+# It is a heuristic, though, so it is not free everywhere. Measured across all
+# 48 models available (10 fixtures + 38 corpus), two come out worse: N25c needs
+# 2.25x the nodes (502,342 -> 1,129,598) and D35a 4% more. Both are still well
+# under a second, and against savings of 50x to 5,000x elsewhere that is a
+# trade worth making — but "always better" would be the wrong thing to believe.
+
+"""
+    _bnb_descriptor_order(cib) -> Vector{Int}
+
+The order to assign descriptors in, most-coupled first. `order[k]` is the original index of the descriptor branch-and-bound should decide at depth `k`. See the section header above for why the order matters.
+
+Deterministic: ties go to the lowest original index, so the result never depends on thread count, and a model whose matrix is entirely zero comes back in file order.
+"""
+function _bnb_descriptor_order(cib::CIB)
+    numberOfDescriptors = cib.numberOfDescriptors
+    numberOfDescriptors <= 2 && return collect(1:numberOfDescriptors)
+
+    offsets = cib.desc_offsets
+    variantCounts = cib.numberOfVariants
+
+    # coupling[i, j] = how much impact weight descriptor i's variants place on
+    # descriptor j's, summed over the block and taken as absolute value: a
+    # strong push towards a variant constrains j exactly as much as a strong
+    # push away from it. The diagonal stays zero — a descriptor's influence on
+    # itself tells us nothing about which to decide first.
+    coupling = zeros(Int, numberOfDescriptors, numberOfDescriptors)
+    @inbounds for sourceDescriptor in 1:numberOfDescriptors,
+                  targetDescriptor in 1:numberOfDescriptors
+        sourceDescriptor == targetDescriptor && continue
+        sourceRows = (offsets[sourceDescriptor] + 1):(offsets[sourceDescriptor] + variantCounts[sourceDescriptor])
+        targetCols = (offsets[targetDescriptor] + 1):(offsets[targetDescriptor] + variantCounts[targetDescriptor])
+        total = 0
+        for row in sourceRows, col in targetCols
+            total += abs(cib.cim[row, col])
+        end
+        coupling[sourceDescriptor, targetDescriptor] = total
+    end
+
+    # `tiesToPlaced[i]` is descriptor i's total coupling to everything chosen so
+    # far, in both directions, kept up to date as each choice is made rather
+    # than recomputed. Before anything is placed it seeds with total coupling to
+    # the whole model, which picks the busiest descriptor to start from.
+    tiesToPlaced = [sum(@view coupling[i, :]) + sum(@view coupling[:, i])
+                    for i in 1:numberOfDescriptors]
+    alreadyPlaced = falses(numberOfDescriptors)
+    order = Vector{Int}(undef, numberOfDescriptors)
+
+    for depth in 1:numberOfDescriptors
+        # Strict `>` keeps the lowest index among equals, which is what makes
+        # this deterministic.
+        best = 0
+        bestScore = -1
+        @inbounds for i in 1:numberOfDescriptors
+            alreadyPlaced[i] && continue
+            if tiesToPlaced[i] > bestScore
+                bestScore = tiesToPlaced[i]
+                best = i
+            end
+        end
+        order[depth] = best
+        alreadyPlaced[best] = true
+
+        # The seed's score meant "coupling to everything"; from here on the
+        # score means "coupling to the placed set", so the first pick resets it
+        # rather than adding to it.
+        @inbounds for i in 1:numberOfDescriptors
+            alreadyPlaced[i] && continue
+            contribution = coupling[i, best] + coupling[best, i]
+            tiesToPlaced[i] = depth == 1 ? contribution : tiesToPlaced[i] + contribution
+        end
+    end
+    return order
+end
+
+"""
+    _permute_descriptors(cib, order) -> CIB
+
+The same model with its descriptors reordered, `order` giving the original index of each new position. The variant blocks of the CIM move with their descriptors, so the model is genuinely identical — only the numbering changes.
+
+`variants` is shared, not rebuilt: it is keyed by descriptor name, so descriptor order does not enter into it. The kernel is left empty; this model exists only to be searched.
+"""
+function _permute_descriptors(cib::CIB, order::Vector{Int})
+    variantCounts = cib.numberOfVariants[order]
+
+    # Where each descriptor's variant block lands in the new numbering.
+    newOffsets = Vector{Int}(undef, cib.numberOfDescriptors)
+    runningOffset = 0
+    for descriptorIndex in 1:cib.numberOfDescriptors
+        newOffsets[descriptorIndex] = runningOffset
+        runningOffset += variantCounts[descriptorIndex]
+    end
+
+    # The row/column permutation the CIM needs: every variant of the new first
+    # descriptor, then every variant of the new second, and so on.
+    variantOrder = Vector{Int}(undef, cib.numberOfDimensions)
+    next = 1
+    for originalDescriptor in order
+        blockStart = cib.desc_offsets[originalDescriptor] + 1
+        blockEnd = cib.desc_offsets[originalDescriptor] + cib.numberOfVariants[originalDescriptor]
+        for column in blockStart:blockEnd
+            variantOrder[next] = column
+            next += 1
+        end
+    end
+
+    permutedCim = cib.cim[variantOrder, variantOrder]
+    return CIB(cib.descriptors[order], cib.variants, variantCounts,
+               permutedCim, permutedims(permutedCim),
+               cib.numberOfDimensions, cib.numberOfDescriptors,
+               Vector{Vector{Int}}(), newOffsets)
+end
+
+"""
+    _bnb_search(cib; node_budget, margin) -> (Union{Nothing,Vector{Vector{Int}}}, nodesVisited)
+
+Branch-and-bound end to end: pick a descriptor order, search in it, and translate the answer back into the caller's own descriptor numbering.
+
+This is the whole branch-and-bound entry point — [`_bnb_descriptor_order`](@ref), [`_permute_descriptors`](@ref), `_bnb_bounds` and `_bnb_fixed_points` are its parts, and callers should not have to assemble them. `nothing` means the node budget was spent without finishing, exactly as in `_bnb_fixed_points`.
+"""
+function _bnb_search(cib::CIB; node_budget::Int, margin::Int=0)
+    order = _bnb_descriptor_order(cib)
+    searchModel = _permute_descriptors(cib, order)
+
+    sufDiff, pairOffsets = _bnb_bounds(searchModel)
+    kernel, nodesVisited = _bnb_fixed_points(searchModel, sufDiff, pairOffsets;
+                                             node_budget=node_budget, margin=margin)
+    isnothing(kernel) && return (nothing, nodesVisited)
+
+    # Back to the caller's numbering: the variant at new position k belongs to
+    # original descriptor order[k]. The sort inside _bnb_fixed_points ordered
+    # these by the SEARCH order's signatures, which is a different order, so
+    # they have to be sorted again once renumbered.
+    original = Vector{Vector{Int}}(undef, length(kernel))
+    for (index, searchScenario) in pairs(kernel)
+        scenario = Vector{Int}(undef, cib.numberOfDescriptors)
+        @inbounds for depth in 1:cib.numberOfDescriptors
+            scenario[order[depth]] = searchScenario[depth]
+        end
+        original[index] = scenario
+    end
+    sort!(original; lt = _sig_less)
+    return (original, nodesVisited)
 end
