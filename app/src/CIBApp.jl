@@ -12,7 +12,9 @@ influence map: independent islands, dial descriptors, and — when the model
 decomposes into small enough islands — exact composed basins on the spot).
 Results are shown as a table; basin analyses and estimates export as CSV. A
 model too large for the exact table analysis gets guidance and a one-click
-path to the estimator instead of an error.
+path to the estimator instead of an error, and a model with more consistent
+scenarios than a table can usefully show is reported by its exact kernel size
+— counted through the influence map, without ever being built.
 
 The server has no external dependencies — it is a minimal HTTP/1.1 responder
 built on the standard-library `Sockets`, talking only to the bundled page — so
@@ -24,6 +26,10 @@ using Sockets
 using CrossImpactBalances
 
 # ─── Server state (single local user) ───────────────────────────────────────
+# Connections are served concurrently (see `serve`), so two analyses running at
+# once both write `last_csv` and the export belongs to whichever finished last.
+# That is already what one person clicking one button at a time means, so it is
+# left unlocked rather than serialised.
 mutable struct AppState
     last_csv::String       # CSV of the most recent basin/estimate analysis, for export
     last_csv_name::String  # download filename for it (exact vs estimated differ)
@@ -98,8 +104,119 @@ function load_from_text(scwtext::AbstractString)
     end
 end
 
+# How many consistent scenarios this page will render as rows. Every kernel
+# mode below shares it: the browser builds its table with innerHTML, and the
+# corpus has models whose kernels run to millions (B100b: 1,195,648) or
+# billions (B100: 19,327,352,832) of scenarios. Past a couple of thousand rows
+# the table stops being something a person reads, and long before the kernel
+# stops being something a browser survives.
+const KERNEL_DISPLAY_CAP = 2000
+
+# ...and how many the basin CSV will carry. Exact Basins is the one mode whose
+# result survives the table being refused: by the time the row count is known
+# the analysis has already run, and a spreadsheet holds far more than a page
+# can. So there are three bands — up to KERNEL_DISPLAY_CAP the table is drawn,
+# up to here the export is written instead, and past here neither, because a
+# file of tens of millions of rows is not one anybody opens either.
+const BASIN_EXPORT_CAP = 1_000_000
+
+"""
+Resolve the kernel, or refuse it with its exact size — `(kernel, size)`, where
+a `nothing` kernel means "too big to show" and `size` is exact regardless.
+
+A kernel the model already carries is used as it stands. Otherwise the islands
+come first, because `influence_structure` costs one pass over the matrix at any
+model size and a model that decomposes has, exactly, a kernel whose size is the
+product over its islands. So the count arrives WITHOUT the kernel ever being
+built: B100's 19,327,352,832 consistent scenarios take a couple of seconds to
+count and roughly 15 TB to hold. Only a single-island model has to be searched
+whole — there the search is the only way to know.
+"""
+function resolve_kernel(cib; cap::Int = KERNEL_DISPLAY_CAP)
+    # A model that already carries its kernel is taken at its word — the same
+    # courtesy estimate_basins and transition_graph extend through the engine's
+    # _resolve_kernel. It is also the only way a caller can spare a degenerate
+    # matrix a search that must not be run on it, so searching anyway would
+    # take away the escape hatch rather than add safety. (Files loaded through
+    # this app never arrive carrying one: load_from_text asks for an empty
+    # kernel precisely so nothing is searched behind the user's back.)
+    if !isempty(cib.consistentScenarios)
+        carriedSize = Int128(length(cib.consistentScenarios))
+        return (carriedSize > cap ? nothing : cib.consistentScenarios), carriedSize
+    end
+
+    structure = influence_structure(cib)
+    if length(structure.components) > 1
+        islandSize = prod(Int128(length(find_consistent(island)))
+                          for island in split_cib(cib; structure = structure))
+        islandSize > cap && return (nothing, islandSize)
+    end
+    # Small enough to hold (or indivisible, and so the only way to find out).
+    kernel = find_consistent(cib)
+    kernelSize = Int128(length(kernel))
+    return (kernelSize > cap ? nothing : kernel), kernelSize
+end
+
+# Why the rows are not coming. Exact Basins is its own case: it alone reaches
+# this point with a finished result in hand, so what it has lost is the drawing
+# of it, not the analysis.
+function too_big_lead(requested, exportable)
+    if requested != "basins"
+        return "Every mode that lists the consistent scenarios one per row — " *
+               "Find Consistent Scenarios, Estimate Basin Shares, Transitions — " *
+               "would have to hold and draw all of them, and past " *
+               "$(KERNEL_DISPLAY_CAP) rows that is neither readable nor " *
+               "something a browser survives."
+    elseif exportable
+        # The cap itself is already in the line above this message, so what is
+        # worth saying here is that the result survived the table being refused.
+        return "The basin analysis itself finished — what will not fit is the " *
+               "drawing of it, one row per consistent scenario. The result is " *
+               "not lost: Export CSV writes every one of them, with its basin " *
+               "size and share."
+    else
+        return "The basin analysis itself finished, but there are more consistent " *
+               "scenarios here than either a page or a spreadsheet carries " *
+               "usefully — the CSV is not written past $(BASIN_EXPORT_CAP) rows " *
+               "either, a file that size being no easier to read than the table."
+    end
+end
+
+# The refusal itself, shaped like find_basins' own — the size, then what still
+# works at that size. Note the difference from `basins_too_big`: estimating is
+# NOT the way out here, because estimate_basins needs the exact kernel too.
+# Structure is, since it splits the model into islands small enough to analyse
+# one at a time.
+function kernel_too_big(cib, kernelSize, requested; exportable::Bool = false)
+    return Dict{String,Any}(
+        "mode" => "kernel_too_big",
+        "requested" => requested,
+        # Whether /export.csv is holding a result for this refusal — the page
+        # shows the Export button on the strength of it.
+        "export" => exportable,
+        "descriptors" => cib.descriptors,
+        "variants" => [cib.variants[name] for name in cib.descriptors],
+        # json_count keeps 19,327,352,832 exact across the >2^53 crossing.
+        "total" => json_count(scenario_count(cib)),
+        "kernel" => json_count(kernelSize),
+        "cap" => KERNEL_DISPLAY_CAP,
+        # The count itself is in `kernel` and the page states it, formatted, in
+        # the line above this message — so it is not repeated here.
+        "message" =>
+            too_big_lead(requested, exportable) * " What else works at this size:\n" *
+            "  • Structure — the influence map. Where the model decomposes into " *
+            "independent islands, each one is a small model you can analyse on " *
+            "its own;\n" *
+            "  • split_cib(cib) from the Julia package — one model per island, to " *
+            "take away and work with separately;\n" *
+            "  • fix_descriptor(cib, d, v) — pin the descriptors you have already " *
+            "decided about, and the kernel of what remains may well fit.",
+        "threads" => Threads.nthreads())
+end
+
 function analyze_consistent(cib)
-    compute = @elapsed (kern = find_consistent(cib))
+    compute = @elapsed ((kern, kernelSize) = resolve_kernel(cib))
+    kern === nothing && return kernel_too_big(cib, kernelSize, "consistent")
     # scenario_count, not max_signature + 1: find_consistent's branch-and-bound
     # numbers no scenario, so it happily returns a kernel for a model whose
     # signatures overrun Int64 — and max_signature would then throw here and
@@ -125,21 +242,10 @@ function analyze_consistent(cib)
                 "scenarios" => scenarios)
 end
 
-function analyze_basins(cib, state::AppState)
-    compute = @elapsed ((fps, sizes, cycles) = find_basins(cib))
-    total = max_signature(cib) + 1
-    order = sortperm(sizes; rev = true)      # largest basin first
-
-    scenarios = Dict{String,Any}[]
-    for k in order
-        u = fps[k]
-        push!(scenarios, Dict("signature" => signature(cib, u),
-                              "variants" => variant_names(cib, u),
-                              "basin_size" => sizes[k],
-                              "basin_pct" => round(100 * sizes[k] / total; digits = 4)))
-    end
-
-    # Build the export CSV and stash it for /export.csv.
+# The export table, one row per consistent scenario, largest basin first.
+# Separate from the response because it outlives it: past the display cap the
+# page draws nothing and this is the whole result.
+function basin_csv(cib, fps, sizes, cycles, order, total)
     io = IOBuffer()
     println(io, "# Cross-Impact Balances basin analysis")
     println(io, "# total scenarios,", total)
@@ -154,7 +260,36 @@ function analyze_basins(cib, state::AppState)
         println(io, csv_row(vcat(Any[rank, signature(cib, u)], variant_names(cib, u),
                                  Any[sizes[k], pct])))
     end
-    state.last_csv = String(take!(io))
+    return String(take!(io))
+end
+
+function analyze_basins(cib, state::AppState; export_cap::Int = BASIN_EXPORT_CAP)
+    compute = @elapsed ((fps, sizes, cycles) = find_basins(cib))
+    total = max_signature(cib) + 1
+    order = sortperm(sizes; rev = true)      # largest basin first
+
+    # Unlike the other kernel modes this one cannot check before it computes —
+    # the row count IS the answer, known only once find_basins has run. So the
+    # guard lands here, on a finished result, and salvages what it can of it.
+    if length(fps) > KERNEL_DISPLAY_CAP
+        exportable = length(fps) <= export_cap
+        if exportable
+            state.last_csv = basin_csv(cib, fps, sizes, cycles, order, total)
+            state.last_csv_name = "basin_analysis.csv"
+        end
+        return kernel_too_big(cib, Int128(length(fps)), "basins"; exportable = exportable)
+    end
+
+    scenarios = Dict{String,Any}[]
+    for k in order
+        u = fps[k]
+        push!(scenarios, Dict("signature" => signature(cib, u),
+                              "variants" => variant_names(cib, u),
+                              "basin_size" => sizes[k],
+                              "basin_pct" => round(100 * sizes[k] / total; digits = 4)))
+    end
+
+    state.last_csv = basin_csv(cib, fps, sizes, cycles, order, total)
     state.last_csv_name = "basin_analysis.csv"
 
     return Dict("mode" => "basins",
@@ -169,11 +304,17 @@ function analyze_basins(cib, state::AppState)
 end
 
 # Basin SHARES by sampling, for models whose space defeats every exact method.
-# The kernel is still found exactly first (estimate_basins runs find_consistent
-# itself when the loaded model carries no kernel), so every consistent scenario
-# appears in the report — a never-hit one shows its upper bound, not a false 0.
+# The kernel is still found exactly first — resolve_kernel does it here and
+# hands it over — so every consistent scenario appears in the report, and a
+# never-hit one shows its upper bound rather than a false 0.
 function analyze_estimate(cib, state::AppState; samples::Int = 1_000_000)
-    compute = @elapsed (est = estimate_basins(cib; samples = samples))
+    # The kernel is resolved here rather than inside estimate_basins so the
+    # size guard applies: the report is one row per consistent scenario, so a
+    # kernel too big to list is too big to estimate shares for too.
+    resolve = @elapsed ((kern, kernelSize) = resolve_kernel(cib))
+    kern === nothing && return kernel_too_big(cib, kernelSize, "estimate")
+    compute = resolve +
+              @elapsed (est = estimate_basins(cib; samples = samples, kernel = kern))
     order = sortperm(est.hits; rev = true)     # biggest estimated share first
 
     scenarios = Dict{String,Any}[]
@@ -298,10 +439,18 @@ end
 # The lever map: which single (or paired) commitment moves one consistent
 # future into another, plus — when the page sends a world state — where things
 # drift today and what redirects them. Costs the same on a 32-scenario model
-# and a 10^18 one, so there is no size guard here and none is needed.
+# and a 10^18 one, so the size of the SPACE never needs guarding here. The
+# kernel does: the graph carries one node per consistent scenario.
 function analyze_transitions(cib, state::AppState; world::Union{Nothing,Vector{Int}} = nothing,
                              radius::Int = 1)
-    compute = @elapsed (graph = transition_graph(cib; from = world, radius = radius))
+    # As in analyze_estimate: transition_graph registers one node per consistent
+    # scenario, so the same cap applies. (An empty kernel is fine and is not
+    # refused — with a world state, transition_graph still traces where today
+    # drifts; without one it raises its own error, exactly as before.)
+    resolve = @elapsed ((kern, kernelSize) = resolve_kernel(cib))
+    kern === nothing && return kernel_too_big(cib, kernelSize, "transitions")
+    compute = resolve + @elapsed (graph = transition_graph(cib; kernel = kern, from = world,
+                                                           radius = radius))
 
     nodeJson = Dict{String,Any}[]
     for index in 1:length(graph.nodes)
@@ -518,23 +667,58 @@ function open_browser(url)
     return nothing
 end
 
+# One connection, start to finish, always closing the socket behind it.
+function serve_connection(sock, state::AppState)
+    try
+        handle(sock, state)
+    catch e
+        try
+            respond(sock, 500, "text/plain", "Internal error: " * sprint(showerror, e))
+        catch
+        end
+    finally
+        close(sock)
+    end
+    return nothing
+end
+
 function serve(state::AppState, server)
+    # Quit only sets state.shutdown, and by then this function is parked inside
+    # accept(), which nothing wakes until the next connection arrives. Closing
+    # the listener from the side makes accept throw and the loop below break.
+    Threads.@spawn begin
+        while !state.shutdown && isopen(server)
+            sleep(0.2)
+        end
+        try
+            close(server)
+        catch
+        end
+    end
+
     while !state.shutdown
         sock = try
             accept(server)
         catch
             break                               # listener closed
         end
-        try
-            handle(sock, state)
-        catch e
-            try
-                respond(sock, 500, "text/plain", "Internal error: " * sprint(showerror, e))
-            catch
-            end
-        finally
-            close(sock)
-        end
+        # Each connection gets its own task, so one long analysis cannot hold up
+        # the rest of the app. It used to: `handle` ran inline here, so a single
+        # request in flight left every other one — a second file, or Quit — on an
+        # accepted socket with no reply, which from the browser's side is
+        # indistinguishable from a dead page.
+        #
+        # On the INTERACTIVE pool specifically. A plain Threads.@spawn is not
+        # enough: the analyses saturate every default-pool thread with CPU-bound
+        # work that never yields, so a handler queued behind them waits just as
+        # long as it did when it ran inline (measured: 32 s, i.e. no improvement
+        # at all). The interactive pool is the one place that work never
+        # occupies. The handler itself only waits on it — the analysis inside
+        # fans out across the default pool as before — so the thread is free
+        # again the moment the request starts computing. (Started without an
+        # interactive thread this falls back to the default pool: no error, no
+        # benefit either, which is why the launcher asks for one by name.)
+        Threads.@spawn :interactive serve_connection(sock, state)
     end
     try
         close(server)
@@ -710,7 +894,7 @@ const PAGE = raw"""
       <a id="exportLink" href="/export.csv" style="display:none;">
         <button class="green">Export CSV</button></a>
     </div>
-    <div class="tablewrap"><table id="table"></table></div>
+    <div class="tablewrap" id="tablewrap"><table id="table"></table></div>
     <div id="extra"></div>
   </div>
   <footer>Cross-Impact Balances desktop app · runs locally on your machine</footer>
@@ -902,6 +1086,15 @@ function render(data, secs) {
         + `exact table analysis on this machine. `
         + `<button class="green" id="btnEstimateNudge">Estimate basin shares instead</button>`
         + `<div class="guide" style="margin-top:10px;">${escapeHtml(data.message)}</div>`;
+  } else if (data.mode === "kernel_too_big") {
+    sum = `This model has <b>${fmt(data.kernel)}</b> consistent scenario(s) across `
+        + `${fmt(data.total)} scenarios — more than the ${fmt(data.cap)} this table `
+        + `can show. `
+        + `<button id="btnStructureNudge">Map the structure instead</button>`
+        + `<div class="guide" style="margin-top:10px;">${escapeHtml(data.message)}</div>`;
+    // Exact Basins alone can still hand over a result here: it finished before
+    // the row count ruled the table out, so the CSV holds the whole analysis.
+    showExport = data.export === true;
   } else if (data.mode === "structure") {
     const islands = data.islands.length;
     sum = `<b>${islands}</b> independent island${islands === 1 ? "" : "s"} across `
@@ -1007,11 +1200,16 @@ function render(data, secs) {
 
   $("summary").innerHTML = sum;
   $("table").innerHTML = html;
+  // The guidance modes have no rows at all; an empty bordered box under the
+  // message reads as a glitch, so the wrapper goes with the table.
+  $("tablewrap").style.display = html ? "block" : "none";
   $("extra").innerHTML = extra;
   $("exportLink").style.display = showExport ? "inline-block" : "none";
   $("results").style.display = "block";
   const nudge = $("btnEstimateNudge");
   if (nudge) nudge.addEventListener("click", () => analyze("estimate"));
+  const structureNudge = $("btnStructureNudge");
+  if (structureNudge) structureNudge.addEventListener("click", () => analyze("structure"));
 }
 
 $("btnConsistent").addEventListener("click", () => analyze("consistent"));
