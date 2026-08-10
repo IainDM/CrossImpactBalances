@@ -32,6 +32,18 @@ the worked examples in [`examples/`](examples/) are the best starting points.
    (`test/bench_optim.jl`, `test/bench_threeway.jl`) are appreciated for
    performance claims.
 
+If you touch the search engine and you have Weimer-Jehle's corpus staged (see
+[`test/WWJ_CORPUS.md`](test/WWJ_CORPUS.md)), also run
+`julia -t auto --project=. test/verify_wwj.jl`. It checks 38 real ScenarioWizard
+models — including 19 against ScenarioWizard's own answers, at up to 10²⁴
+scenarios — and exits non-zero on any disagreement. Those tests are part of
+`Pkg.test()` when the corpus is present and skip when it is not, so a green
+suite on a fresh clone does not mean they ran.
+
+Third-party model collections are welcome, but they go in their own directory
+with a provenance document recording who supplied them and on what terms, rather
+than into `test/sample_files/` alongside our own fixtures.
+
 New succession rules are a particularly easy first contribution: subtype
 `SuccessionRule`, define one `succession_step` method, and (optionally) a
 `fixed_point_margin` — see

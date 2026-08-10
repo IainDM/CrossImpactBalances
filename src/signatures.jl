@@ -75,7 +75,9 @@ end
 
 The maximum signature value (= total scenarios - 1).
 
-Throws an `ArgumentError` for models with more than `typemax(Int64)` ≈ 9.2×10¹⁸ scenarios (for scale: ~130 binary or ~40 ternary descriptors), because signatures beyond that cannot be represented and every signature-driven analysis — [`find_consistent`](@ref), [`find_basins`](@ref) — would silently wrap. Before this guard, `max_signature` itself wrapped silently. [`scenario_count`](@ref) still counts such models exactly, and [`estimate_basins`](@ref) can still estimate their basin shares (it never touches `Int64` signatures); [`influence_structure`](@ref) and [`fix_descriptor`](@ref) can cut them down to exactly analysable pieces.
+Throws an `ArgumentError` for models with more than `typemax(Int64)` ≈ 9.2×10¹⁸ scenarios (for scale: ~63 binary or ~40 ternary descriptors), because signatures beyond that cannot be represented and every signature-*driven* analysis — the odometer sweep, [`find_basins`](@ref) — would silently wrap. Before this guard, `max_signature` itself wrapped silently.
+
+What survives past the line is what never numbers a scenario. [`scenario_count`](@ref) counts the space exactly. [`find_consistent`](@ref) still finds the kernel exactly: its branch-and-bound builds scenarios one descriptor at a time and orders the result by comparing variant choices, so only `algorithm=:sweep` is refused there. [`estimate_basins`](@ref) still estimates basin shares. [`influence_structure`](@ref) and [`fix_descriptor`](@ref) cut the model into exactly analysable pieces.
 """
 function max_signature(cib::CIB)
     totalScenarios = scenario_count(cib)
