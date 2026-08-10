@@ -263,6 +263,80 @@ end
         @test !isempty(tr["edges"])
         @test App.to_json(tr) isa AbstractString
     end
+
+    # A kernel too large to draw must come back as guidance from every mode
+    # that lists one consistent scenario per row — carrying the EXACT size,
+    # which resolve_kernel reads off the influence map rather than by building
+    # the kernel. Without this the page tries to render every row: the WWJ
+    # corpus has models with 1.2 million consistent scenarios (~470 MB of JSON)
+    # and one with 19,327,352,832, which no machine can hold at all.
+    @testset "kernel too big: guidance, not a 4096-row table" begin
+        # A silent matrix: nothing influences anything, so every one of the
+        # 2^12 scenarios is consistent AND the model splits into 12 islands —
+        # the decomposing route, where the size is a product over islands.
+        n = 12
+        nv = fill(2, n)
+        cim = zeros(Int, 2n, 2n)
+        wide = CIB(["D$i" for i in 1:n],
+                   Dict("D$i" => ["V$(i)_$j" for j in 1:2] for i in 1:n),
+                   nv, cim, permutedims(cim), 2n, n,
+                   Vector{Vector{Int}}(), cumsum(vcat(0, nv[1:end-1])))
+        state = App.AppState()
+        @test length(influence_structure(wide).components) == n
+        @test length(find_consistent(wide)) == 4096       # what is NOT rendered
+
+        for (mode, call) in (("consistent", () -> App.analyze_consistent(wide)),
+                             ("estimate",
+                              () -> App.analyze_estimate(wide, state; samples = 2_000)),
+                             ("transitions", () -> App.analyze_transitions(wide, state)))
+            refusal = quietly(call)
+            @test refusal["mode"] == "kernel_too_big"
+            @test refusal["requested"] == mode
+            @test refusal["kernel"] == 4096
+            @test refusal["total"] == 4096
+            @test refusal["cap"] == App.KERNEL_DISPLAY_CAP
+            @test !isempty(refusal["message"])
+            # The refusal is what the page renders, so it must encode — and
+            # stay small, which is the whole point of not sending the kernel.
+            json = App.to_json(refusal)
+            @test json isa AbstractString
+            @test length(json) < 10_000
+        end
+
+        # Exact Basins is the one mode that reaches the cap holding a finished
+        # result, so between the two caps it gives up the table but keeps the
+        # export — the whole analysis, in the one place that can hold it.
+        drawn = App.AppState()
+        withCsv = quietly(() -> App.analyze_basins(wide, drawn))
+        @test withCsv["mode"] == "kernel_too_big"
+        @test withCsv["requested"] == "basins"
+        @test withCsv["kernel"] == 4096
+        @test withCsv["export"] === true
+        @test occursin("Export CSV", withCsv["message"])
+        @test occursin("\"export\":true", App.to_json(withCsv))
+        @test drawn.last_csv_name == "basin_analysis.csv"
+        @test count(==('\n'), drawn.last_csv) == 4096 + 5   # 4 comments, header, rows
+
+        # Past the export cap not even that — just the size, and nothing stale
+        # left behind for /export.csv to hand over in its place.
+        bare = App.AppState()
+        noCsv = quietly(() -> App.analyze_basins(wide, bare; export_cap = 100))
+        @test noCsv["mode"] == "kernel_too_big"
+        @test noCsv["kernel"] == 4096
+        @test noCsv["export"] === false
+        @test isempty(bare.last_csv)
+
+        # Structure is the route the message points at, so it must still run.
+        @test quietly(() -> App.analyze_structure(wide))["mode"] == "structure"
+
+        # A model carrying its own kernel is taken at its word, never searched:
+        # here that kernel is one scenario, so the guard lets it straight
+        # through even though a search would have found 4096.
+        carried = CIB(wide.descriptors, wide.variants, wide.numberOfVariants,
+                      wide.cim, wide.cim_t, 2n, n,
+                      [zeros(Int, n)], wide.desc_offsets)
+        @test quietly(() -> App.analyze_consistent(carried))["count"] == 1
+    end
 end
 
 @testset "C API (capi/src/CIBCApi.jl)" begin
