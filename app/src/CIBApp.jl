@@ -932,7 +932,6 @@ function buildWorldSelects(descriptors, variants) {
     + `<select id="w${i}">`
     + variants[i].map((v, j) => `<option value="${j}">${escapeHtml(v)}</option>`).join("")
     + `</select></span>`).join("");
-  $("worldPanel").style.display = "block";
   worldReady = true;
 }
 
@@ -995,8 +994,9 @@ function escapeHtml(s) {
 
 // Counts may arrive as strings (the server sends any count past 2^53 that
 // way, because a JSON number would silently lose its last digits here in
-// the browser). Strings pass through untouched — exact beats pretty.
-function fmt(x) { return typeof x === "string" ? x : Number(x).toLocaleString(); }
+// the browser). BigInt parses them exactly and still formats with
+// locale-aware thousands separators, same as Number does below 2^53.
+function fmt(x) { return typeof x === "string" ? BigInt(x).toLocaleString() : Number(x).toLocaleString(); }
 
 function timingLine(data, secs) {
   let timing = `${secs}s`;
@@ -1028,9 +1028,16 @@ function render(data, secs) {
   let showExport = false;
   let extra = "";
 
-  // Any response carrying descriptor + variant names can populate the
-  // world-state selectors, so they are ready before the first Transitions run.
-  if (data.descriptors && data.variants) buildWorldSelects(data.descriptors, data.variants);
+  // The world panel only ever matters for a Transitions result — build the
+  // selects (once per file, guarded by worldReady) and reveal the panel
+  // together; every other mode (including a transitions request refused as
+  // kernel_too_big) hides it.
+  if (data.mode === "transitions" && data.descriptors && data.variants) {
+    buildWorldSelects(data.descriptors, data.variants);
+    $("worldPanel").style.display = "block";
+  } else {
+    $("worldPanel").style.display = "none";
+  }
 
   if (data.mode === "transitions") {
     const nodeLabel = i => {
