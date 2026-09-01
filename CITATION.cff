@@ -9,8 +9,6 @@ version: 0.2.0
 authors:
   - family-names: Morrow
     given-names: Iain
-    # TODO(author): uncomment and fill in before submission — JOSS requires it.
-    # orcid: https://orcid.org/0000-0000-0000-0000
 license: MIT
 repository-code: https://github.com/IainDM/CrossImpactBalances
 abstract: >-

@@ -62,8 +62,7 @@ measured against exactly those bytes.
 2. Delete the `test/wwj_corpus/` line from `.gitignore` and `git add` the corpus (8.17 MB raw,
    about +0.36 MB packed).
 3. Re-run `Pkg.test()`. `test/wwj_tests.jl` stops skipping with no code change.
-4. Land the `paper/paper.md` wording, which is deliberately held back while a reviewer cannot obtain
-   the inputs, and record the terms above.
+4. Record the agreed redistribution terms in this document.
 
 ## What is in the files
 
